@@ -4,27 +4,28 @@
 
 本项目 fork 并重构自 https://github.com/liuzhao1225/YouDub-webui/blob/master/README.md 。
 
-## 主要功能
+## 工作原理
 
-- **双工作流模式**:
-    - **自动流水线**: 提供视频URL后，可自动执行从下载到合成的完整流程。
-    - **分步执行**: 提供独立的UI选项卡，用于分别执行下载、人声分离、语音识别、翻译、语音合成和视频合成等步骤。
-- **AI模型支持**:
-    - **语音识别**: 使用 `WhisperX` 进行语音转录，支持时间戳和说话人识别。
-    - **机器翻译**: 通过 `OpenAI` API 调用语言模型进行文本翻译。
-    - **语音合成 (TTS)**: 支持 `XTTS` (用于声音克隆) 和 字节跳动TTS。
-- **项目配置**: 通过 `.env` 环境文件对API密钥、模型路径等参数进行配置。
-- **模型管理**: 程序包含模型检查功能，并在首次使用时自动下载运行所需的模型。
+本项目实现了一条端到端的视频本地化流水线，将外语视频自动转换为目标语言配音版本。核心处理流程如下：
+
+1.  **视频获取**: 使用 `yt-dlp` 从 YouTube 等平台下载源视频及元数据。
+2.  **音频分离**: 通过 **Demucs** (Facebook Research) 将音轨分离为人声与背景音乐/音效。
+3.  **语音识别与说话人分离**: 使用 **WhisperX** 对人声进行自动语音识别 (ASR)，生成带时间戳的逐句文本；同时调用 **Pyannote** 进行说话人分离 (Speaker Diarization)，标记每句话的说话人身份。
+4.  **文本翻译**: 通过 OpenAI 兼容 API 调用大语言模型，逐句将原文翻译为目标语言。
+5.  **语音合成**: 使用 TTS 引擎（支持 **火山引擎 TTS** 或本地 **XTTS v2**）将翻译后的文本合成为语音，并尝试通过音色匹配模拟原说话人声音特征。
+6.  **视频合成**: 将合成语音与原背景音轨混音，叠加字幕轨道，输出最终的本地化视频文件。
+
+项目提供 Gradio Web UI，支持全自动流水线执行或分步手动操作。
 
 ## 安装指南
 
-请遵循以下步骤完成安装。项目推荐使用 Python 3.10 或更高版本。
+项目中含有较古老的依赖，避免使用过高版本的 Python
 
 #### 第1步: 克隆仓库并进入目录
 
 ```bash
-git clone https://github.com/liuzhao1225/YouDub-webui.git
-cd YouDub-webui
+git clone git@github.com:StarDuster/YAYD.git
+cd YAYD
 ```
 
 #### 第2步: 创建虚拟环境
@@ -54,10 +55,6 @@ deno --version
 uv pip install -e .
 ```
 
-#### 第5步: (可选) 安装额外功能
-
-如果您需要 **人声分离(Demucs)** 或 **声音克隆(XTTS)** 功能，请分别安装它们：
-
 - **安装 Demucs:**
   ```bash
   uv pip install git+https://github.com/facebookresearch/demucs
@@ -68,35 +65,29 @@ uv pip install -e .
   uv pip install TTS --no-deps
   ```
 
-#### 第6步: 下载 WhisperX 模型
 
-WhisperX 需要额外的对齐模型和说话人分离模型。
+#### 第5步: 运行模型下载脚本
 
-> ⚠️ **重要**: 说话人分离模型 (pyannote) 需要您在 Hugging Face 上**接受许可协议**后才能下载。
+本项目为保证环境一致性与离线可用性，提供了一键下载脚本。此脚本会下载所有必需的 AI 模型（Demucs, WhisperX, Pyannote Diarization, XTTS v2）并锁定到验证过的版本。
 
-1. **接受 pyannote 模型许可协议**:
-   - 访问 https://huggingface.co/pyannote/speaker-diarization-3.1 并点击 "Agree"
-   - 访问 https://huggingface.co/pyannote/segmentation-3.0 并点击 "Agree"
+1. **配置 Hugging Face 权限**:
+   - 访问 https://huggingface.co/pyannote/speaker-diarization-3.1 并接受许可协议。
+   - 访问 https://huggingface.co/pyannote/segmentation-3.0 并接受许可协议。
+   - 在 `.env` 文件中填入你的 `HF_TOKEN`。
 
-2. **获取 Hugging Face Token**:
-   - 访问 https://huggingface.co/settings/tokens
-   - 创建一个 Access Token 并复制
-
-3. **配置 HF_TOKEN**:
-   在 `.env` 文件中添加:
-   ```env
-   HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   ```
-
-4. **运行下载脚本**:
+2. **运行下载脚本**:
    ```bash
    uv run python scripts/download_models.py
    ```
    
-   此脚本将自动下载:
-   - 中文对齐模型 (wav2vec2-large-xlsr-53-chinese-zh-cn)
-   - 英文对齐模型 (wav2vec2-large-xlsr-53-english)
-   - 说话人分离模型 (pyannote/speaker-diarization-3.1)
+   脚本会自动执行以下操作：
+   - 从 PyTorch Hub 下载 **Demucs (htdemucs_ft)** 模型。
+   - 从 Hugging Face 下载 **WhisperX (large-v3)** 的 CTranslate2 格式模型。
+   - 下载并缓存 **Pyannote Speaker Diarization 3.1** 及其依赖。
+   - 下载 **WhisperX Alignment** 对齐模型 (en, zh)。
+   - 下载 **XTTS v2** 模型 (用于本地语音合成)。
+   
+   > 脚本运行完成后，您可以再次运行 `uv run youdub`，此时“模型检查”页面应全部通过，且程序可在无网络环境下（除翻译/TTS API外）运行。
 
 ## 配置
 
