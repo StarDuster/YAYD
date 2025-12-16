@@ -146,6 +146,133 @@ def generate_embedding(wav_path: str) -> np.ndarray:
     return embedding
 
 
+# --- V3 Async TTS API (supports ICL 2.0 voice cloning) ---
+_BYTEDANCE_V3_SUBMIT_URL = f"https://{_BYTEDANCE_HOST}/api/v3/tts/submit"
+_BYTEDANCE_V3_QUERY_URL = f"https://{_BYTEDANCE_HOST}/api/v3/tts/query"
+
+
+def bytedance_tts_v3_api(
+    text: str,
+    speaker: str = 'BV001_streaming',
+    use_cloned_voice: bool = False,
+) -> bytes | None:
+    """
+    Use the V3 async long-text API for TTS synthesis.
+    This API properly supports ICL 2.0 voice cloning.
+    
+    Args:
+        text: Text to synthesize
+        speaker: Speaker/voice ID (e.g., 'BV001_streaming' or 'S_xxx' for cloned)
+        use_cloned_voice: Whether the speaker is a cloned voice (ICL 2.0)
+    
+    Returns:
+        Audio bytes (WAV format) or None on failure
+    """
+    appid = _DEFAULT_SETTINGS.bytedance_appid
+    access_token = _DEFAULT_SETTINGS.bytedance_access_token
+    
+    if not appid or not access_token:
+        logger.warning("ByteDance APPID or ACCESS_TOKEN not set.")
+        return None
+
+    # Determine resource ID based on voice type
+    if use_cloned_voice:
+        resource_id = "seed-icl-2.0"
+    else:
+        resource_id = "volc.service_type.10029"  # Standard TTS
+    
+    headers = {
+        "X-Api-App-Id": appid,
+        "X-Api-Access-Key": access_token,
+        "X-Api-Resource-Id": resource_id,
+        "Content-Type": "application/json",
+    }
+    
+    unique_id = str(uuid.uuid4())
+    
+    submit_payload = {
+        "user": {"uid": "youdub-webui"},
+        "unique_id": unique_id,
+        "namespace": "BidirectionalTTS",
+        "req_params": {
+            "text": text,
+            "speaker": speaker,
+            "audio_params": {
+                "format": "wav",
+                "sample_rate": 24000,
+            }
+        }
+    }
+    
+    # Step 1: Submit task
+    try:
+        logger.debug(f"V3 TTS Submit: speaker={speaker}, text={text[:30]}...")
+        resp = requests.post(_BYTEDANCE_V3_SUBMIT_URL, json=submit_payload, headers=headers, timeout=30)
+        resp_json = resp.json()
+        
+        if resp_json.get("code") != 20000000:
+            logger.warning(f"V3 TTS submit failed: {resp_json}")
+            return None
+        
+        task_id = resp_json.get("data", {}).get("task_id")
+        if not task_id:
+            logger.warning(f"V3 TTS submit returned no task_id: {resp_json}")
+            return None
+        
+        logger.debug(f"V3 TTS task submitted: {task_id}")
+        
+    except Exception as e:
+        logger.error(f"V3 TTS submit exception: {e}")
+        return None
+    
+    # Step 2: Poll for result
+    query_payload = {"task_id": task_id}
+    max_polls = 60  # Max 60 seconds
+    poll_interval = 1.0
+    
+    for _ in range(max_polls):
+        try:
+            time.sleep(poll_interval)
+            resp = requests.post(_BYTEDANCE_V3_QUERY_URL, json=query_payload, headers=headers, timeout=30)
+            resp_json = resp.json()
+            
+            if resp_json.get("code") != 20000000:
+                logger.warning(f"V3 TTS query error: {resp_json}")
+                return None
+            
+            task_status = resp_json.get("data", {}).get("task_status")
+            
+            if task_status == 1:  # Running
+                continue
+            elif task_status == 2:  # Success
+                audio_url = resp_json.get("data", {}).get("audio_url")
+                if audio_url:
+                    # Download the audio
+                    audio_resp = requests.get(audio_url, timeout=60)
+                    if audio_resp.status_code == 200:
+                        logger.info(f"V3 TTS success: {len(audio_resp.content)} bytes")
+                        return audio_resp.content
+                    else:
+                        logger.warning(f"V3 TTS audio download failed: {audio_resp.status_code}")
+                        return None
+                else:
+                    logger.warning("V3 TTS success but no audio_url")
+                    return None
+            elif task_status == 3:  # Failure
+                logger.warning(f"V3 TTS task failed: {resp_json}")
+                return None
+            else:
+                logger.warning(f"V3 TTS unknown status: {task_status}")
+                continue
+                
+        except Exception as e:
+            logger.error(f"V3 TTS query exception: {e}")
+            return None
+    
+    logger.warning("V3 TTS polling timeout")
+    return None
+
+
 def bytedance_tts_api(
     text: str, 
     voice_type: str = 'BV001_streaming',
@@ -388,7 +515,13 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
 
 
 def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> str | None:
-    """Gets existing cloned voice ID or creates a new one."""
+    """
+    Gets existing cloned voice ID or creates a new one using pre-allocated IDs.
+    
+    ICL 2.0 requires using speaker IDs that are already allocated in the Volcano console.
+    Set VOLCANO_CLONE_SPEAKER_IDS in .env as a comma-separated list of available IDs.
+    Example: VOLCANO_CLONE_SPEAKER_IDS=S_PoN0a1CN1,S_OoN0a1CN1,S_NoN0a1CN1
+    """
     
     # 1. Check local cache
     mapping_path = os.path.join(folder, 'speaker_to_cloned_voice.json')
@@ -404,19 +537,37 @@ def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> s
             return None
         return cached_value
 
-    # 2. Prepare credentials
+    # 2. Get pre-allocated speaker IDs from environment
+    volcano_speaker_ids_str = os.getenv('VOLCANO_CLONE_SPEAKER_IDS', '')
+    if not volcano_speaker_ids_str:
+        logger.warning("VOLCANO_CLONE_SPEAKER_IDS not set in .env. Voice cloning will be skipped.")
+        logger.warning("Please set VOLCANO_CLONE_SPEAKER_IDS to a comma-separated list of IDs from your Volcano console.")
+        return None
+    
+    available_ids = [s.strip() for s in volcano_speaker_ids_str.split(',') if s.strip()]
+    if not available_ids:
+        logger.warning("VOLCANO_CLONE_SPEAKER_IDS is empty. Voice cloning will be skipped.")
+        return None
+    
+    # 3. Find an unused ID
+    used_ids = set(v for v in mapping.values() if v != "FAILED")
+    unused_ids = [id for id in available_ids if id not in used_ids]
+    
+    if not unused_ids:
+        logger.warning(f"All {len(available_ids)} pre-allocated speaker IDs are used. No ID available for {speaker}.")
+        return None
+    
+    speaker_id = unused_ids[0]  # Use first available
+    logger.info(f"Assigning pre-allocated speaker ID {speaker_id} to {speaker}")
+    
+    # 4. Prepare credentials
     appid = _DEFAULT_SETTINGS.bytedance_appid
     access_token = _DEFAULT_SETTINGS.bytedance_access_token
     
     if not appid or not access_token:
         return None
         
-    # 3. Generate new ID and upload
-    # Using a deterministic but unique enough ID format
-    # cleaning speaker name to be safe
-    safe_speaker_name = re.sub(r'[^a-zA-Z0-9]', '_', speaker)[:20]
-    speaker_id = f"S_{safe_speaker_name}_{str(uuid.uuid4()).replace('-', '')[:8]}"
-    
+    # 5. Upload audio to this pre-allocated ID
     if _upload_audio_for_cloning(speaker_wav, appid, access_token, speaker_id):
         mapping[speaker] = speaker_id
         with open(mapping_path, 'w', encoding='utf-8') as f:
@@ -470,7 +621,11 @@ def bytedance_tts(
     
     for _ in range(3):
         try:
-            audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=is_cloned) # type: ignore
+            # Use V3 API for cloned voices (ICL 2.0), V1 API for preset voices
+            if is_cloned:
+                audio_data = bytedance_tts_v3_api(text, speaker=voice_type, use_cloned_voice=True)
+            else:
+                audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=False)
             if audio_data:
                 with open(output_path, "wb") as f:
                     f.write(audio_data)
