@@ -109,6 +109,15 @@ ipython_config.py
 #   https://pdm.fming.dev/#use-with-ide
 .pdm.toml
 
+# uv
+#   uv is an extremely fast Python package and project manager.
+#   uv.lock is the lockfile; whether to commit it depends on your project type:
+#   - For applications: commit uv.lock for reproducible builds
+#   - For libraries: you may choose to ignore it
+uv.lock
+.uv-cache/
+.python-version
+
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
@@ -121,7 +130,7 @@ celerybeat.pid
 
 # Environments
 .env
-.venv
+.venv*/
 env/
 venv/
 ENV/
@@ -168,3 +177,11 @@ download_list.txt
 get_upload_link.txt
 launch.json
 remove_mp4.py
+
+
+# gradio
+.gradio/
+
+# IDE
+.vscode/
+.cursor/

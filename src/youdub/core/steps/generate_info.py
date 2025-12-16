@@ -2,13 +2,16 @@ import json
 import os
 from PIL import Image
 
-
 def resize_thumbnail(folder, size=(1280, 960)):
     image_suffix = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
     for suffix in image_suffix:
         image_path = os.path.join(folder, f'download{suffix}')
         if os.path.exists(image_path):
             break
+    else:
+        # No image found, skip
+        return None
+
     with Image.open(image_path) as img:
         # Calculate the ratio and the size to maintain aspect ratio
         img_ratio = img.width / img.height
@@ -40,11 +43,19 @@ def resize_thumbnail(folder, size=(1280, 960)):
         return new_img_path
 
 def generate_summary_txt(folder):
-    with open(os.path.join(folder, 'summary.json'), 'r', encoding='utf-8') as f:
+    summary_path = os.path.join(folder, 'summary.json')
+    if not os.path.exists(summary_path):
+        return
+
+    with open(summary_path, 'r', encoding='utf-8') as f:
         summary = json.load(f)
-    title = f'{summary["title"]} - {summary["author"]}'
-    summary = summary['summary']
-    txt = f'{title}\n\n{summary}'
+    
+    # Handle cases where summary might be missing keys
+    title = summary.get("title", "Untitled")
+    author = summary.get("author", "Unknown")
+    summary_text = summary.get("summary", "")
+    
+    txt = f'{title} - {author}\n\n{summary_text}'
     with open(os.path.join(folder, 'video.txt'), 'w', encoding='utf-8') as f:
         f.write(txt)
 
@@ -57,5 +68,4 @@ def generate_all_info_under_folder(root_folder):
         if 'download.info.json' in files:
             generate_info(root)
     return f'Generated all info under {root_folder}'
-if __name__ == '__main__':
-    generate_all_info_under_folder('videos')
+
