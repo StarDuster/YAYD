@@ -44,7 +44,7 @@ def run_pipeline(
     whisper_min_speakers,
     whisper_max_speakers,
     translation_target_language,
-    force_bytedance,
+    tts_method,
     subtitles,
     speed_up,
     fps,
@@ -69,7 +69,7 @@ def run_pipeline(
             whisper_min_speakers=whisper_min_speakers,
             whisper_max_speakers=whisper_max_speakers,
             translation_target_language=translation_target_language,
-            force_bytedance=force_bytedance,
+            tts_method=tts_method,
             subtitles=subtitles,
             speed_up=speed_up,
             fps=fps,
@@ -119,7 +119,11 @@ do_everything_interface = gr.Interface(
             label="Translation Target Language",
             value=settings.translation_target_language,
         ),
-        gr.Checkbox(label="Force Bytedance", value=settings.force_bytedance),
+        gr.Dropdown(
+            ["bytedance", "xtts", "gemini"],
+            label="TTS Method",
+            value=settings.tts_method
+        ),
         gr.Checkbox(label="Subtitles", value=True),
         gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=1.05),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30),
@@ -230,17 +234,19 @@ translation_interface = gr.Interface(
 )
 
 
-def _tts_wrapper(folder, force_bytedance):
+def _tts_wrapper(folder, tts_method):
     names = (
         [model_manager._bytedance_requirement().name]  # type: ignore[attr-defined]
-        if force_bytedance
+        if tts_method == "bytedance"
+        else [model_manager._gemini_tts_requirement().name]  # type: ignore[attr-defined]
+        if tts_method == "gemini"
         else [model_manager._xtts_requirement().name]  # type: ignore[attr-defined]
     )
     return _safe_run(
         names,
         generate_all_wavs_under_folder,
         folder,
-        force_bytedance=force_bytedance,
+        tts_method=tts_method,
     )
 
 
@@ -248,7 +254,11 @@ tts_interface = gr.Interface(
     fn=_tts_wrapper,
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
-        gr.Checkbox(label="Force Bytedance", value=settings.force_bytedance),
+        gr.Dropdown(
+            ["bytedance", "xtts", "gemini"],
+            label="TTS Method",
+            value=settings.tts_method
+        ),
     ],
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )

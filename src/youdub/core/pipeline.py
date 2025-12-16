@@ -12,13 +12,13 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from .steps import (
     download,
-    generate_info,
+    generate_all_info_under_folder,
     separate_vocals,
+    synthesize_all_video_under_folder,
     synthesize_speech,
-    synthesize_video,
     transcribe,
     translate,
-    upload,
+    upload_all_videos_under_folder,
 )
 
 
@@ -56,7 +56,7 @@ class VideoPipeline:
         whisper_min_speakers: int | None,
         whisper_max_speakers: int | None,
         translation_target_language: str,
-        force_bytedance: bool,
+        tts_method: str,
         subtitles: bool,
         speed_up: float,
         fps: int,
@@ -108,15 +108,18 @@ class VideoPipeline:
                 transcribe.unload_all_models()
 
                 translate.translate_all_transcript_under_folder(folder, target_language=translation_target_language)
-                synthesize_speech.generate_all_wavs_under_folder(folder, force_bytedance=force_bytedance)
-                synthesize_video.synthesize_all_video_under_folder(
+                synthesize_speech.generate_all_wavs_under_folder(
+                    folder, 
+                    tts_method=tts_method,
+                )
+                synthesize_all_video_under_folder(
                     folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution
                 )
                 # Info + upload are optional/non-model heavy
-                generate_info.generate_all_info_under_folder(folder)
+                generate_all_info_under_folder(folder)
                 if auto_upload_video:
                     time.sleep(1)
-                    upload.upload_all_videos_under_folder(folder)
+                    upload_all_videos_under_folder(folder)
                 return True
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception(f"Error processing video {info.get('title')}: {exc}")
@@ -138,7 +141,7 @@ class VideoPipeline:
         whisper_min_speakers: int | None = None,
         whisper_max_speakers: int | None = None,
         translation_target_language: str | None = None,
-        force_bytedance: bool | None = None,
+        tts_method: str | None = None,
         subtitles: bool = True,
         speed_up: float = 1.05,
         fps: int = 30,
@@ -156,9 +159,8 @@ class VideoPipeline:
         whisper_download_root = whisper_download_root or str(self.settings.whisper_download_root)
         whisper_batch_size = whisper_batch_size or self.settings.whisper_batch_size
         translation_target_language = translation_target_language or self.settings.translation_target_language
-        if force_bytedance is None:
-            force_bytedance = self.settings.force_bytedance
-
+        tts_method = tts_method or self.settings.tts_method
+        
         required_models = [
             self.model_manager._demucs_requirement().name,  # type: ignore[attr-defined]
             self.model_manager._whisper_requirement().name,  # type: ignore[attr-defined]
@@ -166,10 +168,11 @@ class VideoPipeline:
         ]
         if whisper_diarization:
             required_models.append(self.model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
-        if force_bytedance:
-            required_models.append(self.model_manager._bytedance_requirement().name)  # type: ignore[attr-defined]
+            
+        if tts_method == "xtts":
+             required_models.append(self.model_manager._xtts_requirement().name)  # type: ignore[attr-defined]
         else:
-            required_models.append(self.model_manager._xtts_requirement().name)  # type: ignore[attr-defined]
+             required_models.append(self.model_manager._bytedance_requirement().name)  # type: ignore[attr-defined]
         self._ensure_models(required_models)
 
         url = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
@@ -202,7 +205,7 @@ class VideoPipeline:
                     whisper_min_speakers,
                     whisper_max_speakers,
                     translation_target_language,
-                    force_bytedance,
+                    tts_method,
                     subtitles,
                     speed_up,
                     fps,
@@ -233,7 +236,7 @@ class VideoPipeline:
                         whisper_min_speakers,
                         whisper_max_speakers,
                         translation_target_language,
-                        force_bytedance,
+                        tts_method,
                         subtitles,
                         speed_up,
                         fps,

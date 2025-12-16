@@ -89,6 +89,18 @@ def load_model(
     t_start = time.time()
     
     target_device = _AUTO_DEVICE if device == 'auto' else device
+    
+    # Configure torch hub to use our custom demucs directory
+    if settings:
+        try:
+            import torch
+            demucs_dir = settings.resolve_path(settings.demucs_model_dir)
+            if demucs_dir:
+                torch.hub.set_dir(str(demucs_dir))
+                logger.info(f"Set torch hub dir to {demucs_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to set torch hub dir: {e}")
+
     separator_cls = _get_demucs_separator_class()
     _SEPARATOR = separator_cls(model_name, device=target_device, progress=progress, shifts=shifts)
     

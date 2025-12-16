@@ -98,7 +98,7 @@ class ModelManager:
         path = self.settings.resolve_path(self.settings.xtts_model_path)
         hint = (
             "需要本地 XTTS v2 模型目录（包含 config.json / model.pth 等），"
-            "请提前下载并设置 XTTS_MODEL_PATH。若不用 XTTS，可开启 force_bytedance。"
+            "请提前下载并设置 XTTS_MODEL_PATH。若不用 XTTS，请将 TTS Method 设为 bytedance。"
         )
         return ModelRequirement(
             name="XTTS v2",
@@ -122,6 +122,17 @@ class ModelManager:
             env_keys=["BYTEDANCE_APPID", "BYTEDANCE_ACCESS_TOKEN"],
         )
 
+    def _gemini_tts_requirement(self) -> ModelRequirement:
+        hint = "配置 GEMINI_API_KEY 用于 Gemini TTS。"
+        env_present = bool(self.settings.gemini_api_key)
+        path = Path(".gemini_credentials_ok") if env_present else None
+        return ModelRequirement(
+            name="Gemini TTS Credentials",
+            path=path,
+            hint=hint,
+            env_keys=["GEMINI_API_KEY"],
+        )
+
     def list_requirements(self) -> list[ModelRequirement]:
         return [
             self._demucs_requirement(),
@@ -129,6 +140,7 @@ class ModelManager:
             self._whisper_align_requirement(),
             self._whisper_diarization_requirement(),
             self._xtts_requirement(),
+            self._gemini_tts_requirement(),
             self._bytedance_requirement(),
         ]
 

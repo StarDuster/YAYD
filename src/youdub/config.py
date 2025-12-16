@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         alias="DEMUCS_MODEL_NAME",
     )
     demucs_model_dir: Path = Field(
-        default=Path.home() / ".cache" / "torch" / "hub" / "checkpoints",
+        default=Path("models/demucs"),
         description="Folder containing Demucs weights (no auto-download)",
         alias="DEMUCS_MODEL_DIR",
     )
@@ -63,7 +63,11 @@ class Settings(BaseSettings):
         description="Local path to XTTS v2 model directory (no auto-download)",
         alias="XTTS_MODEL_PATH",
     )
-    force_bytedance: bool = Field(default=True, description="Force ByteDance TTS even when XTTS is available")
+    tts_method: str = Field(
+        default="bytedance",
+        description="TTS Engine to use (bytedance or xtts)",
+        alias="TTS_METHOD"
+    )
 
     # API tokens / credentials
     hf_token: Optional[str] = Field(default=None, description="HuggingFace token", alias="HF_TOKEN")
@@ -74,6 +78,24 @@ class Settings(BaseSettings):
     model_name: str = Field(default="gpt-3.5-turbo", description="Model name for summary/translation", alias="MODEL_NAME")
     bili_sessdata: Optional[str] = Field(default=None, description="Bilibili SESSDATA cookie", alias="BILI_SESSDATA")
     bili_jct: Optional[str] = Field(default=None, description="Bilibili bili_jct token", alias="BILI_BILI_JCT")
+    
+    # Gemini TTS
+    gemini_api_key: Optional[str] = Field(
+        default=None, 
+        description="Gemini API key for TTS",
+        alias="GEMINI_API_KEY"
+    )
+    gemini_tts_voice: str = Field(
+        default="Kore",
+        description="Gemini TTS voice name (30 options)",
+        alias="GEMINI_TTS_VOICE"
+    )
+    gemini_tts_model: str = Field(
+        default="gemini-2.5-flash-preview-tts",
+        description="Gemini TTS model identifier",
+        alias="GEMINI_TTS_MODEL"
+    )
+
 
     model_config = SettingsConfigDict(
         env_file=".env",

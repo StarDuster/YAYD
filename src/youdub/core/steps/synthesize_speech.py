@@ -25,6 +25,7 @@ from ..utils import save_wav, save_wav_norm
 _XTTS_MODEL = None
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
+_EMBEDDING_MODEL_LOAD_FAILED = False
 
 _DEFAULT_SETTINGS = Settings()
 _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
@@ -33,8 +34,43 @@ _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
 _BYTEDANCE_HOST = "openspeech.bytedance.com"
 _BYTEDANCE_API_URL = f"https://{_BYTEDANCE_HOST}/api/v1/tts"
 
+# --- Gemini TTS Client Cache ---
+_GEMINI_CLIENT = None
+
+def _get_gemini_client():
+    global _GEMINI_CLIENT
+    if _GEMINI_CLIENT is None:
+        try:
+            from google import genai
+        except ImportError:
+            logger.error("google-genai not installed. Please run 'uv sync'.")
+            return None
+            
+        api_key = _DEFAULT_SETTINGS.gemini_api_key
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not set in config/env.")
+            return None
+        # Explicitly pass the API key from settings as requested
+        _GEMINI_CLIENT = genai.Client(api_key=api_key)
+    return _GEMINI_CLIENT
+
 
 # --- Helper Functions ---
+
+def is_valid_wav(path: str) -> bool:
+    """Check if a file is a valid WAV file."""
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < 44:  # Minimal WAV header size
+        return False
+    try:
+        # Quick check with soundfile which is faster and strict on headers
+        import soundfile as sf
+        with sf.SoundFile(path) as f:
+            return True
+    except Exception:
+        return False
+
 
 def preprocess_text(text: str) -> str:
     text = text.replace('AI', '人工智能')
@@ -77,7 +113,11 @@ def adjust_audio_length(
 # --- Embedding & Speaker Matching Logic ---
 
 def load_embedding_model() -> None:
-    global _EMBEDDING_MODEL, _EMBEDDING_INFERENCE
+    global _EMBEDDING_MODEL, _EMBEDDING_INFERENCE, _EMBEDDING_MODEL_LOAD_FAILED
+    
+    if _EMBEDDING_MODEL_LOAD_FAILED:
+        raise RuntimeError("Embedding model previously failed to load. Skipping retry.")
+
     if _EMBEDDING_MODEL is not None and _EMBEDDING_INFERENCE is not None:
         return
 
@@ -93,6 +133,7 @@ def load_embedding_model() -> None:
         _EMBEDDING_INFERENCE = Inference(_EMBEDDING_MODEL, window="whole")
         logger.info("pyannote/embedding model loaded successfully.")
     except Exception as e:
+        _EMBEDDING_MODEL_LOAD_FAILED = True
         logger.error(f"Error loading pyannote/embedding model: {e}")
         raise
 
@@ -107,7 +148,8 @@ def generate_embedding(wav_path: str) -> np.ndarray:
 
 def bytedance_tts_api(
     text: str, 
-    voice_type: str = 'BV001_streaming'
+    voice_type: str = 'BV001_streaming',
+    use_cloned_voice: bool = False,
 ) -> bytes | None:
     appid = _DEFAULT_SETTINGS.bytedance_appid
     access_token = _DEFAULT_SETTINGS.bytedance_access_token
@@ -116,12 +158,17 @@ def bytedance_tts_api(
         logger.warning("ByteDance APPID or ACCESS_TOKEN not set.")
         return None
 
+    # Use volcano_icl cluster for cloned voices (ICL 1.0/2.0)
+    cluster = 'volcano_icl' if use_cloned_voice else 'volcano_tts'
+    
     header = {"Authorization": f"Bearer;{access_token}"}
+    if use_cloned_voice:
+        header["X-Api-Resource-Id"] = "seed-icl-2.0"
     request_json = {
         "app": {
             "appid": appid,
             "token": access_token,
-            "cluster": 'volcano_tts'
+            "cluster": cluster
         },
         "user": {
             "uid": "https://github.com/liuzhao1225/YouDub-webui"
@@ -169,13 +216,20 @@ def init_bytedance_reference_voices() -> None:
         'BV701_streaming'
     ]
     
+    # Try to load model first. If it fails, there's no point in generating audio that we can't embed.
+    try:
+        load_embedding_model()
+    except Exception:
+        logger.warning("Skipping initialization of Bytedance reference voices due to embedding model failure.")
+        return
+
     sample_text = 'YouDub 是一个创新的开源工具，专注于将 YouTube 等平台的优质视频翻译和配音为中文版本。'
     
     for voice_type in voice_types:
         wav_path = os.path.join(voice_type_dir, f'{voice_type}.wav')
         npy_path = wav_path.replace('.wav', '.npy')
         
-        if os.path.exists(wav_path) and os.path.exists(npy_path):
+        if os.path.exists(wav_path) and os.path.exists(npy_path) and is_valid_wav(wav_path):
             continue
             
         logger.info(f"Generating reference audio for {voice_type}...")
@@ -189,6 +243,8 @@ def init_bytedance_reference_voices() -> None:
                 np.save(npy_path, embedding)
             except Exception as e:
                 logger.error(f"Failed to generate embedding for {voice_type}: {e}")
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)  # Cleanup
 
 
 def generate_speaker_to_voice_type(folder: str) -> dict[str, str]:
@@ -215,6 +271,22 @@ def generate_speaker_to_voice_type(folder: str) -> dict[str, str]:
             
     if not os.path.exists(speaker_folder):
          return {}
+         
+    # Check model before loop to avoid spamming errors if model is broken
+    try:
+        load_embedding_model()
+    except Exception:
+        logger.warning("Embedding model unavailable, falling back to default voice for all speakers.")
+        # Fallback all to default
+        for file in os.listdir(speaker_folder):
+            if file.endswith('.wav'):
+                speaker = file.replace('.wav', '')
+                speaker_to_voice_type[speaker] = 'BV001_streaming'
+        
+        # Save fallback mapping
+        with open(speaker_to_voice_type_path, 'w', encoding='utf-8') as f:
+            json.dump(speaker_to_voice_type, f, indent=2, ensure_ascii=False)
+        return speaker_to_voice_type
 
     for file in os.listdir(speaker_folder):
         if not file.endswith('.wav'):
@@ -240,39 +312,185 @@ def generate_speaker_to_voice_type(folder: str) -> dict[str, str]:
     return speaker_to_voice_type
 
 
+def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_id: str) -> bool:
+    """Uploads audio to Volcano Engine to register a voice for cloning."""
+    url = f"https://{_BYTEDANCE_HOST}/api/v1/mega_tts/audio/upload"
+    # Header requires Resource-Id for ICL 2.0 (seed-icl-2.0)
+    header = {
+        "Authorization": f"Bearer;{token}",
+        "Resource-Id": "seed-icl-2.0", 
+    }
+    
+    try:
+        # Load audio and truncate to first 15 seconds (API limit is 10MB, 15s@24kHz ≈ 720KB)
+        MAX_DURATION_SECONDS = 15
+        SAMPLE_RATE = 24000
+        
+        wav_data, _ = librosa.load(audio_path, sr=SAMPLE_RATE, duration=MAX_DURATION_SECONDS)
+        
+        if len(wav_data) < SAMPLE_RATE:  # Less than 1 second
+            logger.warning(f"Audio {audio_path} too short for cloning (< 1 second).")
+            return False
+        
+        # Save truncated audio to a temporary buffer
+        import io
+        from scipy.io import wavfile
+        
+        # Normalize to int16
+        wav_int16 = (wav_data * 32767).astype(np.int16)
+        
+        buffer = io.BytesIO()
+        wavfile.write(buffer, SAMPLE_RATE, wav_int16)
+        audio_data = buffer.getvalue()
+        
+        logger.info(f"Uploading {len(audio_data) / 1024:.1f}KB audio for voice cloning ({len(wav_data) / SAMPLE_RATE:.1f}s)")
+
+        payload = {
+            "appid": appid,
+            "speaker_id": speaker_id,
+            "audios": [{
+                "audio_bytes": base64.b64encode(audio_data).decode('utf-8'),
+                "audio_format": "wav",
+            }],
+            "source": 2, # 2 for user uploaded
+            "language": 0, # 0 for auto (CN default), 1 for EN. Ideally should be detected.
+            "model_type": 4, # 4: ICL2.0 (Voice Cloning 2.0)
+        }
+        
+        logger.info(f"--- Voice Cloning Upload Request ---")
+        logger.info(f"URL: {url}")
+        logger.info(f"Headers: {header}")
+        # Log payload but truncate audio data
+        debug_payload = payload.copy()
+        if debug_payload.get('audios'):
+             debug_payload['audios'] = [{'audio_bytes': '<hidden>', 'audio_format': a['audio_format']} for a in debug_payload['audios']]
+        logger.info(f"Payload: {json.dumps(debug_payload, ensure_ascii=False)}")
+        logger.info(f"------------------------------------")
+        
+        resp = requests.post(url, json=payload, headers=header, timeout=120)
+        
+        try:
+            resp_json = resp.json()
+        except json.JSONDecodeError:
+            logger.error(f"Voice cloning upload response is not JSON: status={resp.status_code} text={resp.text[:200]}")
+            return False
+            
+        if resp_json.get("base_resp", {}).get("status_code") == 0:
+            logger.info(f"Successfully uploaded audio for cloning: {speaker_id}")
+            return True
+        else:
+            logger.warning(f"Failed to upload audio for cloning: {resp_json}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Exception during voice cloning upload: {e}")
+        return False
+
+
+def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> str | None:
+    """Gets existing cloned voice ID or creates a new one."""
+    
+    # 1. Check local cache
+    mapping_path = os.path.join(folder, 'speaker_to_cloned_voice.json')
+    mapping = {}
+    if os.path.exists(mapping_path):
+        with open(mapping_path, 'r', encoding='utf-8') as f:
+            mapping = json.load(f)
+            
+    if speaker in mapping:
+        cached_value = mapping[speaker]
+        # Return None if previously marked as failed
+        if cached_value == "FAILED":
+            return None
+        return cached_value
+
+    # 2. Prepare credentials
+    appid = _DEFAULT_SETTINGS.bytedance_appid
+    access_token = _DEFAULT_SETTINGS.bytedance_access_token
+    
+    if not appid or not access_token:
+        return None
+        
+    # 3. Generate new ID and upload
+    # Using a deterministic but unique enough ID format
+    # cleaning speaker name to be safe
+    safe_speaker_name = re.sub(r'[^a-zA-Z0-9]', '_', speaker)[:20]
+    speaker_id = f"S_{safe_speaker_name}_{str(uuid.uuid4()).replace('-', '')[:8]}"
+    
+    if _upload_audio_for_cloning(speaker_wav, appid, access_token, speaker_id):
+        mapping[speaker] = speaker_id
+        with open(mapping_path, 'w', encoding='utf-8') as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+        return speaker_id
+    
+    # Mark as failed to avoid retrying
+    mapping[speaker] = "FAILED"
+    with open(mapping_path, 'w', encoding='utf-8') as f:
+        json.dump(mapping, f, indent=2, ensure_ascii=False)
+    logger.warning(f"Voice cloning failed for {speaker}, will use default voice for all segments.")
+    
+    return None
+
+
 def bytedance_tts(
     text: str, 
     output_path: str, 
     speaker_wav: str, 
     voice_type: str | None = None
 ) -> None:
-    if os.path.exists(output_path):
-        logger.info(f'ByteDance TTS {text[:20]}... exists')
+    if os.path.exists(output_path) and is_valid_wav(output_path):
+        logger.info(f'ByteDance TTS {text[:20]}... exists (verified)')
         return
+    elif os.path.exists(output_path):
+        logger.warning(f"Removing invalid cached file: {output_path}")
+        os.remove(output_path)
 
     folder = os.path.dirname(os.path.dirname(output_path))
+    speaker = os.path.basename(speaker_wav).replace('.wav', '')
+    
+    # Strategy:
+    # 1. If voice_type provided explicitly (e.g. from UI override), use it.
+    # 2. If not, try to use CLONED voice (Voice Cloning).
+    # 3. If cloning fails/not available, fall back to MATCHED preset voice (Voice Matching).
     
     if voice_type is None:
-        speaker_to_voice_type = generate_speaker_to_voice_type(folder)
-        speaker = os.path.basename(speaker_wav).replace('.wav', '')
-        voice_type = speaker_to_voice_type.get(speaker, 'BV001_streaming')
+        # Try cloning first
+        cloned_voice_id = get_or_create_cloned_voice(folder, speaker, speaker_wav)
+        if cloned_voice_id:
+            voice_type = cloned_voice_id
+            logger.info(f"Using CLONED voice for {speaker}: {voice_type}")
+        else:
+            # Fallback to matching
+            speaker_to_voice_type = generate_speaker_to_voice_type(folder)
+            voice_type = speaker_to_voice_type.get(speaker, 'BV001_streaming')
+            logger.info(f"Using MATCHED voice for {speaker}: {voice_type}")
 
+    # Detect if we're using a cloned voice (cloned voice IDs start with 'S_')
+    is_cloned = voice_type.startswith('S_') if voice_type else False
+    
     for _ in range(3):
-        audio_data = bytedance_tts_api(text, voice_type=voice_type) # type: ignore
-        if audio_data:
-            with open(output_path, "wb") as f:
-                f.write(audio_data)
+        try:
+            audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=is_cloned) # type: ignore
+            if audio_data:
+                with open(output_path, "wb") as f:
+                    f.write(audio_data)
+                
+                # Validation
+                if is_valid_wav(output_path):
+                    logger.info(f'ByteDance TTS saved: {output_path}')
+                    time.sleep(0.1)
+                    break
+                else:
+                    logger.warning("Saved wav file seems corrupted or invalid.")
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
             
-            # Validation read
-            try:
-                librosa.load(output_path, sr=24000)
-                logger.info(f'ByteDance TTS saved: {output_path}')
-                time.sleep(0.1)
-                break
-            except Exception:
-                logger.warning("Saved wav file seems corrupted, retrying...")
-        
-        time.sleep(0.5)
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"ByteDance TTS loop failed: {e}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            time.sleep(0.5)
 
 
 # --- XTTS Logic ---
@@ -317,7 +535,19 @@ def load_xtts_model(
         
     logger.info(f'Loading XTTS model from {model_path}')
     t_start = time.time()
-    _XTTS_MODEL = TTS(model_path).to(device)
+
+    # Explicitly verify local files to prevent auto-download/hashing behavior
+    checkpoint = os.path.join(model_path, "model.pth")
+    config = os.path.join(model_path, "config.json")
+    vocab = os.path.join(model_path, "vocab.json")
+
+    if os.path.exists(checkpoint) and os.path.exists(config):
+        # Pass empty model_name to avoid lookup. 
+        # For XTTS, it seems passing the directory as model_path is preferred or it handles finding model.pth inside.
+        _XTTS_MODEL = TTS(model_name="", model_path=model_path, config_path=config, progress_bar=False).to(device)
+    else:
+        # Fallback to default behavior if specific files aren't found
+        _XTTS_MODEL = TTS(model_path).to(device)
     t_end = time.time()
     logger.info(f'XTTS model loaded in {t_end - t_start:.2f}s')
 
@@ -334,9 +564,12 @@ def xtts_tts(
 ) -> None:
     global _XTTS_MODEL
     
-    if os.path.exists(output_path):
-        logger.info(f'XTTS {text[:20]}... exists')
+    if os.path.exists(output_path) and is_valid_wav(output_path):
+        logger.info(f'XTTS {text[:20]}... exists (verified)')
         return
+    elif os.path.exists(output_path):
+        logger.warning(f"Removing invalid cached file: {output_path}")
+        os.remove(output_path)
     
     if _XTTS_MODEL is None:
         load_xtts_model(model_name, device, settings=settings, model_manager=model_manager)
@@ -346,10 +579,134 @@ def xtts_tts(
             wav = _XTTS_MODEL.tts(text, speaker_wav=speaker_wav, language=language) # type: ignore
             wav = np.array(wav)
             save_wav(wav, output_path)
-            logger.info(f'XTTS Generated: {text[:20]}...')
-            break
+            
+            if is_valid_wav(output_path):
+                logger.info(f'XTTS Generated: {text[:20]}...')
+                break
+            else:
+                logger.warning("XTTS generated invalid wav file.")
+                if os.path.exists(output_path):
+                    os.remove(output_path)
         except Exception as e:
             logger.warning(f'XTTS failed: {e}')
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+
+# --- Gemini TTS Logic ---
+
+def gemini_tts(
+    text: str,
+    output_path: str,
+    voice_name: str | None = None,
+) -> None:
+    """Generate speech using Gemini TTS and save to file using Best Practices."""
+    
+    if os.path.exists(output_path) and is_valid_wav(output_path):
+        logger.info(f'Gemini TTS {text[:20]}... exists (verified)')
+        return
+    elif os.path.exists(output_path):
+        logger.warning(f"Removing invalid cached file: {output_path}")
+        os.remove(output_path)
+    
+    # Lazy import to avoid hard dependency
+    try:
+        from google.genai import types
+        import wave
+    except ImportError:
+        logger.error("google-genai not installed. Please install it.")
+        return
+
+    client = _get_gemini_client()
+    if not client:
+        return
+    
+    model_name = _DEFAULT_SETTINGS.gemini_tts_model or "gemini-2.5-flash-preview-tts"
+    voice_name = voice_name or _DEFAULT_SETTINGS.gemini_tts_voice or 'Kore'
+
+    # Audio params
+    RATE = 24000
+    SAMPLE_WIDTH = 2 # 16-bit
+    CHANNELS = 1
+
+    max_retries = 10  # Increase retries for rate limits
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=voice_name,
+                            )
+                        )
+                    ),
+                )
+            )
+            
+            # Extract PCM data
+            if (response.candidates and 
+                response.candidates[0].content and 
+                response.candidates[0].content.parts and 
+                response.candidates[0].content.parts[0].inline_data):
+                
+                pcm_data = response.candidates[0].content.parts[0].inline_data.data
+                
+                # Write WAV using standard wave module for robustness
+                with wave.open(output_path, "wb") as wf:
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(SAMPLE_WIDTH)
+                    wf.setframerate(RATE)
+                    wf.writeframes(pcm_data)
+                
+                # Verify
+                if is_valid_wav(output_path):
+                    logger.info(f'Gemini TTS saved: {output_path}')
+                    time.sleep(0.1)
+                    return # Success
+                else:
+                    logger.warning("Gemini TTS wrote invalid file, retrying...")
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+            else:
+                logger.warning(f"Gemini TTS response structure unexpected. Candidates: {response.candidates}, PromptFeedback: {getattr(response, 'prompt_feedback', 'N/A')}")
+                try:
+                    logger.warning(f"Full response dump: {response}")
+                except Exception:
+                    pass
+                # Non-retriable unless it's a transient server error, but structure errors are usually permanent for the same input.
+                # Just incase, we increment retry but don't sleep huge amounts.
+                retry_count += 1
+                time.sleep(1)
+                continue
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                import re
+                # Try to find retry delay in seconds from error message
+                match = re.search(r'retry in (\d+\.?\d*)s', error_str)
+                delay = float(match.group(1)) if match else 20.0
+                # Add a little buffer
+                delay += 1.0
+                
+                logger.warning(f"Gemini TTS Rate Limit (429). Retrying in {delay}s... (Attempt {retry_count+1}/{max_retries})")
+                time.sleep(delay)
+                retry_count += 1
+                continue
+            else:
+                logger.error(f"Gemini TTS generation failed: {e}")
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                # Non-429 errors might not be worth retrying 10 times, but we'll stick to the loop for robustness
+                retry_count += 1
+                time.sleep(1)
+        
 
 
 # --- Init for Pipeline ---
@@ -361,7 +718,7 @@ def init_TTS(settings: Settings | None = None, model_manager: ModelManager | Non
 
 # --- Main Generation Logic ---
 
-def generate_wavs(folder: str, force_bytedance: bool = False) -> None:
+def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
     transcript_path = os.path.join(folder, 'translation.json')
     output_folder = os.path.join(folder, 'wavs')
     if not os.path.exists(output_folder):
@@ -385,14 +742,12 @@ def generate_wavs(folder: str, force_bytedance: bool = False) -> None:
         text = preprocess_text(line['translation'])
         output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
         speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
-        
-        # Determine TTS Method
-        if num_speakers == 1:
-             bytedance_tts(text, output_path, speaker_wav, voice_type='BV701_streaming')
-        elif force_bytedance:
-            bytedance_tts(text, output_path, speaker_wav)
+        if tts_method == 'xtts':
+             xtts_tts(text, output_path, speaker_wav)
+        elif tts_method == 'gemini':
+             gemini_tts(text, output_path)
         else:
-            xtts_tts(text, output_path, speaker_wav)
+             bytedance_tts(text, output_path, speaker_wav)
             
         # Audio stitching and timing adjustment
         start = line['start']
@@ -417,7 +772,14 @@ def generate_wavs(folder: str, force_bytedance: bool = False) -> None:
         desired_len = target_end - new_start
         
         # Adjust generated wav to fit desired length
-        wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
+        if os.path.exists(output_path) and is_valid_wav(output_path):
+            wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
+        else:
+            logger.warning(f"TTS generation failed via {tts_method} for segment {i}, using silence fallback.")
+            # Fallback to silence
+            target_samples = int(desired_len * 24000)
+            wav_chunk = np.zeros(target_samples, dtype=np.float32)
+            actual_len = desired_len
         
         full_wav = np.concatenate((full_wav, wav_chunk))
         line['end'] = new_start + actual_len
@@ -456,11 +818,11 @@ def generate_wavs(folder: str, force_bytedance: bool = False) -> None:
         save_wav_norm(full_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
 
 
-def generate_all_wavs_under_folder(root_folder: str, force_bytedance: bool = False) -> str:
+def generate_all_wavs_under_folder(root_folder: str, tts_method: str = 'bytedance') -> str:
     count = 0
     for root, dirs, files in os.walk(root_folder):
         if 'translation.json' in files and 'audio_combined.wav' not in files:
-            generate_wavs(root, force_bytedance)
+            generate_wavs(root, tts_method)
             count += 1
     msg = f'Generated all wavs under {root_folder} (processed {count} files)'
     logger.info(msg)

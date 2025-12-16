@@ -117,6 +117,10 @@ uv pip install -e .
     BYTEDANCE_APPID=xxxxxxxxxx
     BYTEDANCE_ACCESS_TOKEN=xxxxxxxxxx
 
+    # 由于 Google 的 API 限制过于严格
+    # (Tier 1 账户仅有 10 RPM 和 50 RPD 的限制)，请自备高 tier KEY
+    GOOGLE_API_KEY=xxxxxxxxxx
+
     # 如果你想自动上传到Bilibili
     BILI_SESSDATA=xxxxxxxxxx
     BILI_BILI_JCT=xxxxxxxxxx
