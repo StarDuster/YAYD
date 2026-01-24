@@ -4,12 +4,13 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Iterable
 
 from loguru import logger
 
 from ..config import Settings
-from ..models import ModelManager
+from ..models import ModelCheckError, ModelManager
 from .steps import (
     download,
     generate_all_info_under_folder,
@@ -62,6 +63,9 @@ class VideoPipeline:
         target_resolution: str,
         max_retries: int,
         auto_upload_video: bool,
+        use_nvenc: bool = False,
+        whisper_device: str | None = None,
+        whisper_cpu_model: str | None = None,
     ) -> bool:
         for retry in range(max_retries):
             try:
@@ -106,10 +110,12 @@ class VideoPipeline:
                 _require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
                 _require_file(os.path.join(folder, "audio_instruments.wav"), "伴奏轨(audio_instruments.wav)", min_bytes=44)
 
+                asr_device = whisper_device or device
                 transcribe.transcribe_all_audio_under_folder(
                     folder,
                     model_name=whisper_model,
-                    device=device,
+                    cpu_model_name=whisper_cpu_model,
+                    device=asr_device,
                     batch_size=whisper_batch_size,
                     diarization=whisper_diarization,
                     min_speakers=whisper_min_speakers,
@@ -135,7 +141,12 @@ class VideoPipeline:
                 _require_file(os.path.join(folder, "audio_combined.wav"), "配音合成(audio_combined.wav)", min_bytes=44)
 
                 synthesize_all_video_under_folder(
-                    folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution
+                    folder,
+                    subtitles=subtitles,
+                    speed_up=speed_up,
+                    fps=fps,
+                    resolution=target_resolution,
+                    use_nvenc=use_nvenc,
                 )
 
                 _require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
@@ -161,6 +172,8 @@ class VideoPipeline:
         device: str | None = None,
         shifts: int | None = None,
         whisper_model: str | None = None,
+        whisper_cpu_model: str | None = None,
+        whisper_device: str | None = None,
         whisper_batch_size: int | None = None,
         whisper_diarization: bool = True,
         whisper_min_speakers: int | None = None,
@@ -171,6 +184,7 @@ class VideoPipeline:
         speed_up: float = 1.05,
         fps: int = 30,
         target_resolution: str = "1080p",
+        use_nvenc: bool = False,
         max_workers: int = 1,
         max_retries: int = 3,
         auto_upload_video: bool = True,
@@ -181,13 +195,54 @@ class VideoPipeline:
         device = device or self.settings.demucs_device
         shifts = self.settings.demucs_shifts if shifts is None else shifts
         whisper_model = whisper_model or str(self.settings.whisper_model_path)
+        # Backward compatible defaults: ASR device defaults to Demucs device, unless explicitly set.
+        whisper_device = (whisper_device or getattr(self.settings, "whisper_device", None) or device).strip()
+        whisper_device = whisper_device or device
+        whisper_cpu_model = whisper_cpu_model or (str(getattr(self.settings, "whisper_cpu_model_path", "") or "") or None)
+        if whisper_cpu_model is not None:
+            whisper_cpu_model = str(whisper_cpu_model).strip() or None
         whisper_batch_size = whisper_batch_size or self.settings.whisper_batch_size
         translation_target_language = translation_target_language or self.settings.translation_target_language
         tts_method = tts_method or self.settings.tts_method
+
+        def _has_whisper_model_bin(model_dir: str | None) -> bool:
+            if not model_dir:
+                return False
+            try:
+                path = Path(str(model_dir)).expanduser()
+            except Exception:
+                return False
+            return path.is_dir() and (path / "model.bin").exists()
+
+        wd = (whisper_device or "auto").lower().strip()
+        if wd not in ("auto", "cuda", "cpu"):
+            wd = "auto"
+
+        # Validate ASR model path(s) early so UI can show friendly error instead of silent failures.
+        if wd == "cuda":
+            if not _has_whisper_model_bin(whisper_model):
+                raise ModelCheckError(
+                    f"Whisper GPU 模型目录无效或缺少 model.bin：{whisper_model}\n"
+                    "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_MODEL_PATH。"
+                )
+        elif wd == "cpu":
+            chosen = whisper_cpu_model or whisper_model
+            if not _has_whisper_model_bin(chosen):
+                raise ModelCheckError(
+                    f"Whisper CPU 模型目录无效或缺少 model.bin：{chosen}\n"
+                    "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_CPU_MODEL_PATH / WHISPER_MODEL_PATH。"
+                )
+        else:
+            if not (_has_whisper_model_bin(whisper_model) or _has_whisper_model_bin(whisper_cpu_model)):
+                raise ModelCheckError(
+                    "Whisper 模型目录无效或缺少 model.bin。\n"
+                    f"- WHISPER_MODEL_PATH: {whisper_model}\n"
+                    f"- WHISPER_CPU_MODEL_PATH: {whisper_cpu_model}\n"
+                    "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_MODEL_PATH / WHISPER_CPU_MODEL_PATH。"
+                )
         
         required_models = [
             self.model_manager._demucs_requirement().name,  # type: ignore[attr-defined]
-            self.model_manager._whisper_requirement().name,  # type: ignore[attr-defined]
         ]
         if whisper_diarization:
             required_models.append(self.model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
@@ -207,7 +262,26 @@ class VideoPipeline:
         with ThreadPoolExecutor() as executor:
             executor.submit(separate_vocals.init_demucs, self.settings, self.model_manager)
             executor.submit(synthesize_speech.init_TTS, self.settings, self.model_manager)
-            executor.submit(transcribe.init_asr, self.settings, self.model_manager)
+            # Preload ASR model best-effort to reduce first-request latency.
+            # Respect explicit Whisper device selection from UI; for "auto" keep legacy behavior.
+            if wd == "cpu":
+                executor.submit(
+                    transcribe.load_asr_model,
+                    whisper_cpu_model or whisper_model,
+                    device="cpu",
+                    settings=self.settings,
+                    model_manager=self.model_manager,
+                )
+            elif wd == "cuda":
+                executor.submit(
+                    transcribe.load_asr_model,
+                    whisper_model,
+                    device="cuda",
+                    settings=self.settings,
+                    model_manager=self.model_manager,
+                )
+            else:
+                executor.submit(transcribe.init_asr, self.settings, self.model_manager)
 
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
@@ -236,6 +310,9 @@ class VideoPipeline:
                     target_resolution,
                     max_retries,
                     auto_upload_video,
+                    use_nvenc,
+                    wd,
+                    whisper_cpu_model,
                 )
                 if success:
                     success_list.append(info)
@@ -266,6 +343,9 @@ class VideoPipeline:
                         target_resolution,
                         max_retries,
                         auto_upload_video,
+                        use_nvenc,
+                        wd,
+                        whisper_cpu_model,
                     ): info
                     for info in info_list
                 }

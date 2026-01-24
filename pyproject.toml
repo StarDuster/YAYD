@@ -43,8 +43,7 @@ dependencies = [
     # Use CTranslate2 >= 4.5.0 to align with cuDNN 9 (avoid cuDNN 8 split libs like libcudnn_ops_infer.so.8).
     "ctranslate2>=4.5.0,<5.0.0",
     # faster-whisper VAD uses onnxruntime. Prefer GPU build on Linux.
-    "onnxruntime-gpu; sys_platform == 'linux'",
-    "onnxruntime; sys_platform != 'linux'",
+    "onnxruntime",
 
     # Speaker diarization / speaker embedding (used by diarization + bytedance voice matching; optional at runtime)
     "pyannote.audio>=3.1.0,<5.0.0",
@@ -76,6 +75,12 @@ dependencies = [
 [project.optional-dependencies]
 # Development dependencies
 dev = ["pytest>=7.0.0", "black>=23.0.0", "ruff>=0.1.0"]
+# Optional GPU acceleration stack (Linux).
+# Use: `uv sync --extra gpu`
+gpu = [
+    # Used by our cuDNN preloader (and helps onnxruntime/ctranslate2 GPU providers).
+    "nvidia-cudnn-cu12; sys_platform == 'linux'",
+]
 
 [project.scripts]
 youdub = "youdub.app:main"
@@ -99,15 +104,20 @@ target-version = ["py310"]
 # --- UV Package Manager Configuration ---
 
 [[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
-# faster-whisper / qwen-tts depend on `onnxruntime`, but on Linux we intentionally provide the
-# `onnxruntime` module via the GPU build (`onnxruntime-gpu`) to enable CUDA execution providers.
+# faster-whisper / qwen-tts depend on `onnxruntime`. We declare the runtime explicitly in
+# [project.dependencies], and patch upstream metadata to avoid forcing a specific onnxruntime wheel.
 dependency-metadata = [
-    # Patch faster-whisper to avoid forcing the CPU-only `onnxruntime` wheel.
+    # Patch faster-whisper to avoid forcing a bundled onnxruntime dependency.
     { name = "faster-whisper", version = "1.2.1", provides-extra = ["conversion", "dev"], requires-dist = [
         "ctranslate2<5,>=4.0",
         "huggingface-hub>=0.21",
@@ -120,7 +130,7 @@ dependency-metadata = [
         "isort==5.*; extra == \"dev\"",
         "pytest==7.*; extra == \"dev\"",
     ] },
-    # Patch qwen-tts to avoid forcing the CPU-only `onnxruntime` wheel.
+    # Patch qwen-tts to avoid forcing a bundled onnxruntime dependency.
     { name = "qwen-tts", version = "0.0.5", requires-dist = [
         "transformers==4.57.3",
         "accelerate==1.12.0",
@@ -134,5 +144,11 @@ dependency-metadata = [
 ]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
-torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and extra == 'gpu'" },
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and extra == 'gpu'" },
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]

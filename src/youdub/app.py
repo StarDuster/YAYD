@@ -38,6 +38,8 @@ def run_pipeline(
     device,
     shifts,
     whisper_model,
+    whisper_device,
+    whisper_cpu_model,
     whisper_batch_size,
     whisper_diarization,
     whisper_min_speakers,
@@ -47,6 +49,7 @@ def run_pipeline(
     subtitles,
     speed_up,
     fps,
+    use_nvenc,
     target_resolution,
     max_workers,
     max_retries,
@@ -62,6 +65,8 @@ def run_pipeline(
             device=device,
             shifts=shifts,
             whisper_model=whisper_model,
+            whisper_device=whisper_device,
+            whisper_cpu_model=whisper_cpu_model,
             whisper_batch_size=whisper_batch_size,
             whisper_diarization=whisper_diarization,
             whisper_min_speakers=whisper_min_speakers,
@@ -72,6 +77,7 @@ def run_pipeline(
             speed_up=speed_up,
             fps=fps,
             target_resolution=target_resolution,
+            use_nvenc=use_nvenc,
             max_workers=max_workers,
             max_retries=max_retries,
             auto_upload_video=auto_upload_video,
@@ -107,6 +113,8 @@ do_everything_interface = gr.Interface(
         gr.Radio(["auto", "cuda", "cpu"], label="Demucs Device", value=settings.demucs_device),
         gr.Slider(minimum=0, maximum=10, step=1, label="Number of shifts", value=settings.demucs_shifts),
         gr.Textbox(label="Whisper Model", value=str(settings.whisper_model_path)),
+        gr.Radio(["auto", "cuda", "cpu"], label="Whisper Device", value=settings.whisper_device),
+        gr.Textbox(label="Whisper CPU Model Path", value=str(settings.whisper_cpu_model_path or "")),
         gr.Slider(minimum=1, maximum=128, step=1, label="Whisper Batch Size", value=settings.whisper_batch_size),
         gr.Checkbox(label="Whisper Diarization", value=True),
         gr.Radio([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], label="Whisper Min Speakers", value=None),
@@ -124,6 +132,7 @@ do_everything_interface = gr.Interface(
         gr.Checkbox(label="Subtitles", value=True),
         gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=1.05),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30),
+        gr.Checkbox(label="Use NVENC (h264_nvenc)", value=False),
         gr.Radio(
             ["4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
             label="Resolution",
@@ -131,7 +140,7 @@ do_everything_interface = gr.Interface(
         ),
         gr.Slider(minimum=1, maximum=100, step=1, label="Max Workers", value=1),
         gr.Slider(minimum=1, maximum=10, step=1, label="Max Retries", value=3),
-        gr.Checkbox(label="Auto Upload Video", value=True),
+        gr.Checkbox(label="Auto Upload Video", value=False),
     ],
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )
@@ -182,18 +191,16 @@ demucs_interface = gr.Interface(
 )
 
 whisper_inference = gr.Interface(
-    fn=lambda folder, model, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
-        [
-            model_manager._whisper_requirement().name,  # type: ignore[attr-defined]
-            *(  # include diarization requirement only when enabled
-                [model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
-                if diarization
-                else []
-            ),
-        ],
+    fn=lambda folder, model, cpu_model, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
+        (
+            [model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
+            if diarization
+            else []
+        ),
         transcribe_all_audio_under_folder,
         folder,
         model_name=model,
+        cpu_model_name=cpu_model,
         device=device,
         batch_size=batch_size,
         diarization=diarization,
@@ -205,7 +212,8 @@ whisper_inference = gr.Interface(
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Textbox(label="Model", value=str(settings.whisper_model_path)),
-        gr.Radio(["auto", "cuda", "cpu"], label="Device", value=settings.demucs_device),
+        gr.Textbox(label="CPU Model (optional)", value=str(settings.whisper_cpu_model_path or "")),
+        gr.Radio(["auto", "cuda", "cpu"], label="Whisper Device", value=settings.whisper_device),
         gr.Slider(minimum=1, maximum=128, step=1, label="Batch Size", value=settings.whisper_batch_size),
         gr.Checkbox(label="Diarization", value=True),
         gr.Radio([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], label="Whisper Min Speakers", value=None),
@@ -276,6 +284,7 @@ syntehsize_video_interface = gr.Interface(
             label="Resolution",
             value="1080p",
         ),
+        gr.Checkbox(label="Use NVENC (h264_nvenc)", value=False),
     ],
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )

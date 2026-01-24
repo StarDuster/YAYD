@@ -16,7 +16,7 @@ from loguru import logger
 
 from ...config import Settings
 from ...models import ModelCheckError, ModelManager
-from ..utils import save_wav
+from ..utils import ensure_torchaudio_backend_compat, save_wav
 
 
 def _import_faster_whisper():
@@ -151,10 +151,13 @@ def _ensure_assets(
     require_diarization: bool,
 ) -> None:
     model_manager.enforce_offline()
-    names = [model_manager._whisper_requirement().name]  # type: ignore[attr-defined]
+    # NOTE: Whisper ASR model path is often provided via UI arguments (not only Settings).
+    # Avoid enforcing a fixed Settings-based path here; `load_asr_model()` will validate the
+    # actual model_dir passed in (expects model.bin).
     if require_diarization:
-        names.append(model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
-    model_manager.ensure_ready(names=names)
+        model_manager.ensure_ready(
+            names=[model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
+        )
 
 
 def _default_compute_type(device: str) -> str:
@@ -186,7 +189,9 @@ def load_asr_model(
     model_path = Path(model_dir)
     if not model_path.exists():
         raise ModelCheckError(
-            f"Whisper model directory not found: {model_path}. Please download faster-whisper CTranslate2 model and set WHISPER_MODEL_PATH."
+            "Whisper model directory not found: "
+            f"{model_path}. Please download faster-whisper CTranslate2 model and set "
+            "WHISPER_MODEL_PATH (or WHISPER_CPU_MODEL_PATH when using CPU)."
         )
     if model_path.is_dir() and not (model_path / "model.bin").exists():
         raise ModelCheckError(f"Whisper CTranslate2 model missing model.bin: {model_path}")
@@ -208,9 +213,19 @@ def load_asr_model(
 def init_asr(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
+    requested_device = getattr(settings, "whisper_device", "auto")
+    resolved_device = requested_device
+    if resolved_device == "auto":
+        resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model_dir = str(settings.whisper_model_path)
+    cpu_dir = getattr(settings, "whisper_cpu_model_path", None)
+    if resolved_device == "cpu" and cpu_dir:
+        model_dir = str(cpu_dir)
+
     load_asr_model(
-        model_dir=str(settings.whisper_model_path),
-        device="auto",
+        model_dir=model_dir,
+        device=resolved_device,
         settings=settings,
         model_manager=model_manager,
     )
@@ -246,6 +261,10 @@ def load_diarize_model(
     key = f"{device}|{diar_dir_str}"
     if _DIARIZATION_PIPELINE is not None and _DIARIZATION_KEY == key:
         return
+
+    # pyannote.audio<=3.1 imports torchaudio.set_audio_backend at import time, but torchaudio>=2.10 removed it.
+    # Provide a no-op shim so diarization can still work with the default backend.
+    ensure_torchaudio_backend_compat()
 
     try:
         from pyannote.audio import Pipeline  # type: ignore
@@ -419,6 +438,7 @@ def _assign_speakers_by_overlap(
 def transcribe_audio(
     folder: str,
     model_name: str | None = None,
+    cpu_model_name: str | None = None,
     device: str = "auto",
     batch_size: int = 32,
     diarization: bool = True,
@@ -471,6 +491,15 @@ def transcribe_audio(
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device == "cpu":
+        # Prefer explicit CPU model path (UI arg) -> settings default -> fallback to model_name.
+        cpu_candidate = (cpu_model_name or "").strip()
+        if not cpu_candidate:
+            cpu_dir = getattr(settings, "whisper_cpu_model_path", None)
+            cpu_candidate = str(cpu_dir).strip() if cpu_dir else ""
+        if cpu_candidate:
+            model_name = cpu_candidate
 
     load_asr_model(
         model_dir=model_name,
@@ -549,6 +578,7 @@ def transcribe_audio(
 def transcribe_all_audio_under_folder(
     folder: str,
     model_name: str | None = None,
+    cpu_model_name: str | None = None,
     device: str = "auto",
     batch_size: int = 32,
     diarization: bool = True,
@@ -564,6 +594,7 @@ def transcribe_all_audio_under_folder(
         ok = transcribe_audio(
             root,
             model_name=model_name,
+            cpu_model_name=cpu_model_name,
             device=device,
             batch_size=batch_size,
             diarization=diarization,

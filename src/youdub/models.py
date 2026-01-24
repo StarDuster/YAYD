@@ -56,10 +56,19 @@ class ModelManager:
         )
 
     def _whisper_requirement(self) -> ModelRequirement:
-        path = self.settings.resolve_path(self.settings.whisper_model_path)
+        gpu_path = self.settings.resolve_path(self.settings.whisper_model_path)
+        cpu_path = self.settings.resolve_path(getattr(self.settings, "whisper_cpu_model_path", None))
+        # Prefer a path that actually contains model.bin (CTranslate2 model).
+        path = None
+        for candidate in (gpu_path, cpu_path):
+            if candidate and candidate.is_dir() and (candidate / "model.bin").exists():
+                path = candidate
+                break
+        if path is None:
+            path = gpu_path or cpu_path
         hint = (
             "faster-whisper CTranslate2 offline model directory required (should contain model.bin)."
-            f"Please download and place at: {path} (or set WHISPER_MODEL_PATH)."
+            f"Please download and place at: {path} (set WHISPER_MODEL_PATH, or WHISPER_CPU_MODEL_PATH for CPU)."
         )
         return ModelRequirement(
             name=f"Whisper ASR ({self.settings.whisper_model_name})",

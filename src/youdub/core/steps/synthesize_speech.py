@@ -20,7 +20,7 @@ from scipy.spatial.distance import cosine
 from ...config import Settings
 from ...models import ModelCheckError, ModelManager
 from ..cn_tx import TextNorm
-from ..utils import save_wav, save_wav_norm
+from ..utils import ensure_torchaudio_backend_compat, save_wav, save_wav_norm
 
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
@@ -176,6 +176,7 @@ def load_embedding_model() -> None:
 
     try:
         try:
+            ensure_torchaudio_backend_compat()
             from pyannote.audio import Inference, Model  # type: ignore
         except Exception as exc:  # pylint: disable=broad-except
             raise RuntimeError(

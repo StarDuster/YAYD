@@ -126,7 +126,8 @@ def synthesize_video(
     subtitles: bool = True, 
     speed_up: float = 1.05, 
     fps: int = 30, 
-    resolution: str = '1080p'
+    resolution: str = '1080p',
+    use_nvenc: bool = False,
 ) -> None:
     output_video = os.path.join(folder, 'video.mp4')
     if os.path.exists(output_video):
@@ -182,6 +183,7 @@ def synthesize_video(
     else:
         filter_complex = f"[0:v]{video_speed_filter}[v];[1:a]{audio_speed_filter}[a]"
         
+    video_encoder = "h264_nvenc" if use_nvenc else "libx264"
     ffmpeg_command = [
         'ffmpeg',
         '-i', input_video,
@@ -191,7 +193,7 @@ def synthesize_video(
         '-map', '[a]',
         '-r', str(fps),
         '-s', res_string,
-        '-c:v', 'libx264',
+        '-c:v', video_encoder,
         '-c:a', 'aac',
         output_video,
         '-y'
@@ -202,6 +204,20 @@ def synthesize_video(
         time.sleep(1)
         logger.info(f"Synthesized video: {output_video}")
     except subprocess.CalledProcessError as e:
+        if use_nvenc:
+            logger.warning(f"FFmpeg failed with NVENC ({video_encoder}), fallback to libx264: {e}")
+            ffmpeg_command_fallback = ffmpeg_command.copy()
+            try:
+                idx = ffmpeg_command_fallback.index("-c:v") + 1
+                ffmpeg_command_fallback[idx] = "libx264"
+            except ValueError:
+                # Should not happen: keep best-effort fallback.
+                pass
+            subprocess.run(ffmpeg_command_fallback, check=True)
+            time.sleep(1)
+            logger.info(f"Synthesized video (libx264 fallback): {output_video}")
+            return
+
         logger.error(f"FFmpeg failed: {e}")
         raise
 
@@ -211,7 +227,8 @@ def synthesize_all_video_under_folder(
     subtitles: bool = True, 
     speed_up: float = 1.05, 
     fps: int = 30, 
-    resolution: str = '1080p'
+    resolution: str = '1080p',
+    use_nvenc: bool = False,
 ) -> str:
     count = 0
     for root, _dirs, files in os.walk(folder):
@@ -224,7 +241,14 @@ def synthesize_all_video_under_folder(
         except Exception:
             # Treat as not present/invalid and re-synthesize.
             pass
-        synthesize_video(root, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=resolution)
+        synthesize_video(
+            root,
+            subtitles=subtitles,
+            speed_up=speed_up,
+            fps=fps,
+            resolution=resolution,
+            use_nvenc=use_nvenc,
+        )
         count += 1
     msg = f'Synthesized all videos under {folder} (processed {count} files)'
     logger.info(msg)

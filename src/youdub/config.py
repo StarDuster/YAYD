@@ -33,6 +33,19 @@ class Settings(BaseSettings):
         description="Path to the locally downloaded faster-whisper CTranslate2 model directory (expects model.bin)",
         alias="WHISPER_MODEL_PATH",
     )
+    whisper_cpu_model_path: Optional[Path] = Field(
+        default=None,
+        description=(
+            "Optional path to a CPU-optimized faster-whisper CTranslate2 model directory (e.g., int8). "
+            "Used when Whisper device resolves to CPU. If unset, WHISPER_MODEL_PATH will be used."
+        ),
+        alias="WHISPER_CPU_MODEL_PATH",
+    )
+    whisper_device: str = Field(
+        default="auto",
+        description="cuda/cpu/auto for Whisper ASR",
+        alias="WHISPER_DEVICE",
+    )
     whisper_diarization_model_dir: Optional[Path] = Field(
         default=Path("models/ASR/whisper/diarization"),
         description="Path to diarization model cache (offline, no auto-download)",
