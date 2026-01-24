@@ -74,7 +74,6 @@ def test_generate_wavs_qwen_path_smoke(tmp_path, monkeypatch):
 
     ss.generate_wavs(str(folder), tts_method="qwen")
 
-    # Outputs
     assert (folder / "audio_tts.wav").exists()
     assert (folder / "audio_combined.wav").exists()
     assert (folder / "wavs" / "0000.wav").exists()
