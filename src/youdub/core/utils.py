@@ -4,6 +4,16 @@ import numpy as np
 from scipy.io import wavfile
 
 
+def _peak_abs(wav: np.ndarray) -> float:
+    """Return max absolute amplitude without allocating a full `abs(wav)` temp array."""
+    if wav.size <= 0:
+        return 0.0
+    # Two-pass (max+min) but constant memory; avoids `np.abs(wav)` doubling peak memory for long audio.
+    max_val = float(np.max(wav))
+    min_val = float(np.min(wav))
+    return max(abs(max_val), abs(min_val))
+
+
 def ensure_torchaudio_backend_compat() -> None:
     """
     Compatibility shim for torchaudio>=2.10.
@@ -45,13 +55,15 @@ def save_wav(wav: np.ndarray, output_path: str, sample_rate: int = 24000) -> Non
     wavfile.write(output_path, sample_rate, wav_i16.astype(np.int16))
 
 def save_wav_norm(wav: np.ndarray, output_path: str, sample_rate: int = 24000) -> None:
-    wav_norm = wav * (32767 / max(0.01, np.max(np.abs(wav))))
+    peak = _peak_abs(wav)
+    wav_norm = wav * (32767 / max(0.01, peak))
     wavfile.write(output_path, sample_rate, wav_norm.astype(np.int16))
 
 def normalize_wav(wav_path: str) -> None:
     try:
         sample_rate, wav = wavfile.read(wav_path)
-        wav_norm = wav * (32767 / max(0.01, np.max(np.abs(wav))))
+        peak = _peak_abs(wav)
+        wav_norm = wav * (32767 / max(0.01, peak))
         wavfile.write(wav_path, sample_rate, wav_norm.astype(np.int16))
     except Exception as e:
         print(f"Error normalizing wav {wav_path}: {e}")
