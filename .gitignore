@@ -186,3 +186,10 @@ remove_mp4.py
 # IDE
 .vscode/
 .cursor/
+
+# Local misc (not for repo)
+misc/
+
+# Debug artifacts from misc scripts
+debug_gemini_output.bin
+test_gemini.wav
