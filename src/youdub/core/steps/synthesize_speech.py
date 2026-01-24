@@ -3,10 +3,11 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
-from typing import Any
 
 import librosa
 import numpy as np
@@ -20,7 +21,6 @@ from ...models import ModelCheckError, ModelManager
 from ..cn_tx import TextNorm
 from ..utils import save_wav, save_wav_norm
 
-# --- Global Caches ---
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
 _EMBEDDING_MODEL_LOAD_FAILED = False
@@ -28,11 +28,9 @@ _EMBEDDING_MODEL_LOAD_FAILED = False
 _DEFAULT_SETTINGS = Settings()
 _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
 
-# --- ByteDance TTS Constants ---
 _BYTEDANCE_HOST = "openspeech.bytedance.com"
 _BYTEDANCE_API_URL = f"https://{_BYTEDANCE_HOST}/api/v1/tts"
 
-# --- Gemini TTS Client Cache ---
 _GEMINI_CLIENT = None
 
 def _get_gemini_client():
@@ -48,12 +46,9 @@ def _get_gemini_client():
         if not api_key:
             logger.warning("GEMINI_API_KEY not set in config/env.")
             return None
-        # Explicitly pass the API key from settings as requested
         _GEMINI_CLIENT = genai.Client(api_key=api_key)
     return _GEMINI_CLIENT
 
-
-# --- Helper Functions ---
 
 def is_valid_wav(path: str) -> bool:
     """Check if a file is a valid WAV file."""
@@ -62,9 +57,8 @@ def is_valid_wav(path: str) -> bool:
     if os.path.getsize(path) < 44:  # Minimal WAV header size
         return False
     try:
-        # Quick check with soundfile which is faster and strict on headers
         import soundfile as sf
-        with sf.SoundFile(path) as f:
+        with sf.SoundFile(path):
             return True
     except Exception:
         return False
@@ -75,7 +69,6 @@ def preprocess_text(text: str) -> str:
     text = re.sub(r'(?<!^)([A-Z])', r' \1', text)
     normalizer = TextNorm()
     text = normalizer(text)
-    # Insert space between letters and numbers
     text = re.sub(r'(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])', ' ', text)
     return text
 
@@ -98,17 +91,22 @@ def adjust_audio_length(
     
     new_desired_length = current_length * speed_factor
     
-    target_path = wav_path.replace('.wav', '_adjusted.wav')
+    target_path = wav_path.replace(".wav", "_adjusted.wav")
     stretch_audio(wav_path, target_path, ratio=speed_factor, sample_rate=sample_rate)
     
-    wav_stretched, _ = librosa.load(target_path, sr=sample_rate)
+    try:
+        wav_stretched, _ = librosa.load(target_path, sr=sample_rate)
+    finally:
+        # 临时文件仅用于中间 stretch，避免长期堆积占用磁盘。
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+        except Exception:
+            pass
     
-    # Trim to exactly new_desired_length in samples
     target_samples = int(new_desired_length * sample_rate)
     return wav_stretched[:target_samples], new_desired_length
 
-
-# --- Embedding & Speaker Matching Logic ---
 
 def load_embedding_model() -> None:
     global _EMBEDDING_MODEL, _EMBEDDING_INFERENCE, _EMBEDDING_MODEL_LOAD_FAILED
@@ -130,7 +128,11 @@ def load_embedding_model() -> None:
 
         logger.info("Loading pyannote/embedding model...")
         token = _DEFAULT_SETTINGS.hf_token
-        _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
+        # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
+        try:
+            _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token)
+        except TypeError:
+            _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
         
         if _EMBEDDING_MODEL is None:
             logger.error("Failed to load pyannote/embedding. Please check HF_TOKEN.")
@@ -152,7 +154,6 @@ def generate_embedding(wav_path: str) -> np.ndarray:
     return embedding
 
 
-# --- V3 Async TTS API (supports ICL 2.0 voice cloning) ---
 _BYTEDANCE_V3_SUBMIT_URL = f"https://{_BYTEDANCE_HOST}/api/v3/tts/submit"
 _BYTEDANCE_V3_QUERY_URL = f"https://{_BYTEDANCE_HOST}/api/v3/tts/query"
 
@@ -181,7 +182,6 @@ def bytedance_tts_v3_api(
         logger.warning("ByteDance APPID or ACCESS_TOKEN not set.")
         return None
 
-    # Determine resource ID based on voice type
     if use_cloned_voice:
         resource_id = "seed-icl-2.0"
     else:
@@ -210,7 +210,6 @@ def bytedance_tts_v3_api(
         }
     }
     
-    # Step 1: Submit task
     try:
         logger.debug(f"V3 TTS Submit: speaker={speaker}, text={text[:30]}...")
         resp = requests.post(_BYTEDANCE_V3_SUBMIT_URL, json=submit_payload, headers=headers, timeout=30)
@@ -231,7 +230,6 @@ def bytedance_tts_v3_api(
         logger.error(f"V3 TTS submit exception: {e}")
         return None
     
-    # Step 2: Poll for result
     query_payload = {"task_id": task_id}
     max_polls = 60  # Max 60 seconds
     poll_interval = 1.0
@@ -253,7 +251,6 @@ def bytedance_tts_v3_api(
             elif task_status == 2:  # Success
                 audio_url = resp_json.get("data", {}).get("audio_url")
                 if audio_url:
-                    # Download the audio
                     audio_resp = requests.get(audio_url, timeout=60)
                     if audio_resp.status_code == 200:
                         logger.info(f"V3 TTS success: {len(audio_resp.content)} bytes")
@@ -291,7 +288,6 @@ def bytedance_tts_api(
         logger.warning("ByteDance APPID or ACCESS_TOKEN not set.")
         return None
 
-    # Use volcano_icl cluster for cloned voices (ICL 1.0/2.0)
     cluster = 'volcano_icl' if use_cloned_voice else 'volcano_tts'
     
     header = {"Authorization": f"Bearer;{access_token}"}
@@ -349,7 +345,6 @@ def init_bytedance_reference_voices() -> None:
         'BV701_streaming'
     ]
     
-    # Try to load model first. If it fails, there's no point in generating audio that we can't embed.
     try:
         load_embedding_model()
     except Exception:
@@ -405,18 +400,15 @@ def generate_speaker_to_voice_type(folder: str) -> dict[str, str]:
     if not os.path.exists(speaker_folder):
          return {}
          
-    # Check model before loop to avoid spamming errors if model is broken
     try:
         load_embedding_model()
     except Exception:
         logger.warning("Embedding model unavailable, falling back to default voice for all speakers.")
-        # Fallback all to default
         for file in os.listdir(speaker_folder):
             if file.endswith('.wav'):
                 speaker = file.replace('.wav', '')
                 speaker_to_voice_type[speaker] = 'BV001_streaming'
         
-        # Save fallback mapping
         with open(speaker_to_voice_type_path, 'w', encoding='utf-8') as f:
             json.dump(speaker_to_voice_type, f, indent=2, ensure_ascii=False)
         return speaker_to_voice_type
@@ -431,7 +423,6 @@ def generate_speaker_to_voice_type(folder: str) -> dict[str, str]:
             embedding = generate_embedding(wav_path)
             np.save(wav_path.replace('.wav', '.npy'), embedding)
             
-            # Find closest voice type
             best_match = sorted(voice_types.keys(), key=lambda x: 1 - cosine(voice_types[x], embedding))[0]
             speaker_to_voice_type[speaker] = best_match
             logger.info(f'Matched {speaker} to {best_match}')
@@ -448,7 +439,6 @@ def generate_speaker_to_voice_type(folder: str) -> dict[str, str]:
 def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_id: str) -> bool:
     """Uploads audio to Volcano Engine to register a voice for cloning."""
     url = f"https://{_BYTEDANCE_HOST}/api/v1/mega_tts/audio/upload"
-    # Header requires Resource-Id for ICL 2.0 (seed-icl-2.0)
     header = {
         "Authorization": f"Bearer;{token}",
         "Resource-Id": "seed-icl-2.0", 
@@ -465,11 +455,9 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
             logger.warning(f"Audio {audio_path} too short for cloning (< 1 second).")
             return False
         
-        # Save truncated audio to a temporary buffer
         import io
         from scipy.io import wavfile
         
-        # Normalize to int16
         wav_int16 = (wav_data * 32767).astype(np.int16)
         
         buffer = io.BytesIO()
@@ -493,7 +481,6 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
         logger.info(f"--- Voice Cloning Upload Request ---")
         logger.info(f"URL: {url}")
         logger.info(f"Headers: {header}")
-        # Log payload but truncate audio data
         debug_payload = payload.copy()
         if debug_payload.get('audios'):
              debug_payload['audios'] = [{'audio_bytes': '<hidden>', 'audio_format': a['audio_format']} for a in debug_payload['audios']]
@@ -533,7 +520,6 @@ def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> s
     Example: VOLCANO_CLONE_SPEAKER_IDS=S_PoN0a1CN1,S_OoN0a1CN1,S_NoN0a1CN1
     """
     
-    # 1. Check local cache
     mapping_path = os.path.join(folder, 'speaker_to_cloned_voice.json')
     mapping = {}
     if os.path.exists(mapping_path):
@@ -542,12 +528,10 @@ def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> s
             
     if speaker in mapping:
         cached_value = mapping[speaker]
-        # Return None if previously marked as failed
         if cached_value == "FAILED":
             return None
         return cached_value
 
-    # 2. Get pre-allocated speaker IDs from environment
     volcano_speaker_ids_str = os.getenv('VOLCANO_CLONE_SPEAKER_IDS', '')
     if not volcano_speaker_ids_str:
         logger.warning("VOLCANO_CLONE_SPEAKER_IDS not set in .env. Voice cloning will be skipped.")
@@ -559,7 +543,6 @@ def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> s
         logger.warning("VOLCANO_CLONE_SPEAKER_IDS is empty. Voice cloning will be skipped.")
         return None
     
-    # 3. Find an unused ID
     used_ids = set(v for v in mapping.values() if v != "FAILED")
     unused_ids = [id for id in available_ids if id not in used_ids]
     
@@ -570,21 +553,18 @@ def get_or_create_cloned_voice(folder: str, speaker: str, speaker_wav: str) -> s
     speaker_id = unused_ids[0]  # Use first available
     logger.info(f"Assigning pre-allocated speaker ID {speaker_id} to {speaker}")
     
-    # 4. Prepare credentials
     appid = _DEFAULT_SETTINGS.bytedance_appid
     access_token = _DEFAULT_SETTINGS.bytedance_access_token
     
     if not appid or not access_token:
         return None
         
-    # 5. Upload audio to this pre-allocated ID
     if _upload_audio_for_cloning(speaker_wav, appid, access_token, speaker_id):
         mapping[speaker] = speaker_id
         with open(mapping_path, 'w', encoding='utf-8') as f:
             json.dump(mapping, f, indent=2, ensure_ascii=False)
         return speaker_id
     
-    # Mark as failed to avoid retrying
     mapping[speaker] = "FAILED"
     with open(mapping_path, 'w', encoding='utf-8') as f:
         json.dump(mapping, f, indent=2, ensure_ascii=False)
@@ -609,36 +589,26 @@ def bytedance_tts(
     folder = os.path.dirname(os.path.dirname(output_path))
     speaker = os.path.basename(speaker_wav).replace('.wav', '')
     
-    # Strategy:
-    # 1. If voice_type provided explicitly (e.g. from UI override), use it.
-    # 2. If not, try to use CLONED voice (Voice Cloning).
-    # 3. If cloning fails/not available, fall back to MATCHED preset voice (Voice Matching).
-    
     if voice_type is None:
-        # Try cloning first
         cloned_voice_id = get_or_create_cloned_voice(folder, speaker, speaker_wav)
         if cloned_voice_id:
             voice_type = cloned_voice_id
             logger.info(f"Using CLONED voice for {speaker}: {voice_type}")
         else:
-            # Fallback to matching
             speaker_to_voice_type = generate_speaker_to_voice_type(folder)
             voice_type = speaker_to_voice_type.get(speaker, 'BV001_streaming')
             logger.info(f"Using MATCHED voice for {speaker}: {voice_type}")
 
-    # Detect if we're using a cloned voice (cloned voice IDs start with 'S_')
     is_cloned = voice_type.startswith('S_') if voice_type else False
     
     for _ in range(3):
         try:
-            # Use V3 API for cloned voices (ICL 2.0), V1 API for preset voices
-            # Use V1 API for both, as V3 gives 55000000 error for ICL currently 
+            # ICL 2.0 当前使用 V1 接口更稳定
             audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=is_cloned)
             if audio_data:
                 with open(output_path, "wb") as f:
                     f.write(audio_data)
                 
-                # Validation
                 if is_valid_wav(output_path):
                     logger.info(f'ByteDance TTS saved: {output_path}')
                     time.sleep(0.1)
@@ -656,16 +626,11 @@ def bytedance_tts(
             time.sleep(0.5)
 
 
-# --- Qwen3-TTS (Worker) Logic ---
-
 _QWEN_WORKER_READY = "__READY__"
 _QWEN_WORKER_STUB_ENV = "YOUDUB_QWEN_WORKER_STUB"
 
 
 def _get_qwen_worker_script_path() -> Path:
-    # Repository layout:
-    #   repo/scripts/qwen_tts_worker.py
-    #   repo/src/youdub/core/steps/synthesize_speech.py  (this file)
     repo_root = Path(__file__).resolve().parents[4]
     return repo_root / "scripts" / "qwen_tts_worker.py"
 
@@ -680,30 +645,122 @@ class _QwenTtsWorker:
         if stub:
             cmd.append("--stub")
 
+        logger.info(f"Starting Qwen3-TTS worker (stub={stub})")
+        logger.debug(f"Qwen3-TTS worker cmd: {' '.join(cmd)}")
+
         try:
             self._proc = subprocess.Popen(  # noqa: S603
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
         except Exception as exc:
             raise ModelCheckError(f"无法启动 Qwen3-TTS worker：{exc}") from exc
 
+        logger.info(f"Qwen3-TTS worker pid={self._proc.pid}, waiting for ready...")
+
+        self._stderr_tail: deque[str] = deque(maxlen=200)
+
+        def _drain_stderr() -> None:
+            stream = self._proc.stderr
+            if stream is None:
+                return
+            try:
+                for line in stream:
+                    s = line.rstrip("\n")
+                    if s:
+                        self._stderr_tail.append(s)
+            except Exception:
+                # Best-effort: avoid crashing main flow due to stderr reader issues.
+                return
+
+        threading.Thread(target=_drain_stderr, daemon=True).start()
+
+        startup_begin = time.monotonic()
+        startup_done = threading.Event()
+        startup_timed_out = threading.Event()
+        try:
+            startup_timeout_sec = float(os.getenv("YOUDUB_QWEN_WORKER_STARTUP_TIMEOUT_SEC", "1800") or "1800")
+        except Exception:
+            startup_timeout_sec = 1800.0
+
+        def _startup_heartbeat() -> None:
+            # 避免“正在加载但完全没日志输出”的错觉
+            while not startup_done.wait(10.0):
+                elapsed = time.monotonic() - startup_begin
+                logger.info(f"Qwen3-TTS worker loading... ({elapsed:.1f}s)")
+
+        def _startup_watchdog() -> None:
+            if startup_timeout_sec <= 0:
+                return
+            if startup_done.wait(startup_timeout_sec):
+                return
+            startup_timed_out.set()
+            logger.error(
+                f"Qwen3-TTS worker startup timeout after {startup_timeout_sec:.0f}s, terminating."
+            )
+            try:
+                self._proc.terminate()
+            except Exception:
+                return
+
+        threading.Thread(target=_startup_heartbeat, daemon=True).start()
+        threading.Thread(target=_startup_watchdog, daemon=True).start()
+
         assert self._proc.stdout is not None
-        ready = self._proc.stdout.readline().strip()
-        if ready != _QWEN_WORKER_READY:
+        startup_stdout_tail: list[str] = []
+        ready_ok = False
+        try:
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if not s:
+                    continue
+                if s == _QWEN_WORKER_READY:
+                    ready_ok = True
+                    break
+                startup_stdout_tail.append(s)
+                if len(startup_stdout_tail) > 50:
+                    startup_stdout_tail = startup_stdout_tail[-50:]
+        finally:
+            startup_done.set()
+
+        if ready_ok:
+            elapsed = time.monotonic() - startup_begin
+            logger.info(f"Qwen3-TTS worker ready in {elapsed:.1f}s")
+
+        if not ready_ok:
+            rc = self._proc.poll()
+            stdout_tail = "\n".join(startup_stdout_tail).strip()
+            stderr_tail = "\n".join(list(self._stderr_tail)).strip()
             self.close()
-            raise ModelCheckError(f"Qwen3-TTS worker 启动失败：{ready}")
+
+            details: list[str] = []
+            if startup_timed_out.is_set():
+                details.append(f"startup_timeout_sec={startup_timeout_sec:.0f}")
+            if rc is not None:
+                details.append(f"exit_code={rc}")
+                if rc == -9:
+                    details.append("看起来像是被 SIGKILL 杀掉（常见原因：内存不足/OOM 或 WSL2 内存限制）")
+            if stdout_tail:
+                details.append("stdout:\n" + stdout_tail)
+            if stderr_tail:
+                details.append("stderr:\n" + stderr_tail)
+
+            extra = ("\n" + "\n".join(details)) if details else ""
+            raise ModelCheckError(f"Qwen3-TTS worker 启动失败。{extra}")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "_QwenTtsWorker":
         py = settings.resolve_path(settings.qwen_tts_python_path)
         if not py or not py.exists():
             raise ModelCheckError(
-                f"Qwen3-TTS Python 不存在：{py}。请创建独立环境安装 qwen-tts，并设置 QWEN_TTS_PYTHON。"
+                f"Qwen3-TTS Python 不存在：{py}。请将 QWEN_TTS_PYTHON 指向一个可用的 python（该环境需安装 qwen-tts）。"
             )
 
         model_dir = settings.resolve_path(settings.qwen_tts_model_path)
@@ -732,13 +789,54 @@ class _QwenTtsWorker:
         self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
 
-        line = self._proc.stdout.readline()
-        if not line:
-            raise RuntimeError("Qwen3-TTS worker 无输出")
+        begin = time.monotonic()
+        done = threading.Event()
 
-        resp = json.loads(line)
+        def _heartbeat() -> None:
+            # 单段生成耗时较长时，提供可见的“还在跑”的日志
+            while not done.wait(10.0):
+                elapsed = time.monotonic() - begin
+                logger.info(f"Qwen3-TTS generating... ({elapsed:.1f}s) -> {output_path}")
+
+        threading.Thread(target=_heartbeat, daemon=True).start()
+
+        skipped: list[str] = []
+        max_skip = 50
+        try:
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                    extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                    raise RuntimeError("Qwen3-TTS worker 无输出" + extra)
+
+                s = line.strip()
+                if not s:
+                    continue
+
+                try:
+                    resp = json.loads(s)
+                    break
+                except json.JSONDecodeError:
+                    skipped.append(s)
+                    if len(skipped) >= max_skip:
+                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                        noise = "\n".join(skipped[-10:])
+                        raise RuntimeError(
+                            "Qwen3-TTS worker 输出无法解析为 JSON（协议被日志污染）。"
+                            f"\nstdout_tail:\n{noise}{extra}"
+                        )
+                    continue
+        finally:
+            done.set()
+
         if not resp.get("ok"):
-            raise RuntimeError(str(resp.get("error", "unknown error")))
+            err = str(resp.get("error", "unknown error"))
+            trace = resp.get("trace")
+            if trace:
+                raise RuntimeError(err + "\n" + str(trace))
+            raise RuntimeError(err)
 
     def close(self) -> None:
         proc = getattr(self, "_proc", None)
@@ -756,8 +854,6 @@ class _QwenTtsWorker:
             pass
 
 
-# --- Gemini TTS Logic ---
-
 def gemini_tts(
     text: str,
     output_path: str,
@@ -772,7 +868,6 @@ def gemini_tts(
         logger.warning(f"Removing invalid cached file: {output_path}")
         os.remove(output_path)
     
-    # Lazy import to avoid hard dependency
     try:
         from google.genai import types
         import wave
@@ -787,7 +882,6 @@ def gemini_tts(
     model_name = _DEFAULT_SETTINGS.gemini_tts_model or "gemini-2.5-flash-preview-tts"
     voice_name = voice_name or _DEFAULT_SETTINGS.gemini_tts_voice or 'Kore'
 
-    # Audio params
     RATE = 24000
     SAMPLE_WIDTH = 2 # 16-bit
     CHANNELS = 1
@@ -812,7 +906,6 @@ def gemini_tts(
                 )
             )
             
-            # Extract PCM data
             if (response.candidates and 
                 response.candidates[0].content and 
                 response.candidates[0].content.parts and 
@@ -820,14 +913,12 @@ def gemini_tts(
                 
                 pcm_data = response.candidates[0].content.parts[0].inline_data.data
                 
-                # Write WAV using standard wave module for robustness
                 with wave.open(output_path, "wb") as wf:
                     wf.setnchannels(CHANNELS)
                     wf.setsampwidth(SAMPLE_WIDTH)
                     wf.setframerate(RATE)
                     wf.writeframes(pcm_data)
                 
-                # Verify
                 if is_valid_wav(output_path):
                     logger.info(f'Gemini TTS saved: {output_path}')
                     time.sleep(0.1)
@@ -842,8 +933,6 @@ def gemini_tts(
                     logger.warning(f"Full response dump: {response}")
                 except Exception:
                     pass
-                # Non-retriable unless it's a transient server error, but structure errors are usually permanent for the same input.
-                # Just incase, we increment retry but don't sleep huge amounts.
                 retry_count += 1
                 time.sleep(1)
                 continue
@@ -852,10 +941,8 @@ def gemini_tts(
             error_str = str(e)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 import re
-                # Try to find retry delay in seconds from error message
                 match = re.search(r'retry in (\d+\.?\d*)s', error_str)
                 delay = float(match.group(1)) if match else 20.0
-                # Add a little buffer
                 delay += 1.0
                 
                 logger.warning(f"Gemini TTS Rate Limit (429). Retrying in {delay}s... (Attempt {retry_count+1}/{max_retries})")
@@ -866,22 +953,15 @@ def gemini_tts(
                 logger.error(f"Gemini TTS generation failed: {e}")
                 if os.path.exists(output_path):
                     os.remove(output_path)
-                # Non-429 errors might not be worth retrying 10 times, but we'll stick to the loop for robustness
                 retry_count += 1
                 time.sleep(1)
         
 
 
-# --- Init for Pipeline ---
-
 def init_TTS(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
     """Pre-initialize models if needed (mainly for warming up)."""
-    # Qwen3-TTS runs in an external worker process (separate venv) to avoid dependency conflicts.
-    # Warm-up is intentionally skipped here to avoid heavy model load at pipeline startup.
     return
 
-
-# --- Main Generation Logic ---
 
 def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
     transcript_path = os.path.join(folder, 'translation.json')
@@ -896,9 +976,10 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
         
-    speakers = set(line['speaker'] for line in transcript)
+    speakers = set(line["speaker"] for line in transcript)
     num_speakers = len(speakers)
-    logger.info(f'Found {num_speakers} speakers')
+    total_segments = len(transcript)
+    logger.info(f"TTS({tts_method}) 开始：segments={total_segments}, speakers={num_speakers}, folder={folder}")
     
     full_wav = np.zeros((0, ))
 
@@ -908,13 +989,18 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
 
     try:
         for i, line in enumerate(transcript):
-            speaker = line['speaker']
-            text = preprocess_text(line['translation'])
-            output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
-            speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
+            speaker = line["speaker"]
+            text = preprocess_text(line["translation"])
+            output_path = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
+            speaker_wav = os.path.join(folder, "SPEAKER", f"{speaker}.wav")
+            seg_no = i + 1
+            cached_before = os.path.exists(output_path) and is_valid_wav(output_path)
+            cache_tag = " [cached]" if cached_before else ""
+            logger.info(f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}")
             if tts_method == 'qwen' and qwen_worker is not None:
                 try:
-                    qwen_worker.synthesize(text, speaker_wav, output_path, language="Auto")
+                    if not cached_before:
+                        qwen_worker.synthesize(text, speaker_wav, output_path, language="Auto")
                 except Exception as exc:
                     logger.warning(f"Qwen3-TTS worker failed for segment {i}: {exc}")
             elif tts_method == 'gemini':
@@ -922,13 +1008,11 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
             else:
                 bytedance_tts(text, output_path, speaker_wav)
             
-            # Audio stitching and timing adjustment
             start = line['start']
             original_length = line['end'] - start
             
             current_full_end = len(full_wav) / 24000.0
             
-            # If there is a gap between current end and next start, fill with silence
             if start > current_full_end:
                 silence_dur = start - current_full_end
                 full_wav = np.concatenate((full_wav, np.zeros((int(silence_dur * 24000), ))))
@@ -944,12 +1028,10 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
                 
             desired_len = target_end - new_start
             
-            # Adjust generated wav to fit desired length
             if os.path.exists(output_path) and is_valid_wav(output_path):
                 wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
             else:
                 logger.warning(f"TTS generation failed via {tts_method} for segment {i}, using silence fallback.")
-                # Fallback to silence
                 target_samples = int(desired_len * 24000)
                 wav_chunk = np.zeros(target_samples, dtype=np.float32)
                 actual_len = desired_len
@@ -960,20 +1042,18 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
         if qwen_worker is not None:
             qwen_worker.close()
 
-    # Mixing with background music
     vocal_wav_path = os.path.join(folder, 'audio_vocals.wav')
     if os.path.exists(vocal_wav_path):
         vocal_wav, _ = librosa.load(vocal_wav_path, sr=24000)
-        # Normalize volume of TTS to match original vocals peak
         if len(full_wav) > 0 and np.max(np.abs(full_wav)) > 0:
             full_wav = full_wav / np.max(np.abs(full_wav)) * np.max(np.abs(vocal_wav))
             
     save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'), sample_rate=24000)
+    logger.info(f'Generated {os.path.join(folder, "audio_tts.wav")}')
     
     with open(transcript_path, 'w', encoding='utf-8') as f:
         json.dump(transcript, f, indent=2, ensure_ascii=False)
 
-    # Combine with instruments
     instruments_path = os.path.join(folder, 'audio_instruments.wav')
     if os.path.exists(instruments_path):
         instruments_wav, _ = librosa.load(instruments_path, sr=24000)
