@@ -166,6 +166,17 @@ TRANSLATION_STRATEGY=parallel
 # guide_parallel 模式下的并发数
 TRANSLATION_MAX_CONCURRENCY=4
 
+# --- yt-dlp 下载认证 (可选) ---
+# 需要登录才能访问的内容（私有播放列表、年龄限制视频等）可配置 cookies。
+# 优先级：YTDLP_COOKIE_PATH > YTDLP_COOKIES_FROM_BROWSER
+#
+# 方案 A（推荐）：使用浏览器导出的 cookies.txt（Netscape 格式）
+YTDLP_COOKIE_PATH=
+#
+# 方案 B：直接从浏览器读取 cookies（在部分环境可能不可用）
+YTDLP_COOKIES_FROM_BROWSER=
+YTDLP_COOKIES_FROM_BROWSER_PROFILE=
+
 # --- B站上传配置 (可选) ---
 # cookie 文件路径（由 biliup login 生成）
 BILI_COOKIE_PATH=bili_cookies.json
@@ -194,6 +205,25 @@ uv run youdub
     *   点击“提交”，系统将自动执行下载、分离、识别、翻译、合成全流程。
 3.  **分步模式**:
     *   可在各标签页单独执行特定步骤（如仅下载、仅翻译、仅 TTS），便于调试或人工修正中间结果（如修正 `translation.json`）。
+
+### yt-dlp 使用 Cookie（可选）
+
+当下载 YouTube 遇到需要登录/年龄限制/私有内容等情况，可配置 cookies：
+
+1.  导出 cookies.txt（Netscape 格式）并设置：
+
+```ini
+YTDLP_COOKIE_PATH=yt_cookies.txt
+```
+
+2.  或直接从浏览器读取（不建议作为首选，兼容性依赖环境）：
+
+```ini
+YTDLP_COOKIES_FROM_BROWSER=chrome
+YTDLP_COOKIES_FROM_BROWSER_PROFILE=Default
+```
+
+> 提醒：cookies 属于敏感信息，不要提交到仓库；本项目已在 `.gitignore` 中忽略常见的 cookies 文件名。
 
 ### B 站上传
 

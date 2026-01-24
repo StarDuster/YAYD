@@ -91,7 +91,7 @@ class VideoPipeline:
                     return True
 
                 check_cancelled()
-                folder = download.download_single_video(info, root_folder, resolution)
+                folder = download.download_single_video(info, root_folder, resolution, settings=self.settings)
                 if folder is None:
                     logger.warning(f"下载失败: {info.get('title')}")
                     return False
@@ -321,7 +321,7 @@ class VideoPipeline:
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
 
-        info_list = list(download.get_info_list_from_url(urls, num_videos))
+        info_list = list(download.get_info_list_from_url(urls, num_videos, settings=self.settings))
 
         if max_workers <= 1:
             for info in info_list:

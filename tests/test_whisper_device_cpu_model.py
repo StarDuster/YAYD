@@ -162,7 +162,7 @@ def test_pipeline_warmup_loads_cpu_model_when_whisper_device_cpu(tmp_path: Path,
     monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda urls, num: [])
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: [])
 
     calls: list[tuple[str, str]] = []
 
@@ -204,7 +204,7 @@ def test_pipeline_warmup_loads_gpu_model_when_whisper_device_cuda(tmp_path: Path
     monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda urls, num: [])
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: [])
 
     calls: list[tuple[str, str]] = []
 

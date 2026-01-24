@@ -202,3 +202,8 @@ qrcode.png
 upload.log
 download.log
 ds_update.log
+
+# yt-dlp cookies (local secrets)
+cookies.txt
+yt_cookies.txt
+ytdlp_cookies.txt

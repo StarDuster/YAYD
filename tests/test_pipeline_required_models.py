@@ -46,7 +46,7 @@ def test_pipeline_builds_required_model_list_for_method(
     monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.transcribe, "init_asr", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda urls, num: [])
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: [])
 
     pipe = pl.VideoPipeline(settings=settings, model_manager=manager)
     out = pipe.run(

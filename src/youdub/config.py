@@ -13,6 +13,23 @@ class Settings(BaseSettings):
     # General paths
     root_folder: Path = Field(default=Path("videos"), description="Base folder for downloads and outputs")
 
+    # yt-dlp (video download)
+    ytdlp_cookie_path: Optional[Path] = Field(
+        default=None,
+        description="Path to Netscape-format cookies file for yt-dlp (optional)",
+        alias="YTDLP_COOKIE_PATH",
+    )
+    ytdlp_cookies_from_browser: Optional[str] = Field(
+        default=None,
+        description="Read cookies directly from browser for yt-dlp (e.g., chrome/firefox/edge). Ignored if YTDLP_COOKIE_PATH is set.",
+        alias="YTDLP_COOKIES_FROM_BROWSER",
+    )
+    ytdlp_cookies_from_browser_profile: Optional[str] = Field(
+        default=None,
+        description="Browser profile for YTDLP_COOKIES_FROM_BROWSER (optional, e.g., Default/Profile 1)",
+        alias="YTDLP_COOKIES_FROM_BROWSER_PROFILE",
+    )
+
     # Demucs
     demucs_model_name: str = Field(
         default="htdemucs_ft",
