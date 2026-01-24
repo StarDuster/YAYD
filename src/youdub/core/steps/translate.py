@@ -735,16 +735,26 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
     
+    cfg = settings or _DEFAULT_SETTINGS
+    translation_model = cfg.model_name
+    
     if os.path.exists(summary_path):
         try:
             with open(summary_path, 'r', encoding='utf-8') as f:
                 summary = json.load(f)
+            # Backfill translation_model if missing
+            if "translation_model" not in summary:
+                summary["translation_model"] = translation_model
+                with open(summary_path, 'w', encoding='utf-8') as f:
+                    json.dump(summary, f, indent=2, ensure_ascii=False)
         except Exception:
             summary = summarize(info, transcript, target_language, settings=settings)
+            summary["translation_model"] = translation_model
             with open(summary_path, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
     else:
         summary = summarize(info, transcript, target_language, settings=settings)
+        summary["translation_model"] = translation_model
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 

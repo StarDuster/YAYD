@@ -161,9 +161,31 @@ def _upload_video_with_biliup(
     title_english = data.get("title", "")
     webpage_url = data.get("webpage_url", "")
 
+    # Read model information for description
+    translation_model = summary.get("translation_model", "")
+    tts_method = ""
+    tts_done_path = os.path.join(folder, ".tts_done.json")
+    if os.path.exists(tts_done_path):
+        try:
+            with open(tts_done_path, "r", encoding="utf-8") as f:
+                tts_done = json.load(f)
+            tts_method = tts_done.get("tts_method", "")
+        except Exception:
+            pass
+
+    # Build model info line
+    model_info_parts = []
+    if translation_model:
+        model_info_parts.append(f"翻译模型: {translation_model}")
+    if tts_method:
+        tts_display = {"bytedance": "ByteDance TTS", "gemini": "Gemini TTS", "qwen": "Qwen3-TTS"}.get(tts_method, tts_method)
+        model_info_parts.append(f"配音模型: {tts_display}")
+    model_info_line = " | ".join(model_info_parts) if model_info_parts else ""
+
     description = (
         f"{webpage_url}\n{title_english}\n{summary_text}\n\n"
-        "项目地址：https://github.com/StarDuster/YAYD\n"
+        + (f"{model_info_line}\n" if model_info_line else "")
+        + "项目地址：https://github.com/StarDuster/YAYD\n"
         "YAYD 是 YouDub-webui 的一个 fork，旨在将 YouTube 和其他平台上的高质量视频翻译和配音成中文版本。"
         "该工具结合了最新的 AI 技术，包括语音识别、大型语言模型翻译，以及 AI 声音克隆技术，"
         "提供与原视频相似的中文配音，为中文用户提供卓越的观看体验。"

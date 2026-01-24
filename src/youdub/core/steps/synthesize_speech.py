@@ -1465,7 +1465,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             
     check_cancelled()
     save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'), sample_rate=24000)
-        logger.info(f'已生成 {os.path.join(folder, "audio_tts.wav")}')
+    logger.info(f'已生成 {os.path.join(folder, "audio_tts.wav")}')
     
     with open(transcript_path, 'w', encoding='utf-8') as f:
         json.dump(transcript, f, indent=2, ensure_ascii=False)
