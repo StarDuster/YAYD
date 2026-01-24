@@ -66,5 +66,5 @@ def normalize_wav(wav_path: str) -> None:
         wav_norm = wav * (32767 / max(0.01, peak))
         wavfile.write(wav_path, sample_rate, wav_norm.astype(np.int16))
     except Exception as e:
-        print(f"Error normalizing wav {wav_path}: {e}")
+        print(f"标准化音频文件失败 {wav_path}: {e}")
 

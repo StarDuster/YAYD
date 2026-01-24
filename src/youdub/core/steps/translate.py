@@ -110,26 +110,26 @@ def _handle_sdk_exception(exc: Exception, attempt: int) -> float | None:
     """Return sleep seconds for retry, or None to stop retrying."""
     # --- OpenAI compatible SDK exceptions ---
     if isinstance(exc, (AuthenticationError,)):
-        logger.error(f"LLM authentication failed: {exc}")
+        logger.error(f"LLM认证失败: {exc}")
         return None
     if isinstance(exc, (BadRequestError,)):
-        logger.error(f"LLM request parameter error: {exc}")
+        logger.error(f"LLM请求参数错误: {exc}")
         return None
     if isinstance(exc, (RateLimitError,)):
         delay = min(2 ** attempt, 30)
-        logger.warning(f"LLM rate limited, retrying after {delay}s: {exc}")
+        logger.warning(f"LLM速率限制，{delay}秒后重试: {exc}")
         return float(delay)
     if isinstance(exc, (APITimeoutError, APIConnectionError)):
         delay = min(2 ** attempt, 20)
-        logger.warning(f"LLM connection/timeout, retrying after {delay}s: {exc}")
+        logger.warning(f"LLM连接/超时，{delay}秒后重试: {exc}")
         return float(delay)
     if isinstance(exc, APIStatusError):
         status = getattr(exc, "status_code", None)
         if status in {500, 502, 503, 504}:
             delay = min(2 ** attempt, 20)
-            logger.warning(f"LLM server error ({status}), retrying after {delay}s: {exc}")
+            logger.warning(f"LLM服务器错误 ({status})，{delay}秒后重试: {exc}")
             return float(delay)
-        logger.error(f"LLM request failed ({status}): {exc}")
+        logger.error(f"LLM请求失败 ({status}): {exc}")
         return None
 
     return None
@@ -179,7 +179,7 @@ def summarize(
             summary_data = {"title": title, "summary": summary_text}
             break
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"Summary parsing failed (attempt={attempt + 1}/5): {exc}")
+            logger.warning(f"摘要解析失败 (尝试={attempt + 1}/5): {exc}")
             sleep_with_cancel(1)
         except Exception as exc:  # SDK/network errors handled explicitly below
             delay = _handle_sdk_exception(exc, attempt)
@@ -237,7 +237,7 @@ def summarize(
                 "language": target_language,
             }
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"Summary translation parsing failed (attempt={attempt + 1}/5): {exc}")
+            logger.warning(f"摘要翻译解析失败 (尝试={attempt + 1}/5): {exc}")
             sleep_with_cancel(1)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -447,7 +447,7 @@ def _build_translation_guide(
                 "notes": notes,
             }
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"Translation guide parsing failed (attempt={attempt + 1}/5): {exc}")
+            logger.warning(f"翻译指南解析失败 (尝试={attempt + 1}/5): {exc}")
             sleep_with_cancel(1)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -455,7 +455,7 @@ def _build_translation_guide(
                 raise
             sleep_with_cancel(delay)
 
-    logger.warning("Translation guide generation failed, falling back to empty guide")
+    logger.warning("翻译指南生成失败，回退到空指南")
     return {"style": [], "glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
 
 
@@ -496,7 +496,7 @@ def _translate_single_with_guide(
                 raise _TranslationValidationError(processed)
             return processed
         except _TranslationValidationError as exc:
-            logger.warning(f"Translation validation failed (attempt={attempt + 1}/30): {exc}")
+            logger.warning(f"翻译校验失败 (尝试={attempt + 1}/30): {exc}")
             sleep_with_cancel(0.5)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -569,10 +569,10 @@ def _translate_chunk_with_guide(
                 raise ValueError(f"missing translations: {missing[:10]}")
             return out
         except _TranslationValidationError as exc:
-            logger.warning(f"Chunk translation validation failed (attempt={attempt + 1}/10): {exc}")
+            logger.warning(f"块翻译校验失败 (尝试={attempt + 1}/10): {exc}")
             sleep_with_cancel(0.8)
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"Chunk translation parsing failed (attempt={attempt + 1}/10): {exc}")
+            logger.warning(f"块翻译解析失败 (尝试={attempt + 1}/10): {exc}")
             sleep_with_cancel(0.8)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -581,7 +581,7 @@ def _translate_chunk_with_guide(
             sleep_with_cancel(delay)
 
     # Fallback: translate each line in this chunk sequentially (still no cross-chunk history).
-    logger.warning(f"Chunk translation failed, falling back to sentence-by-sentence: indexes={indexes[:5]}.. (len={len(indexes)})")
+    logger.warning(f"块翻译失败，回退到逐句翻译: indexes={indexes[:5]}.. (len={len(indexes)})")
     out: dict[int, str] = {}
     for i in indexes:
         src = payload.get(str(i), "")
@@ -625,8 +625,8 @@ def _translate_content(
                         if 0 <= idx < len(results):
                             results[idx] = tr
                             src = cast(str, transcript[idx].get("text", ""))
-                            logger.info(f"Original: {src}")
-                            logger.info(f"Translation: {tr}")
+                            logger.info(f"原文: {src}")
+                            logger.info(f"译文: {tr}")
             except BaseException:
                 for f in futures:
                     f.cancel()
@@ -661,8 +661,8 @@ def _translate_content(
             
             try:
                 translation = _chat_completion_text(backend, messages).replace("\n", "")
-                logger.info(f'Original: {text}')
-                logger.info(f'Translation: {translation}')
+                logger.info(f'原文: {text}')
+                logger.info(f'译文: {translation}')
                 
                 is_valid, processed = valid_translation(text, translation)
                 if not is_valid:
@@ -671,7 +671,7 @@ def _translate_content(
                 translation = processed
                 break
             except _TranslationValidationError as exc:
-                logger.warning(f"Translation validation failed (attempt={attempt + 1}/30): {exc}")
+                logger.warning(f"翻译校验失败 (尝试={attempt + 1}/30): {exc}")
                 sleep_with_cancel(0.5)
             except Exception as exc:
                 delay = _handle_sdk_exception(exc, attempt)
@@ -706,7 +706,7 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
                     raise ValueError("translation.json missing 'translation' field")
             translation_ok = True
         except Exception as exc:
-            logger.warning(f"Invalid translation file, will regenerate: {translation_path} ({exc})")
+            logger.warning(f"翻译文件无效，将重新生成: {translation_path} ({exc})")
             try:
                 os.remove(translation_path)
             except Exception:
@@ -715,12 +715,12 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
 
     # If both translation + summary exist, we consider this step ready.
     if translation_ok and os.path.exists(summary_path):
-        logger.info(f'Translation already exists in {folder}')
+        logger.info(f'翻译已存在于 {folder}')
         return True
 
     info_path = os.path.join(folder, 'download.info.json')
     if not os.path.exists(info_path):
-        logger.warning(f"Info file not found: {info_path}")
+        logger.warning(f"未找到信息文件: {info_path}")
         return False
         
     with open(info_path, 'r', encoding='utf-8') as f:
@@ -729,7 +729,7 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
     
     transcript_path = os.path.join(folder, 'transcript.json')
     if not os.path.exists(transcript_path):
-        logger.warning(f"Transcript file not found: {transcript_path}")
+        logger.warning(f"未找到转录文件: {transcript_path}")
         return False
         
     with open(transcript_path, 'r', encoding='utf-8') as f:

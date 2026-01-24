@@ -108,10 +108,10 @@ def _preload_cudnn_for_onnxruntime_gpu() -> None:
             return
 
         ctypes.CDLL(str(cudnn_lib), mode=ctypes.RTLD_GLOBAL)
-        logger.info(f"Preloaded cuDNN for onnxruntime-gpu: {cudnn_lib}")
+        logger.info(f"已预加载cuDNN用于onnxruntime-gpu: {cudnn_lib}")
     except Exception as exc:  # pylint: disable=broad-except
         # Never hard-fail here; downstream may still work if the system has cuDNN installed.
-        logger.warning(f"Failed to preload cuDNN for onnxruntime-gpu: {exc}")
+        logger.warning(f"预加载cuDNN失败 onnxruntime-gpu: {exc}")
 
 
 def unload_all_models() -> None:
@@ -137,7 +137,7 @@ def unload_all_models() -> None:
         import gc
 
         gc.collect()
-        logger.info("ASR/diarization models unloaded")
+        logger.info("ASR/说话人分离模型已卸载")
 
 
 def _ensure_offline_mode() -> None:
@@ -204,12 +204,12 @@ def load_asr_model(
 
     WhisperModel, BatchedInferencePipeline = _import_faster_whisper()
 
-    logger.info(f"Loading Whisper model from {model_path} (device={device}, compute_type={compute_type})")
+    logger.info(f"加载Whisper模型 {model_path} (设备={device}, compute_type={compute_type})")
     t0 = time.time()
     _ASR_MODEL = WhisperModel(str(model_path), device=device, compute_type=compute_type)
     _ASR_PIPELINE = BatchedInferencePipeline(model=_ASR_MODEL) if use_batched else None
     _ASR_KEY = key
-    logger.info(f"Loaded Whisper model in {time.time() - t0:.2f}s")
+    logger.info(f"Whisper模型加载完成，耗时 {time.time() - t0:.2f}秒")
 
 
 def init_asr(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
@@ -285,7 +285,7 @@ def load_diarize_model(
 
     cfg = _find_pyannote_config(diar_dir) if diar_dir else None
 
-    logger.info(f"Loading diarization pipeline (device={device})")
+    logger.info(f"加载说话人分离管道 (设备={device})")
     t0 = time.time()
     if cfg and cfg.exists():
         pipeline = Pipeline.from_pretrained(str(cfg))
@@ -302,7 +302,7 @@ def load_diarize_model(
     pipeline.to(torch.device(device))
     _DIARIZATION_PIPELINE = pipeline
     _DIARIZATION_KEY = key
-    logger.info(f"Loaded diarization pipeline in {time.time() - t0:.2f}s")
+    logger.info(f"说话人分离管道加载完成，耗时 {time.time() - t0:.2f}秒")
 
 
 def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~') -> list[dict[str, Any]]:
@@ -337,7 +337,7 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
     check_cancelled()
     wav_path = os.path.join(folder, "audio_vocals.wav")
     if not os.path.exists(wav_path):
-        logger.warning(f"Audio file not found: {wav_path}")
+        logger.warning(f"未找到音频文件: {wav_path}")
         return
 
     target_sr = 24000
@@ -366,7 +366,7 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
             check_cancelled()
             chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=offset, duration=duration)
         except Exception as exc:
-            logger.warning(f"Failed to load speaker audio chunk (speaker={speaker}, offset={offset:.2f}s): {exc}")
+            logger.warning(f"加载说话人音频块失败 (speaker={speaker}, offset={offset:.2f}秒): {exc}")
             continue
         if chunk.size <= 0:
             continue
@@ -405,7 +405,7 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
         speaker_file_path = os.path.join(speaker_folder, f"{speaker}.wav")
         save_wav(audio, speaker_file_path, sample_rate=target_sr)
         if max_ref_samples > 0 and audio.shape[0] >= max_ref_samples:
-            logger.info(f"Saved speaker reference ({max_ref_seconds:.1f}s): {speaker_file_path}")
+            logger.info(f"已保存说话人参考 ({max_ref_seconds:.1f}秒): {speaker_file_path}")
 
 
 def _assign_speakers_by_overlap(
@@ -471,13 +471,13 @@ def transcribe_audio(
             if not isinstance(transcript, list):
                 raise ValueError("transcript.json is not a list")
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"Invalid transcript file, will regenerate: {transcript_path} ({exc})")
+            logger.warning(f"转录文件无效，将重新生成: {transcript_path} ({exc})")
             try:
                 os.remove(transcript_path)
             except Exception:
                 pass
         else:
-            logger.info(f"Transcript already exists in {folder}")
+            logger.info(f"转录已存在于 {folder}")
             # Ensure speaker reference files exist even when transcript step is skipped.
             try:
                 speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
@@ -492,7 +492,7 @@ def transcribe_audio(
                 if need:
                     generate_speaker_audio(folder, transcript)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(f"Failed to ensure speaker reference wavs: {exc}")
+                logger.warning(f"确保说话人参考音频失败: {exc}")
             return True
 
     wav_path = os.path.join(folder, "audio_vocals.wav")
@@ -528,7 +528,7 @@ def transcribe_audio(
 
     assert _ASR_MODEL is not None
 
-    logger.info(f"Transcribing {wav_path}")
+    logger.info(f"转录中 {wav_path}")
     t0 = time.time()
 
     _preload_cudnn_for_onnxruntime_gpu()
@@ -556,7 +556,7 @@ def transcribe_audio(
     for seg in segments_iter:
         check_cancelled()
         segments_list.append(seg)
-    logger.info(f"ASR done in {time.time() - t0:.2f}s (segments={len(segments_list)}, language={getattr(info, 'language', None)})")
+    logger.info(f"ASR完成，耗时 {time.time() - t0:.2f}秒 (段数={len(segments_list)}, 语言={getattr(info, 'language', None)})")
 
     transcript: list[dict[str, Any]] = []
     for seg in segments_list:
@@ -578,7 +578,7 @@ def transcribe_audio(
         try:
             load_diarize_model(device=device, settings=settings, model_manager=model_manager)
             assert _DIARIZATION_PIPELINE is not None
-            logger.info("Starting diarization (pyannote)...")
+            logger.info("开始说话人分离 (pyannote)...")
             check_cancelled()
             ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
             turns: list[dict[str, Any]] = []
@@ -587,7 +587,7 @@ def transcribe_audio(
                 turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
             _assign_speakers_by_overlap(transcript, turns)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"Diarization failed, falling back to single speaker: {exc}")
+            logger.warning(f"说话人分离失败，回退到单说话人: {exc}")
             for item in transcript:
                 item["speaker"] = "SPEAKER_00"
 
@@ -597,7 +597,7 @@ def transcribe_audio(
     check_cancelled()
     with open(transcript_path, "w", encoding="utf-8") as f:
         json.dump(transcript, f, indent=2, ensure_ascii=False)
-    logger.info(f"Saved transcript: {transcript_path}")
+    logger.info(f"已保存转录: {transcript_path}")
 
     check_cancelled()
     generate_speaker_audio(folder, transcript)

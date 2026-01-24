@@ -41,20 +41,48 @@ cd YAYD
 
 ### 2. 环境配置与安装
 
-确保已安装 `uv`，然后同步依赖：
+确保已安装 `uv`，然后同步依赖。
+
+#### 依赖 Extras 说明
+
+项目将依赖拆分为多个 extras，支持按需安装：
+
+| Extra | 说明 | 包含内容 |
+|-------|------|----------|
+| `cpu` | CPU 运行时 | `onnxruntime` (CPU 版) |
+| `gpu` | GPU 加速栈 (Linux) | `onnxruntime-gpu`, `nvidia-cudnn-cu12`, PyTorch cu128 轮子 |
+| `dev` | 开发工具 | `pytest`, `black`, `ruff` |
+
+> **注意**: `onnxruntime` 和 `onnxruntime-gpu` 不能共存。选择 `--extra cpu` 或 `--extra gpu` 其中之一。
+
+#### 安装命令
 
 ```bash
-# 创建虚拟环境并安装依赖（默认 CPU 依赖）
-uv sync
+# CPU 环境（默认，适合无 NVIDIA GPU 或仅测试）
+uv sync --extra cpu
 
-# 如需 GPU 加速（Linux，CUDA 12.8 / PyTorch cu128）
+# GPU 环境（推荐生产使用，Linux + CUDA 12.8）
 uv sync --extra gpu
+
+# GPU + 开发工具（开发/测试）
+uv sync --extra gpu --extra dev
+
+# 仅基础依赖（不含 onnxruntime，需手动管理）
+uv sync
 ```
 
-或者使用传统的 pip 安装方式（建议在虚拟环境中）：
+#### PyTorch GPU/CPU 自动选择
+
+`torch` 和 `torchaudio` 会根据 extras 自动选择安装源：
+- `--extra gpu` → 从 `pytorch-cu128` index 安装 CUDA 12.8 版本
+- 无 `--extra gpu` → 从 `pytorch-cpu` index 安装 CPU 版本
+
+#### 传统 pip 安装（不推荐）
 
 ```bash
+# 建议在虚拟环境中
 pip install -e .
+# GPU 支持需手动安装: pip install onnxruntime-gpu nvidia-cudnn-cu12
 ```
 
 ### 3. 安装外部依赖

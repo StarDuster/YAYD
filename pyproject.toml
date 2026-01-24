@@ -42,8 +42,7 @@ dependencies = [
     "faster-whisper>=1.2.1",
     # Use CTranslate2 >= 4.5.0 to align with cuDNN 9 (avoid cuDNN 8 split libs like libcudnn_ops_infer.so.8).
     "ctranslate2>=4.5.0,<5.0.0",
-    # faster-whisper VAD uses onnxruntime. Prefer GPU build on Linux.
-    "onnxruntime",
+    # faster-whisper VAD uses onnxruntime. Keep it in cpu/gpu extras so you can choose the build.
 
     # Speaker diarization / speaker embedding (used by diarization + bytedance voice matching; optional at runtime)
     "pyannote.audio>=3.1.0,<5.0.0",
@@ -63,7 +62,7 @@ dependencies = [
     "requests>=2.31.0,<3.0.0",
 
     # Bilibili upload
-    "bilibili_toolman",
+    "biliup>=1.1.28",
 
     # PyTorch ecosystem (CUDA 12.8 on Linux via uv index)
     # Keep as a range so you can upgrade without editing this file again.
@@ -75,11 +74,18 @@ dependencies = [
 [project.optional-dependencies]
 # Development dependencies
 dev = ["pytest>=7.0.0", "black>=23.0.0", "ruff>=0.1.0"]
+
+# CPU runtime stack (default runtime dependencies but kept optional so you can swap to GPU builds cleanly)
+# Use: `uv sync --extra cpu`
+cpu = ["onnxruntime"]
+
 # Optional GPU acceleration stack (Linux).
 # Use: `uv sync --extra gpu`
 gpu = [
     # Used by our cuDNN preloader (and helps onnxruntime/ctranslate2 GPU providers).
     "nvidia-cudnn-cu12; sys_platform == 'linux'",
+    # GPU build of onnxruntime (avoid co-install with onnxruntime)
+    "onnxruntime-gpu; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -115,7 +121,7 @@ explicit = true
 
 [tool.uv]
 # faster-whisper / qwen-tts depend on `onnxruntime`. We declare the runtime explicitly in
-# [project.dependencies], and patch upstream metadata to avoid forcing a specific onnxruntime wheel.
+# [project.optional-dependencies] (cpu/gpu extras), and patch upstream metadata to avoid forcing a specific onnxruntime wheel.
 dependency-metadata = [
     # Patch faster-whisper to avoid forcing a bundled onnxruntime dependency.
     { name = "faster-whisper", version = "1.2.1", provides-extra = ["conversion", "dev"], requires-dist = [

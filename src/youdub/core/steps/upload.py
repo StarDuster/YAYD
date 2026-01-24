@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import json
 import os
+import shutil
+from pathlib import Path
+from typing import Optional
 
-import requests
-from bilibili_toolman.bilisession.common.submission import Submission
-from bilibili_toolman.bilisession.web import BiliSession
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -11,215 +13,288 @@ from ..interrupts import check_cancelled, sleep_with_cancel
 
 load_dotenv()
 
-# 代理配置（仅用于 B 站上传，不影响其他模块）
-_BILI_PROXY = os.getenv("BILI_PROXY", "").strip()
-if _BILI_PROXY:
-    logger.info(f"Bilibili upload proxy configured: {_BILI_PROXY}")
+try:
+    import stream_gears  # type: ignore
+except Exception as exc:  # noqa: BLE001 - keep best-effort import to avoid breaking non-upload features
+    stream_gears = None  # type: ignore[assignment]
+    _STREAM_GEARS_IMPORT_ERROR: Exception | None = exc
+else:
+    _STREAM_GEARS_IMPORT_ERROR = None
 
-# UPOS 上传 CDN（bilibili_toolman 的 preupload 参数 upcdn）
-# 说明：不同 upcdn 会返回不同的 bilivideo 上传入口；有些入口在某些网络/代理下会 TLS 握手失败。
-_BILI_UPLOAD_CDN = os.getenv("BILI_UPLOAD_CDN", "").strip()
+
+def _is_uploaded(submission_result: object) -> bool:
+    if not isinstance(submission_result, dict):
+        return False
+    results = submission_result.get("results")
+    if isinstance(results, list) and results and isinstance(results[0], dict):
+        return results[0].get("code") == 0
+    # Backward-compat for any custom markers.
+    return submission_result.get("code") == 0
 
 
-def _iter_upload_cdns() -> list[str]:
-    # 默认顺序：优先用户指定，其次常见可用项
-    # 目前验证：bda2/bda/tx 常见可用；cos/ali 在部分网络会出现 SSL unexpected EOF
-    candidates = [_BILI_UPLOAD_CDN, "bda2", "bda", "tx"]
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in candidates:
-        c = (c or "").strip()
-        if not c or c in seen:
-            continue
-        seen.add(c)
-        out.append(c)
+def _success_marker(payload: dict[str, object] | None = None) -> dict[str, object]:
+    # Keep compatibility with pipeline._already_uploaded() which checks results[0].code == 0.
+    out: dict[str, object] = {"results": [{"code": 0}]}
+    if payload:
+        out.update(payload)
     return out
 
 
-def _upload_video_endpoint_with_fallback(session: BiliSession, video_path: str) -> str:
-    last_exc: Exception | None = None
-    for cdn in _iter_upload_cdns():
-        try:
-            session.UPLOAD_CDN = cdn
-            logger.info(f"Uploading video via UPOS CDN: {cdn}")
-            video_endpoint, _biz_id = session.UploadVideo(video_path)
-            return video_endpoint
-        except (
-            requests.exceptions.SSLError,
-            requests.exceptions.ProxyError,
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        ) as e:
-            last_exc = e
-            logger.warning(f"UploadVideo failed via CDN={cdn} (network/proxy): {e}")
+def _cdn_to_upload_line(cdn: Optional[str]):
+    if stream_gears is None:
+        return None
+    # Dynamically build mapping from available UploadLine members (PyPI version may differ from source).
+    mapping: dict[str, object] = {}
+    for name in ("Bda", "Bda2", "Tx", "Txa", "Bldsa", "Alia", "Qn"):
+        if hasattr(stream_gears.UploadLine, name):
+            mapping[name.lower()] = getattr(stream_gears.UploadLine, name)
+    if not cdn:
+        return None
+    return mapping.get(cdn.strip().lower())
+
+
+def _iter_upload_lines(preferred_cdn: Optional[str]) -> list[object | None]:
+    # order: preferred -> auto(None) -> common fallbacks
+    # keep small & predictable; avoid over-design
+    fallbacks = ["bda2", "bda", "tx", "txa", "bldsa"]
+    out: list[object | None] = []
+
+    preferred_line = _cdn_to_upload_line(preferred_cdn)
+    if preferred_line is not None:
+        out.append(preferred_line)
+
+    # auto selection
+    out.append(None)
+
+    # explicit fallbacks
+    for cdn in fallbacks:
+        line = _cdn_to_upload_line(cdn)
+        if line is None:
             continue
-        except Exception as e:  # noqa: BLE001 - keep behavior simple, bubble up if not obviously endpoint issue
-            last_exc = e
-            msg = str(e)
-            # 最常见的“入口不可用/上传会话无效”表现：NoSuchUpload / unexpected eof
-            if "NoSuchUpload" in msg or "UNEXPECTED_EOF_WHILE_READING" in msg or "unexpected eof" in msg.lower():
-                logger.warning(f"UploadVideo failed via CDN={cdn}: {msg}")
-                continue
-            raise
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("UploadVideo failed: no CDN candidates available")
+        if line not in out:
+            out.append(line)
+    return out
 
 
-def bili_login() -> BiliSession:
-    sessdata = os.getenv('BILI_SESSDATA')
-    bili_jct = os.getenv('BILI_BILI_JCT')
-    
-    if not sessdata or not bili_jct:
-        raise Exception('Please set BILI_SESSDATA and BILI_BILI_JCT in .env file.')
-        
+def _ensure_cookie_file(cookie_path: Path) -> bool:
     try:
-        session = BiliSession(f'SESSDATA={sessdata};bili_jct={bili_jct}')
-        # 设置代理（仅影响此 session，不影响其他模块）
-        if _BILI_PROXY:
-            session.proxies = {
-                'http': _BILI_PROXY,
-                'https': _BILI_PROXY,
-            }
-            logger.info(f"Bilibili session using proxy: {_BILI_PROXY}")
-            # 代理环境下强烈建议关闭并发分块上传，避免代理/网络抖动导致 multipart 会话失效
-            session.WORKERS_UPLOAD = 1
-        logger.info("Bilibili session created.")
-        return session
-    except Exception as e:
-        logger.error(e)
-        raise Exception('Failed to login to Bilibili. Please check credentials.')
-
-
-def upload_video(folder: str) -> bool:
-    check_cancelled()
-    submission_result_path = os.path.join(folder, 'bilibili.json')
-    if os.path.exists(submission_result_path):
-        with open(submission_result_path, 'r', encoding='utf-8') as f:
-            submission_result = json.load(f)
-        
-        if 'results' in submission_result and submission_result['results'][0]['code'] == 0:
-            logger.info('Video already uploaded.')
-            return True
-        
-    video_path = os.path.join(folder, 'video.mp4')
-    cover_path = os.path.join(folder, 'video.png')
-    
-    if not os.path.exists(video_path):
-        logger.warning(f"Video file not found: {video_path}")
+        cookie_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"创建cookie目录失败 {cookie_path.parent}: {exc}")
         return False
-
-    summary_path = os.path.join(folder, 'summary.json')
-    if not os.path.exists(summary_path):
-        logger.warning(f"Summary file not found: {summary_path}")
-        return False
-
-    with open(summary_path, 'r', encoding='utf-8') as f:
-        summary = json.load(f)
-        
-    info_path = os.path.join(folder, 'download.info.json')
-    if not os.path.exists(info_path):
-        logger.warning(f"Info file not found: {info_path}")
-        return False
-        
-    with open(info_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    summary_title = summary.get('title', 'Untitled').replace('视频标题：', '').strip()
-    summary_text = summary.get('summary', '').replace(
-        '视频摘要：', '').replace('视频简介：', '').strip()
-        
-    tags = summary.get('tags', [])
-    if not isinstance(tags, list):
-        tags = []
-        
-    author = summary.get("author", "Unknown")
-    title = f'【中配】{summary_title} - {author}'
-    
-    title_english = data.get('title', '')
-    webpage_url = data.get('webpage_url', '')
-    
-    description = (
-        f'{title_english}\n{summary_text}\n\n'
-        '项目地址：https://github.com/liuzhao1225/YouDub-webui\n'
-        'YouDub 是一个开创性的开源工具，旨在将 YouTube 和其他平台上的高质量视频翻译和配音成中文版本。'
-        '该工具结合了最新的 AI 技术，包括语音识别、大型语言模型翻译，以及 AI 声音克隆技术，'
-        '提供与原视频相似的中文配音，为中文用户提供卓越的观看体验。'
-    )
 
     try:
-        session = bili_login()
-    except Exception as e:
-        logger.error(f"Login skipped/failed: {e}")
-        return False
-    
-    video_endpoint: str | None = None
-    for retry in range(5):
-        check_cancelled()
-        try:
-            if video_endpoint is None:
-                video_endpoint = _upload_video_endpoint_with_fallback(session, video_path)
-
-            submission = Submission(
-                title=title,
-                desc=description
-            )
-
-            submission.videos.append(
-                Submission(
-                    title=title,
-                    video_endpoint=video_endpoint
-                )
-            )
-
-            if os.path.exists(cover_path):
-                submission.cover_url = session.UploadCover(cover_path)
-
-            base_tags = ['YouDub', author, 'AI', 'ChatGPT', '中文配音', '科学', '科普']
-            all_tags = base_tags + tags
-            
-            seen_tags = set()
-            final_tags = []
-            for t in all_tags:
-                if t not in seen_tags and len(t) <= 20:
-                    final_tags.append(t)
-                    seen_tags.add(t)
-                if len(final_tags) >= 12:
-                    break
-                    
-            for tag in final_tags:
-                submission.tags.append(tag)
-                
-            submission.thread = 201  # 科普 201, 科技
-            submission.copyright = submission.COPYRIGHT_REUPLOAD
-            submission.source = webpage_url
-            
-            response = session.SubmitSubmission(submission, seperate_parts=False)
-            
-            if response['results'][0]['code'] != 0:
-                logger.error(response)
-                raise Exception(f"Bilibili error: {response}")
-                
-            logger.info(f"Submission successful: {response}")
-            
-            with open(submission_result_path, 'w', encoding='utf-8') as f:
-                json.dump(response, f, ensure_ascii=False, indent=4)
+        if cookie_path.exists() and cookie_path.stat().st_size > 0:
+            logger.info(f"使用现有B站cookie文件: {cookie_path}")
             return True
-            
-        except Exception:
-            # Use full traceback; upstream (bilibili_toolman) can raise confusing KeyError like: KeyError('OK')
-            logger.exception(f"Bilibili upload/submit failed (retry {retry+1}/5)")
-            sleep_with_cancel(10)
-            
-    logger.error("Failed to upload after retries.")
+    except Exception:
+        # If stat fails, just attempt re-login.
+        pass
+
+    # Prefer using an existing cookies.json generated by biliup login (or any other means).
+    # We intentionally do NOT auto-login here (web cookies flow breaks frequently).
+    candidate = cookie_path.parent / "cookies.json"
+    try:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            if candidate.resolve() != cookie_path.resolve():
+                shutil.copy2(candidate, cookie_path)
+                logger.info(f"已采用现有cookies.json -> {cookie_path}")
+            else:
+                logger.info(f"Using existing Bilibili cookie file: {cookie_path}")
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"采用现有cookies.json失败: {exc}")
+
     return False
 
 
+def _upload_video_with_biliup(
+    folder: str,
+    proxy: Optional[str],
+    upload_cdn: Optional[str],
+    cookie_path: Path,
+) -> bool:
+    check_cancelled()
+
+    submission_result_path = os.path.join(folder, "bilibili.json")
+    if os.path.exists(submission_result_path):
+        try:
+            with open(submission_result_path, "r", encoding="utf-8") as f:
+                submission_result = json.load(f)
+            if _is_uploaded(submission_result):
+                logger.info("视频已上传")
+                return True
+        except Exception:
+            # Corrupted marker -> proceed to upload.
+            pass
+
+    video_path = os.path.join(folder, "video.mp4")
+    cover_path = os.path.join(folder, "video.png")
+    if not os.path.exists(video_path):
+        logger.warning(f"未找到视频文件: {video_path}")
+        return False
+
+    summary_path = os.path.join(folder, "summary.json")
+    if not os.path.exists(summary_path):
+        logger.warning(f"未找到摘要文件: {summary_path}")
+        return False
+    with open(summary_path, "r", encoding="utf-8") as f:
+        summary = json.load(f)
+
+    info_path = os.path.join(folder, "download.info.json")
+    if not os.path.exists(info_path):
+        logger.warning(f"未找到信息文件: {info_path}")
+        return False
+    with open(info_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    summary_title = summary.get("title", "Untitled").replace("视频标题：", "").strip()
+    summary_text = summary.get("summary", "").replace("视频摘要：", "").replace("视频简介：", "").strip()
+
+    tags = summary.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+
+    author = summary.get("author", "Unknown")
+    title = f"【中配】{summary_title} - {author}"[:80]
+
+    title_english = data.get("title", "")
+    webpage_url = data.get("webpage_url", "")
+
+    description = (
+        f"{webpage_url}\n{title_english}\n{summary_text}\n\n"
+        "项目地址：https://github.com/StarDuster/YAYD\n"
+        "YAYD 是 YouDub-webui 的一个 fork，旨在将 YouTube 和其他平台上的高质量视频翻译和配音成中文版本。"
+        "该工具结合了最新的 AI 技术，包括语音识别、大型语言模型翻译，以及 AI 声音克隆技术，"
+        "提供与原视频相似的中文配音，为中文用户提供卓越的观看体验。"
+    )
+
+    base_tags = ["YouDub", author, "AI", "ChatGPT", "中文配音", "科学", "科普"]
+    all_tags = base_tags + tags
+    seen_tags: set[str] = set()
+    final_tags: list[str] = []
+    for t in all_tags:
+        if not isinstance(t, str):
+            continue
+        if t not in seen_tags and len(t) <= 20:
+            final_tags.append(t)
+            seen_tags.add(t)
+        if len(final_tags) >= 12:
+            break
+
+    try:
+        if not cookie_path.exists() or cookie_path.stat().st_size <= 0:
+            logger.error(
+                f"B站cookie文件未找到或为空: {cookie_path}. "
+                "请通过 `biliup login` 生成（会创建cookies.json），然后设置 BILI_COOKIE_PATH。"
+            )
+            return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"访问cookie文件失败 {cookie_path}: {exc}")
+        return False
+
+    # one upload attempt may still fail due to line/proxy/network; try a small set of lines
+    attempts = 0
+    for retry in range(5):
+        check_cancelled()
+        for line in _iter_upload_lines(upload_cdn):
+            check_cancelled()
+            attempts += 1
+            try:
+                line_name = getattr(line, "name", None) or str(line)
+                logger.info(f"通过biliup上传中 (尝试 {attempts}, 重试 {retry+1}/5, 线路={line_name})")
+                stream_gears.upload(  # type: ignore[union-attr]
+                    video_path=[video_path],
+                    cookie_file=str(cookie_path),
+                    title=title,
+                    tid=201,
+                    tag=",".join(final_tags),
+                    copyright=2,
+                    source=str(webpage_url or ""),
+                    desc=description,
+                    cover=cover_path if os.path.exists(cover_path) else "",
+                    line=line,
+                    proxy=proxy,
+                )
+
+                # write a success marker compatible with pipeline._already_uploaded()
+                with open(submission_result_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        _success_marker(
+                            {
+                                "tool": "biliup",
+                                "title": title,
+                                "tid": 201,
+                                "tag": final_tags,
+                                "source": webpage_url,
+                            }
+                        ),
+                        f,
+                        ensure_ascii=False,
+                        indent=4,
+                    )
+                logger.info("上传成功")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"biliup上传失败: {exc}")
+                msg = str(exc).lower()
+                if "cookie" in msg or "csrf" in msg or "登录" in msg or "unauthorized" in msg:
+                    logger.error(
+                        "检测到可能的认证/cookie错误。 "
+                        "请重新运行 `biliup login` 刷新cookies.json，然后重试。"
+                    )
+                    return False
+                sleep_with_cancel(2)
+
+        sleep_with_cancel(8)
+
+    logger.error("重试后仍上传失败")
+    return False
+
+
+def upload_video(folder: str) -> bool:
+    """Upload a single video folder (expects video.mp4 etc)."""
+    if stream_gears is None:
+        logger.error(f"stream_gears不可用。请安装依赖 'biliup'。({_STREAM_GEARS_IMPORT_ERROR})")
+        return False
+
+    proxy = (os.getenv("BILI_PROXY") or "").strip() or None
+    upload_cdn = (os.getenv("BILI_UPLOAD_CDN") or "").strip() or None
+    cookie_path = Path((os.getenv("BILI_COOKIE_PATH") or "bili_cookies.json").strip() or "bili_cookies.json")
+    if not _ensure_cookie_file(cookie_path):
+        logger.error(
+            f"B站cookie文件未就绪: {cookie_path}。 "
+            "通过 `biliup login` 生成（会创建cookies.json），然后设置 BILI_COOKIE_PATH。"
+        )
+        return False
+    return _upload_video_with_biliup(folder, proxy, upload_cdn, cookie_path)
+
+
 def upload_all_videos_under_folder(folder: str) -> str:
+    if stream_gears is None:
+        return f"Error: stream_gears not available. Install dependency 'biliup'. ({_STREAM_GEARS_IMPORT_ERROR})"
+
+    proxy = (os.getenv("BILI_PROXY") or "").strip() or None
+    upload_cdn = (os.getenv("BILI_UPLOAD_CDN") or "").strip() or None
+    cookie_path = Path((os.getenv("BILI_COOKIE_PATH") or "bili_cookies.json").strip() or "bili_cookies.json")
+
+    if proxy:
+        logger.info(f"B站上传代理已配置: {proxy}")
+    if upload_cdn:
+        logger.info(f"B站首选上传CDN: {upload_cdn}")
+    logger.info(f"B站cookie路径: {cookie_path}")
+
+    # Prepare cookie file once to avoid repeated attempts for each video folder.
+    if not _ensure_cookie_file(cookie_path):
+        return (
+            "Error: Bilibili cookie file not ready. "
+            "Run `biliup login` to generate cookies.json, then set BILI_COOKIE_PATH (or keep cookies.json in place)."
+        )
+
     count = 0
     for root, _, files in os.walk(folder):
         check_cancelled()
-        if 'video.mp4' in files:
-            if upload_video(root):
+        if "video.mp4" in files:
+            if _upload_video_with_biliup(root, proxy, upload_cdn, cookie_path):
                 count += 1
-    return f'All videos under {folder} processed. Uploaded count: {count}.'
+    return f"All videos under {folder} processed. Uploaded count: {count}."

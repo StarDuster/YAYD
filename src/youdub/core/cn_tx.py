@@ -1046,7 +1046,7 @@ class TextNorm:
             for c in text:
                 if not IN_VALID_CHARS.get(c):
                     print(
-                        f'WARNING: illegal char {c} in: {text}', file=sys.stderr)
+                        f'警告: 非法字符 {c} 在: {text}', file=sys.stderr)
                     return ''
 
         if self.remove_space:
@@ -1122,7 +1122,7 @@ if __name__ == '__main__':
 
                 ndone += 1
                 if ndone % args.log_interval == 0:
-                    print(f'text norm: {ndone} lines done.',
+                    print(f'文本规范化: {ndone} 行已完成。',
                           file=sys.stderr, flush=True)
         else:
             for l in istream:
@@ -1144,7 +1144,7 @@ if __name__ == '__main__':
 
                 ndone += 1
                 if ndone % args.log_interval == 0:
-                    print(f'text norm: {ndone} lines done.',
+                    print(f'文本规范化: {ndone} 行已完成。',
                           file=sys.stderr, flush=True)
-    print(f'text norm: {ndone} lines done in total.',
+    print(f'文本规范化: 共完成 {ndone} 行。',
           file=sys.stderr, flush=True)

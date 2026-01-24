@@ -11,6 +11,7 @@ from loguru import logger
 _CANCEL_EVENT = threading.Event()
 _CANCEL_REASON: str | None = None
 _HANDLERS_INSTALLED = False
+_SIGINT_COUNT = 0
 
 
 class CancelledByUser(BaseException):
@@ -30,7 +31,7 @@ def request_cancel(reason: str | None = None) -> None:
     _CANCEL_REASON = (reason or "cancelled").strip() or "cancelled"
     _CANCEL_EVENT.set()
     try:
-        logger.warning(f"Cancellation requested: {_CANCEL_REASON}")
+        logger.warning(f"已请求取消: {_CANCEL_REASON}")
     except Exception:
         # Logging must never block cancellation.
         pass
@@ -103,7 +104,27 @@ def install_signal_handlers() -> None:
     prev_term = signal.getsignal(sigterm)
 
     def _handler(signum: int, frame) -> None:  # noqa: ARG001
+        global _SIGINT_COUNT  # noqa: PLW0603
         name = "SIGINT" if signum == sigint else "SIGTERM" if signum == sigterm else str(signum)
+
+        if signum == sigint:
+            _SIGINT_COUNT += 1
+            if _SIGINT_COUNT >= 2:
+                # Second Ctrl+C: force exit immediately (blocking I/O won't respond to signals)
+                import os
+                import sys
+
+                try:
+                    logger.warning("第二次 Ctrl+C，强制退出")
+                except Exception:
+                    pass
+                try:
+                    sys.stderr.write("\n强制退出\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                os._exit(130)
+
         request_cancel(name)
 
         prev = prev_int if signum == sigint else prev_term
