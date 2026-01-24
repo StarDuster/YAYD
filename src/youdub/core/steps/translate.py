@@ -316,20 +316,31 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output_data = []
     for item in translation:
         start = item['start']
+        end = item['end']
         text = item['text']
         speaker = item['speaker']
         translation_text = item.get('translation', '')
         sentences = split_text_into_sentences(translation_text)
         
-        if not translation_text:
+        if not translation_text or not sentences:
             # Handle empty translation
             duration_per_char = 0
         else:
-            duration_per_char = (item['end'] - item['start']) / len(translation_text)
+            # Use actual split sentence lengths to avoid gaps from rstrip/processing
+            total_chars = sum(len(s) for s in sentences)
+            if total_chars > 0:
+                duration_per_char = (end - start) / total_chars
+            else:
+                duration_per_char = 0
              
-        for sentence in sentences:
+        for i, sentence in enumerate(sentences):
             sentence_len = len(sentence)
             sentence_end = start + duration_per_char * sentence_len
+            
+            # Ensure the last sentence ends exactly at the original segment end
+            is_last = (i == len(sentences) - 1)
+            if is_last:
+                sentence_end = end
 
             output_data.append({
                 "start": round(start, 3),
@@ -390,6 +401,7 @@ def _build_translation_guide(
         "- dont_translate：必须原样保留的 token（如代码/公式/缩写/产品名）\n"
         "- notes：额外注意事项\n"
         "硬性要求：\n"
+        "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 将人工智能的“agent”翻译为“智能体”\n"
         "- 强化学习中写作 `Q-Learning`（不要写 Queue Learning）\n"
         "- 变压器指模型时保留 `Transformer`\n"
@@ -476,6 +488,7 @@ def _translate_single_with_guide(
         f"{info}\n"
         f"指南（JSON）：{guide_json}\n"
         "请只输出译文本身：\n"
+        "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
         "- 不要换行\n"
@@ -530,6 +543,7 @@ def _translate_chunk_with_guide(
         f"指南（JSON）：{guide_json}\n"
         "你会收到一个 JSON 对象：key 是句子编号（字符串），value 是原文。\n"
         "请只返回 JSON 对象，保持相同 key，value 只包含译文本身：\n"
+        "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
         "- 不要换行\n"
@@ -638,11 +652,11 @@ def _translate_content(
     full_translation: list[str] = []
 
     fixed_message = [
-        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。'},
-        {'role': 'user', 'content': '使用地道的中文Translate:"Knowledge is power."'},
-        {'role': 'assistant', 'content': '翻译：“知识就是力量。”'},
-        {'role': 'user', 'content': '使用地道的中文Translate:"To be or not to be, that is the question."'},
-        {'role': 'assistant', 'content': '翻译：“生存还是毁灭，这是一个值得考虑的问题。”'},
+        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。只输出译文，不要包含“翻译”二字。'},
+        {'role': 'user', 'content': 'Translate:"Knowledge is power."'},
+        {'role': 'assistant', 'content': '知识就是力量。'},
+        {'role': 'user', 'content': 'Translate:"To be or not to be, that is the question."'},
+        {'role': 'assistant', 'content': '生存还是毁灭，这是一个值得考虑的问题。'},
     ]
 
     history: list[dict[str, str]] = []
@@ -656,7 +670,7 @@ def _translate_content(
             # Keep history short to avoid token limit
             current_history = history[-30:]
             messages = fixed_message + current_history + [
-                {'role': 'user', 'content': f'使用地道的中文Translate:"{text}"'}
+                {'role': 'user', 'content': f'Translate:"{text}"'}
             ]
             
             try:
@@ -682,7 +696,7 @@ def _translate_content(
         full_translation.append(translation)
         
         history.append({'role': 'user', 'content': f'Translate:"{text}"'})
-        history.append({'role': 'assistant', 'content': f'翻译：“{translation}”'})
+        history.append({'role': 'assistant', 'content': f'{translation}'})
         # Avoid rate limits
         sleep_with_cancel(0.1)
 
