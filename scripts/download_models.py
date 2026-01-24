@@ -8,7 +8,6 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from youdub.config import Settings
-from youdub.models import ModelManager
 
 try:
     from huggingface_hub import snapshot_download

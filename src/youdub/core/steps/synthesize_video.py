@@ -11,11 +11,10 @@ def split_text(
     input_data: list[dict[str, Any]], 
     punctuations: list[str] | None = None
 ) -> list[dict[str, Any]]:
-    if punctuations is None:
-        punctuations = ['，', '；', '：', '。', '？', '！', '\n', '”']
+    puncts = set(punctuations or ['，', '；', '：', '。', '？', '！', '\n', '”'])
 
     def is_punctuation(char: str) -> bool:
-        return char in punctuations # type: ignore
+        return char in puncts
 
     output_data = []
     for item in input_data:
@@ -26,7 +25,6 @@ def split_text(
         sentence_start = 0
 
         if not text:
-            # Handle empty text case
             output_data.append(item)
             continue
 
@@ -35,10 +33,8 @@ def split_text(
         for i, char in enumerate(text):
             if not is_punctuation(char) and i != len(text) - 1:
                 continue
-            # Logic: minimum 5 chars or end of string
             if i - sentence_start < 5 and i != len(text) - 1:
                 continue
-            # If next char is also punctuation, skip this split?
             if i < len(text) - 1 and is_punctuation(text[i+1]):
                 continue
                 
@@ -78,11 +74,7 @@ def generate_srt(
             start = format_timestamp(line['start'] / speed_up)
             end = format_timestamp(line['end'] / speed_up)
             text = line['translation']
-            
-            # Simple word wrapping for subtitles
-            # Note: This simple logic might break words in English if not careful, 
-            # but usually 'translation' here is Chinese (based on context).
-            
+
             if not text:
                 continue
                 
@@ -110,22 +102,19 @@ def get_aspect_ratio(video_path: str) -> float:
         return dimensions['width'] / dimensions['height']
     except Exception as e:
         logger.error(f"Failed to get aspect ratio: {e}")
-        return 16/9  # Default fallback
+        return 16/9
 
 
 def convert_resolution(aspect_ratio: float, resolution: str = '1080p') -> tuple[int, int]:
     base_res = int(resolution.replace('p', ''))
     
     if aspect_ratio < 1:
-        # Portrait / Vertical
         width = base_res
         height = int(width / aspect_ratio)
     else:
-        # Landscape / Horizontal
         height = base_res
         width = int(height * aspect_ratio)
         
-    # Ensure even dimensions for encoding
     width = width - (width % 2)
     height = height - (height % 2)
     
@@ -157,35 +146,21 @@ def synthesize_video(
     output_video = os.path.join(folder, 'video.mp4')
     
     generate_srt(translation, srt_path, speed_up)
-    
-    # FFmpeg usually handles forward slashes better cross-platform in filters
-    srt_path_escaped = srt_path.replace('\\', '/').replace(':', '\\\\:') 
-    # Note: Windows paths in filter_complex can be tricky.
-    # The original code just did replace('\\', '/').
-    
+
     aspect_ratio = get_aspect_ratio(input_video)
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    font_size = int(width / 40) if width < height else int(width / 60) # Heuristic adjustment?
-    # Original code: font_size = int(width/128). That seems very small for 1080p (approx 15px).
-    # Maybe 1920 / 128 = 15. That is small. 
-    # Let's keep original logic for consistency unless it's clearly wrong.
-    font_size = int(width / 128) 
+    font_size = int(width / 128)
     
     outline = int(round(font_size / 8))
     
     video_speed_filter = f"setpts=PTS/{speed_up}"
     audio_speed_filter = f"atempo={speed_up}"
     
-    # Subtitle filter needs careful escaping
-    # Original: subtitle_filter = f"subtitles={srt_path}:force_style='FontName=Arial...'"
-    # If srt_path contains spaces or special chars, it might break.
-    # We'll use the replace logic from original code.
     srt_path_filter = srt_path.replace('\\', '/')
     
-    # Windows absolute path handling in ffmpeg filters: E:/foo -> E\\:/foo
-    if ':' in srt_path_filter and os.name == 'nt':
+    if os.name == 'nt' and ':' in srt_path_filter:
         srt_path_filter = srt_path_filter.replace(':', '\\:')
         
     subtitle_filter = (

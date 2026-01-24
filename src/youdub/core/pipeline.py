@@ -9,7 +9,7 @@ from typing import Any, Iterable
 from loguru import logger
 
 from ..config import Settings
-from ..models import ModelCheckError, ModelManager
+from ..models import ModelManager
 from .steps import (
     download,
     generate_all_info_under_folder,
@@ -115,7 +115,6 @@ class VideoPipeline:
                 synthesize_all_video_under_folder(
                     folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution
                 )
-                # Info + upload are optional/non-model heavy
                 generate_all_info_under_folder(folder)
                 if auto_upload_video:
                     time.sleep(1)
@@ -178,7 +177,6 @@ class VideoPipeline:
         url = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
         urls = [_ for _ in url.split("\n") if _]
 
-        # Warm up models asynchronously
         with ThreadPoolExecutor() as executor:
             executor.submit(separate_vocals.init_demucs, self.settings, self.model_manager)
             executor.submit(synthesize_speech.init_TTS, self.settings, self.model_manager)

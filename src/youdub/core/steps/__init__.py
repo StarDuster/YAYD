@@ -11,7 +11,6 @@ from .separate_vocals import (
     separate_audio,
 )
 from .transcribe import (
-    generate_speaker_audio,
     load_diarize_model,
     init_asr,
     load_asr_model,

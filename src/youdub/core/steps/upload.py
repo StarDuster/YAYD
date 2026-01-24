@@ -7,7 +7,6 @@ from bilibili_toolman.bilisession.web import BiliSession
 from dotenv import load_dotenv
 from loguru import logger
 
-# Load environment variables
 load_dotenv()
 
 
@@ -20,8 +19,6 @@ def bili_login() -> BiliSession:
         
     try:
         session = BiliSession(f'SESSDATA={sessdata};bili_jct={bili_jct}')
-        # We assume login is successful if object is created? 
-        # BiliSession might not verify immediately.
         logger.info("Bilibili session created.")
         return session
     except Exception as e:
@@ -35,8 +32,6 @@ def upload_video(folder: str) -> bool:
         with open(submission_result_path, 'r', encoding='utf-8') as f:
             submission_result = json.load(f)
         
-        # Check if previous upload was successful
-        # 'results' key structure depends on library version, assuming parity with original code
         if 'results' in submission_result and submission_result['results'][0]['code'] == 0:
             logger.info('Video already uploaded.')
             return True
@@ -64,7 +59,6 @@ def upload_video(folder: str) -> bool:
     with open(info_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    # Clean up title and summary
     summary_title = summary.get('title', 'Untitled').replace('视频标题：', '').strip()
     summary_text = summary.get('summary', '').replace(
         '视频摘要：', '').replace('视频简介：', '').strip()
@@ -93,19 +87,15 @@ def upload_video(folder: str) -> bool:
         logger.error(f"Login skipped/failed: {e}")
         return False
     
-    # Submit the submission
     for retry in range(5):
         try:
-            # Upload video and get endpoint
             video_endpoint, _ = session.UploadVideo(video_path)
 
-            # Create a submission object
             submission = Submission(
                 title=title,
                 desc=description
             )
 
-            # Add video to submission
             submission.videos.append(
                 Submission(
                     title=title,
@@ -113,12 +103,9 @@ def upload_video(folder: str) -> bool:
                 )
             )
 
-            # Upload and set cover
             if os.path.exists(cover_path):
                 submission.cover_url = session.UploadCover(cover_path)
 
-            # Tags processing
-            # Max 12 tags, max 20 chars per tag
             base_tags = ['YouDub', author, 'AI', 'ChatGPT', '中文配音', '科学', '科普']
             all_tags = base_tags + tags
             

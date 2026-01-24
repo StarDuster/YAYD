@@ -9,36 +9,28 @@ def resize_thumbnail(folder, size=(1280, 960)):
         if os.path.exists(image_path):
             break
     else:
-        # No image found, skip
         return None
 
     with Image.open(image_path) as img:
-        # Calculate the ratio and the size to maintain aspect ratio
         img_ratio = img.width / img.height
         target_ratio = size[0] / size[1]
 
         if img_ratio < target_ratio:
-            # Image is wider than target ratio, fix height to the desired size
             new_height = size[1]
             new_width = int(new_height * img_ratio)
         else:
-            # Image is taller than target ratio, fix width to the desired size
             new_width = size[0]
             new_height = int(new_width / img_ratio)
 
-        # Resize the image with high-quality resampling
         img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-        # Create a black image of the target size
         new_img = Image.new('RGB', size, "black")
 
-        # Paste the resized image onto the center of the black image
         x_offset = (size[0] - new_width) // 2
         y_offset = (size[1] - new_height) // 2
         new_img.paste(img, (x_offset, y_offset))
 
-        # Save or return the new image
-        new_img_path = os.path.join(folder, 'video.png')  # Modify as needed
+        new_img_path = os.path.join(folder, 'video.png')
         new_img.save(new_img_path)
         return new_img_path
 
@@ -50,7 +42,6 @@ def generate_summary_txt(folder):
     with open(summary_path, 'r', encoding='utf-8') as f:
         summary = json.load(f)
     
-    # Handle cases where summary might be missing keys
     title = summary.get("title", "Untitled")
     author = summary.get("author", "Unknown")
     summary_text = summary.get("summary", "")
