@@ -17,11 +17,12 @@ def _peak_abs(wav: np.ndarray) -> float:
 
 def ensure_torchaudio_backend_compat() -> None:
     """
-    Compatibility shim for torchaudio>=2.10.
+    Compatibility shim for torchaudio / pyannote.audio backend APIs.
 
     `pyannote.audio==3.1.1` calls `torchaudio.set_audio_backend("soundfile")` and
-    `torchaudio.get_audio_backend()` at import time. Newer torchaudio versions removed
-    these functions, causing pyannote to fail importing.
+    `torchaudio.get_audio_backend()` / `torchaudio.list_audio_backends()` at import time.
+    Some torchaudio versions/builds may not expose these symbols, causing pyannote to fail
+    importing or executing diarization.
 
     We provide best-effort no-op shims so pyannote can import and rely on the
     default audio I/O stack (torchcodec / soundfile).
@@ -32,23 +33,63 @@ def ensure_torchaudio_backend_compat() -> None:
     except Exception:
         return
 
-    # Patch set_audio_backend if missing
-    if not hasattr(torchaudio, "set_audio_backend"):
-        def _set_audio_backend(_backend: str) -> None:  # noqa: ARG001
+    # Keep a tiny per-process backend state so set/get/list are consistent.
+    state_attr = "_youdub_audio_backend"
+    if not hasattr(torchaudio, state_attr):
+        try:
+            setattr(torchaudio, state_attr, "soundfile")
+        except Exception:
+            # If we cannot set attributes on torchaudio module, shimming won't work reliably.
+            return
+
+    def _set_audio_backend(backend: str) -> None:
+        try:
+            setattr(torchaudio, state_attr, str(backend))
+        except Exception:
             return None
 
+    def _get_audio_backend() -> str:
+        try:
+            v = getattr(torchaudio, state_attr)
+        except Exception:
+            return "soundfile"
+        return str(v) if v else "soundfile"
+
+    def _list_audio_backends() -> list[str]:
+        backends: list[str] = []
+
+        # Best-effort: expose "soundfile" if installed (commonly used by pyannote).
+        try:
+            import soundfile  # type: ignore  # noqa: F401
+
+            backends.append("soundfile")
+        except Exception:
+            pass
+
+        # Also include current backend value so callers won't crash on unexpected strings.
+        cur = _get_audio_backend()
+        if cur and cur not in backends:
+            backends.append(cur)
+
+        # If none detected, still provide a non-empty list for older callers.
+        return backends or ["soundfile"]
+
+    # Patch set/get/list if missing
+    if not hasattr(torchaudio, "set_audio_backend"):
         try:
             setattr(torchaudio, "set_audio_backend", _set_audio_backend)
         except Exception:
             pass
 
-    # Patch get_audio_backend if missing
     if not hasattr(torchaudio, "get_audio_backend"):
-        def _get_audio_backend() -> str:
-            return "soundfile"
-
         try:
             setattr(torchaudio, "get_audio_backend", _get_audio_backend)
+        except Exception:
+            pass
+
+    if not hasattr(torchaudio, "list_audio_backends"):
+        try:
+            setattr(torchaudio, "list_audio_backends", _list_audio_backends)
         except Exception:
             pass
 
