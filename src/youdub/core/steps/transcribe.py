@@ -27,7 +27,7 @@ def _import_faster_whisper():
         raise RuntimeError(
             "缺少依赖 faster-whisper，语音识别功能不可用。\n"
             "请在当前虚拟环境中安装：`pip install -U faster-whisper`（或使用 `uv sync`）。\n"
-            f"Original error: {exc}"
+            f"原始错误: {exc}"
         ) from exc
     return WhisperModel, BatchedInferencePipeline
 
@@ -191,12 +191,12 @@ def load_asr_model(
     model_path = Path(model_dir)
     if not model_path.exists():
         raise ModelCheckError(
-            "Whisper model directory not found: "
-            f"{model_path}. Please download faster-whisper CTranslate2 model and set "
-            "WHISPER_MODEL_PATH (or WHISPER_CPU_MODEL_PATH when using CPU)."
+            "Whisper 模型目录不存在: "
+            f"{model_path}。请下载 faster-whisper 的 CTranslate2 模型，并设置 "
+            "WHISPER_MODEL_PATH（CPU 用 WHISPER_CPU_MODEL_PATH）。"
         )
     if model_path.is_dir() and not (model_path / "model.bin").exists():
-        raise ModelCheckError(f"Whisper CTranslate2 model missing model.bin: {model_path}")
+        raise ModelCheckError(f"Whisper CTranslate2 模型缺少 model.bin: {model_path}")
 
     key = f"{model_path.absolute()}|device={device}|compute={compute_type}|batched={int(use_batched)}"
     if _ASR_KEY == key and _ASR_MODEL is not None:
@@ -275,7 +275,7 @@ def load_diarize_model(
         raise RuntimeError(
             "缺少依赖 pyannote.audio，说话人分离不可用。\n"
             "请安装 `pyannote.audio` 并准备好离线模型缓存（或关闭 diarization）。\n"
-            f"Original error: {exc}"
+            f"原始错误: {exc}"
         ) from exc
 
     if diar_dir:
@@ -292,7 +292,7 @@ def load_diarize_model(
     else:
         token = settings.hf_token
         if not token:
-            raise ModelCheckError("Missing HF_TOKEN, cannot load pyannote/speaker-diarization-3.1.")
+            raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
         # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
         try:
             pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
@@ -636,6 +636,6 @@ def transcribe_all_audio_under_folder(
         )
         if ok:
             count += 1
-    msg = f"Transcribed all audio under {folder} (processed {count} files)"
+    msg = f"转录完成: {folder}（处理 {count} 个文件）"
     logger.info(msg)
     return msg

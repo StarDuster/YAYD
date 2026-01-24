@@ -31,7 +31,7 @@ def _import_demucs_infer() -> tuple[Any, Any]:
     except ModuleNotFoundError as exc:
         raise DemucsDependencyError(
             "缺少依赖 `demucs-infer`：请先安装后再使用“人声分离(Demucs)”功能。\n"
-            "Suggestion: `uv sync` (or `pip install demucs-infer`)"
+            "建议：运行 `uv sync`（或 `pip install demucs-infer`）"
         ) from exc
     return get_model, apply_model
 
@@ -48,9 +48,9 @@ def _set_torch_hub_dir(settings: Settings) -> None:
     try:
         os.makedirs(demucs_dir, exist_ok=True)
         torch.hub.set_dir(str(demucs_dir))
-        logger.info(f"Set torch hub dir to {demucs_dir}")
+        logger.info(f"设置 torch hub 目录: {demucs_dir}")
     except Exception as e:
-        logger.warning(f"Failed to set torch hub dir: {e}")
+        logger.warning(f"设置 torch hub 目录失败: {e}")
 
 
 def init_demucs(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
@@ -84,13 +84,13 @@ def load_model(
 
     get_model, _apply_model = _import_demucs_infer()
 
-    logger.info(f"Loading Demucs model: {model_name}")
+    logger.info(f"加载 Demucs 模型: {model_name}")
     t_start = time.time()
     model = get_model(model_name)
     _DEMUCS_MODEL = model
     _DEMUCS_MODEL_NAME = model_name
     _DEMUCS_DEVICE = target_device
-    logger.info(f"Demucs model loaded in {time.time() - t_start:.2f} seconds")
+    logger.info(f"Demucs 模型加载完成，耗时 {time.time() - t_start:.2f} 秒")
     return model
 
 
@@ -108,7 +108,7 @@ def unload_model() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        logger.info("Demucs model unloaded")
+        logger.info("Demucs 模型已卸载")
 
 
 def separate_audio(
@@ -129,14 +129,14 @@ def separate_audio(
     instruments_output_path = os.path.join(folder, 'audio_instruments.wav')
     
     if os.path.exists(vocal_output_path) and os.path.exists(instruments_output_path):
-        logger.info(f'Audio already separated in {folder}')
+        logger.info(f"已分离音频: {folder}")
         return
     
     settings = settings or Settings()
     model_manager = model_manager or ModelManager(settings)
     _ensure_demucs_ready(settings, model_manager)
 
-    logger.info(f"Separating audio from {folder}")
+    logger.info(f"开始分离音频: {folder}")
 
     model = load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
     _, apply_model = _import_demucs_infer()
@@ -205,127 +205,135 @@ def separate_audio(
 
     t_start = time.time()
     try:
-        # 长音频：不要整段 load（会 OOM）。用 soundfile 流式读 + 大 chunk + 静音附近切点 + overlap 淡入淡出拼接。
-        try:
-            import soundfile as sf
+        use_chunked_demucs = bool(getattr(settings, "demucs_chunk_long_audio", False))
+        if use_chunked_demucs:
+            # 长音频：不要整段 load（会 OOM）。用 soundfile 流式读 + 大 chunk + 静音附近切点 + overlap 淡入淡出拼接。
+            try:
+                import soundfile as sf
 
-            info = sf.info(audio_path)
-            sr_info = int(info.samplerate)
-            total_frames = int(info.frames)
-            duration_sec = float(total_frames) / float(sr_info) if sr_info else 0.0
-        except Exception:
-            sr_info = 0
-            total_frames = 0
-            duration_sec = 0.0
+                info = sf.info(audio_path)
+                sr_info = int(info.samplerate)
+                total_frames = int(info.frames)
+                duration_sec = float(total_frames) / float(sr_info) if sr_info else 0.0
+            except Exception:
+                sr_info = 0
+                total_frames = 0
+                duration_sec = 0.0
 
-        long_audio_threshold_sec = 15 * 60
-        if duration_sec >= long_audio_threshold_sec:
-            if sr_info != target_sr:
-                raise RuntimeError(
-                    f"Audio too long ({duration_sec:.1f}s), sample rate is {sr_info}Hz, but Demucs expects {target_sr}Hz. "
-                    "为避免 OOM，本项目不会对长音频走“整段加载+重采样”。请先用 ffmpeg 重新抽取成 44100Hz/2ch 的 wav。"
+            long_audio_threshold_sec = int(getattr(settings, "demucs_long_audio_threshold_sec", 15 * 60))
+            if duration_sec >= long_audio_threshold_sec:
+                if sr_info != target_sr:
+                    raise RuntimeError(
+                        f"音频过长({duration_sec:.1f}s)，采样率 {sr_info}Hz，但 Demucs 需要 {target_sr}Hz。"
+                        "为避免 OOM，不会对长音频做“整段加载+重采样”。请先用 ffmpeg 转为 44100Hz/2ch wav。"
+                    )
+
+                import numpy as np
+                import soundfile as sf
+
+                chunk_sec = 10 * 60
+                overlap_sec = 2
+                chunk_frames = int(chunk_sec * target_sr)
+                overlap_frames = int(overlap_sec * target_sr)
+                if chunk_frames <= overlap_frames * 2:
+                    raise ValueError(f"Invalid chunk config: chunk_sec={chunk_sec}, overlap_sec={overlap_sec}")
+
+                logger.warning(
+                    f"音频较长({duration_sec:.1f}s)，启用分块 Demucs 避免 OOM："
+                    f"chunk≈{chunk_sec}s, overlap={overlap_sec}s, shifts={shifts}（切点靠近静音）"
                 )
 
-            import numpy as np
-            import soundfile as sf
+                prev_v_tail = None
+                prev_i_tail = None
 
-            chunk_sec = 10 * 60
-            overlap_sec = 2
-            chunk_frames = int(chunk_sec * target_sr)
-            overlap_frames = int(overlap_sec * target_sr)
-            if chunk_frames <= overlap_frames * 2:
-                raise ValueError(f"Invalid chunk config: chunk_sec={chunk_sec}, overlap_sec={overlap_sec}")
+                start_frame = 0
+                with (
+                    sf.SoundFile(audio_path, mode="r") as in_f,
+                    sf.SoundFile(
+                        vocal_output_path, mode="w", samplerate=target_sr, channels=target_channels, subtype="PCM_16"
+                    ) as out_v,
+                    sf.SoundFile(
+                        instruments_output_path,
+                        mode="w",
+                        samplerate=target_sr,
+                        channels=target_channels,
+                        subtype="PCM_16",
+                    ) as out_i,
+                ):
+                    while start_frame < total_frames:
+                        check_cancelled()
+                        nominal_end = min(total_frames, start_frame + chunk_frames)
+                        end_frame = total_frames if nominal_end >= total_frames else _pick_cut_frame(
+                            in_f, start_frame, nominal_end, total_frames, target_sr
+                        )
+                        # 避免极端情况下不前进
+                        if end_frame <= start_frame + overlap_frames:
+                            end_frame = nominal_end
 
-            logger.warning(
-                f"Audio is long ({duration_sec:.1f}s). Use chunked Demucs to avoid OOM "
-                f"(chunk~{chunk_sec}s, overlap={overlap_sec}s, shifts={shifts}, cut=near-silence)."
-            )
+                        in_f.seek(start_frame)
+                        audio_chunk = in_f.read(frames=end_frame - start_frame, dtype="float32", always_2d=True)
+                        audio_chunk = _fix_channels(audio_chunk)
+                        if audio_chunk.size == 0:
+                            break
 
-            prev_v_tail = None
-            prev_i_tail = None
+                        wav_t = torch.from_numpy(np.asarray(audio_chunk.T, dtype=np.float32))  # [C, T]
+                        mix = wav_t.unsqueeze(0)  # [1, C, T]
 
-            start_frame = 0
-            with (
-                sf.SoundFile(audio_path, mode="r") as in_f,
-                sf.SoundFile(vocal_output_path, mode="w", samplerate=target_sr, channels=target_channels, subtype="PCM_16") as out_v,
-                sf.SoundFile(
-                    instruments_output_path, mode="w", samplerate=target_sr, channels=target_channels, subtype="PCM_16"
-                ) as out_i,
-            ):
-                while start_frame < total_frames:
-                    check_cancelled()
-                    nominal_end = min(total_frames, start_frame + chunk_frames)
-                    end_frame = total_frames if nominal_end >= total_frames else _pick_cut_frame(
-                        in_f, start_frame, nominal_end, total_frames, target_sr
-                    )
-                    # 避免极端情况下不前进
-                    if end_frame <= start_frame + overlap_frames:
-                        end_frame = nominal_end
+                        check_cancelled()
+                        sources = apply_model(model, mix, shifts=shifts, split=True, progress=False, device=target_device)
+                        sources = sources[0]  # [S, C, T]
+                        vocals_tensor = sources[vocals_idx]
+                        instruments_tensor = sources.sum(dim=0) - vocals_tensor
 
-                    in_f.seek(start_frame)
-                    audio_chunk = in_f.read(frames=end_frame - start_frame, dtype="float32", always_2d=True)
-                    audio_chunk = _fix_channels(audio_chunk)
-                    if audio_chunk.size == 0:
-                        break
+                        vocals = vocals_tensor.cpu().numpy().T  # [T, C]
+                        instruments = instruments_tensor.cpu().numpy().T  # [T, C]
+                        del sources, vocals_tensor, instruments_tensor, mix, wav_t, audio_chunk
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        gc.collect()
 
-                    wav_t = torch.from_numpy(np.asarray(audio_chunk.T, dtype=np.float32))  # [C, T]
-                    mix = wav_t.unsqueeze(0)  # [1, C, T]
+                        chunk_len = int(vocals.shape[0])
+                        has_next = end_frame < total_frames
 
-                    check_cancelled()
-                    sources = apply_model(model, mix, shifts=shifts, split=True, progress=False, device=target_device)
-                    sources = sources[0]  # [S, C, T]
-                    vocals_tensor = sources[vocals_idx]
-                    instruments_tensor = sources.sum(dim=0) - vocals_tensor
-
-                    vocals = vocals_tensor.cpu().numpy().T  # [T, C]
-                    instruments = instruments_tensor.cpu().numpy().T  # [T, C]
-                    del sources, vocals_tensor, instruments_tensor, mix, wav_t, audio_chunk
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-
-                    chunk_len = int(vocals.shape[0])
-                    has_next = end_frame < total_frames
-
-                    if prev_v_tail is None:
-                        if has_next and overlap_frames > 0:
-                            keep_end = max(0, chunk_len - overlap_frames)
-                            out_v.write(vocals[:keep_end])
-                            out_i.write(instruments[:keep_end])
-                            prev_v_tail = vocals[keep_end:]
-                            prev_i_tail = instruments[keep_end:]
+                        if prev_v_tail is None:
+                            if has_next and overlap_frames > 0:
+                                keep_end = max(0, chunk_len - overlap_frames)
+                                out_v.write(vocals[:keep_end])
+                                out_i.write(instruments[:keep_end])
+                                prev_v_tail = vocals[keep_end:]
+                                prev_i_tail = instruments[keep_end:]
+                            else:
+                                out_v.write(vocals)
+                                out_i.write(instruments)
+                                prev_v_tail = None
+                                prev_i_tail = None
                         else:
-                            out_v.write(vocals)
-                            out_i.write(instruments)
-                            prev_v_tail = None
-                            prev_i_tail = None
-                    else:
-                        overlap_len = min(overlap_frames, chunk_len, int(prev_v_tail.shape[0]))
-                        if overlap_len > 0:
-                            fade_in = np.linspace(0.0, 1.0, overlap_len, dtype=np.float32)[:, None]
-                            fade_out = 1.0 - fade_in
-                            out_v.write(prev_v_tail[-overlap_len:] * fade_out + vocals[:overlap_len] * fade_in)
-                            out_i.write(prev_i_tail[-overlap_len:] * fade_out + instruments[:overlap_len] * fade_in)
+                            overlap_len = min(overlap_frames, chunk_len, int(prev_v_tail.shape[0]))
+                            if overlap_len > 0:
+                                fade_in = np.linspace(0.0, 1.0, overlap_len, dtype=np.float32)[:, None]
+                                fade_out = 1.0 - fade_in
+                                out_v.write(prev_v_tail[-overlap_len:] * fade_out + vocals[:overlap_len] * fade_in)
+                                out_i.write(prev_i_tail[-overlap_len:] * fade_out + instruments[:overlap_len] * fade_in)
 
-                        if has_next and overlap_frames > 0:
-                            keep_end = max(overlap_len, chunk_len - overlap_frames)
-                            out_v.write(vocals[overlap_len:keep_end])
-                            out_i.write(instruments[overlap_len:keep_end])
-                            prev_v_tail = vocals[keep_end:]
-                            prev_i_tail = instruments[keep_end:]
-                        else:
-                            out_v.write(vocals[overlap_len:])
-                            out_i.write(instruments[overlap_len:])
-                            prev_v_tail = None
-                            prev_i_tail = None
+                            if has_next and overlap_frames > 0:
+                                keep_end = max(overlap_len, chunk_len - overlap_frames)
+                                out_v.write(vocals[overlap_len:keep_end])
+                                out_i.write(instruments[overlap_len:keep_end])
+                                prev_v_tail = vocals[keep_end:]
+                                prev_i_tail = instruments[keep_end:]
+                            else:
+                                out_v.write(vocals[overlap_len:])
+                                out_i.write(instruments[overlap_len:])
+                                prev_v_tail = None
+                                prev_i_tail = None
 
-                    if not has_next:
-                        break
-                    start_frame = max(0, end_frame - overlap_frames)
+                        if not has_next:
+                            break
+                        start_frame = max(0, end_frame - overlap_frames)
 
-            logger.info(f"Audio separated in {time.time() - t_start:.2f} seconds")
-            logger.info("Separation task finished completely.")
-            return
+                logger.info(f"分离完成，耗时 {time.time() - t_start:.2f} 秒")
+                logger.info("分离任务完成")
+                return
 
         # 短音频：保持简单（整段 load + save_wav）。
         import torchaudio
@@ -336,13 +344,13 @@ def separate_audio(
         except Exception:
             pass
 
-        logger.info(f"Loading audio from {audio_path}...")
+        logger.info(f"加载音频: {audio_path}")
         check_cancelled()
         wav, sr = torchaudio.load(audio_path)
-        logger.info(f"Audio loaded. Shape: {wav.shape}, SR: {sr}")
+        logger.info(f"音频已加载: shape={wav.shape}, sr={sr}")
 
         if sr != target_sr:
-            logger.info(f"Resampling from {sr} to {target_sr}...")
+            logger.info(f"重采样: {sr}->{target_sr}")
             resampler = torchaudio.transforms.Resample(sr, target_sr)
             wav = resampler(wav)
             sr = target_sr
@@ -354,7 +362,7 @@ def separate_audio(
 
         mix = wav.unsqueeze(0)  # [1, C, T]
 
-        logger.info(f"Running Demucs ({model_name}) on {target_device} (shifts={shifts})...")
+        logger.info(f"运行 Demucs: {model_name} device={target_device} shifts={shifts}")
         check_cancelled()
         sources = apply_model(model, mix, shifts=shifts, split=True, progress=progress, device=target_device)
         sources = sources[0]  # [S, C, T]
@@ -365,18 +373,18 @@ def separate_audio(
         vocals = vocals_tensor.cpu().numpy().T
         instruments = instruments_tensor.cpu().numpy().T
     except Exception as e:
-        logger.error(f"Error separating audio from {folder}: {e}")
+        logger.error(f"分离失败: {folder} ({e})")
         raise
 
-    logger.info(f"Audio separated in {time.time() - t_start:.2f} seconds")
+    logger.info(f"分离完成，耗时 {time.time() - t_start:.2f} 秒")
 
-    logger.info(f"Saving vocals to {vocal_output_path}...")
+    logger.info(f"保存人声: {vocal_output_path}")
     save_wav(vocals, vocal_output_path, sample_rate=sr)
 
-    logger.info(f"Saving instruments to {instruments_output_path}...")
+    logger.info(f"保存伴奏: {instruments_output_path}")
     save_wav(instruments, instruments_output_path, sample_rate=sr)
 
-    logger.info("Separation task finished completely.")
+    logger.info("分离任务完成")
 
 
 
@@ -388,10 +396,10 @@ def extract_audio_from_video(folder: str) -> bool:
         
     audio_path = os.path.join(folder, 'audio.wav')
     if os.path.exists(audio_path):
-        logger.info(f'Audio already extracted in {folder}')
+        logger.info(f"已提取音频: {folder}")
         return True
         
-    logger.info(f'Extracting audio from {folder}')
+    logger.info(f"开始提取音频: {folder}")
     check_cancelled()
 
     cmd = [
@@ -449,11 +457,11 @@ def extract_audio_from_video(folder: str) -> bool:
         pass
 
     if proc.returncode not in (0, None):
-        logger.error(f"FFmpeg failed to extract audio from {video_path} (rc={proc.returncode})\n{stderr or stdout}")
+        logger.error(f"FFmpeg 提取音频失败: {video_path} (rc={proc.returncode})\n{stderr or stdout}")
         return False
 
     sleep_with_cancel(1)
-    logger.info(f'Audio extracted from {folder}')
+    logger.info(f"音频已提取: {folder}")
     return True
 
 
@@ -504,6 +512,6 @@ def separate_all_audio_under_folder(
             separate_audio(subdir, model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
             count += 1
 
-    msg = f'All audio separated under {root_folder} (processed {count} files)'
+    msg = f"音频分离完成: {root_folder}（processed {count} files / 处理 {count} 个文件）"
     logger.info(msg)
     return msg

@@ -104,7 +104,7 @@ def get_aspect_ratio(video_path: str) -> float:
         dimensions = json.loads(result.stdout)['streams'][0]
         return dimensions['width'] / dimensions['height']
     except Exception as e:
-        logger.error(f"Failed to get aspect ratio: {e}")
+        logger.error(f"获取视频宽高比失败: {e}")
         return 16/9
 
 
@@ -137,9 +137,9 @@ def synthesize_video(
     if os.path.exists(output_video):
         try:
             if os.path.getsize(output_video) >= 1024:
-                logger.info(f'Video already synthesized in {folder}')
+                logger.info(f"已合成视频: {folder}")
                 return
-            logger.warning(f"Existing video.mp4 looks invalid (too small), will re-generate: {output_video}")
+            logger.warning(f"video.mp4 疑似无效(过小)，将重新生成: {output_video}")
             os.remove(output_video)
         except Exception:
             # Best-effort: proceed to re-generate
@@ -233,10 +233,10 @@ def synthesize_video(
     try:
         _run_ffmpeg(ffmpeg_command)
         sleep_with_cancel(1)
-        logger.info(f"Synthesized video: {output_video}")
+        logger.info(f"视频已生成: {output_video}")
     except subprocess.CalledProcessError as e:
         if use_nvenc:
-            logger.warning(f"FFmpeg failed with NVENC ({video_encoder}), fallback to libx264: {e}")
+            logger.warning(f"NVENC({video_encoder}) 失败，回退到 libx264: {e}")
             ffmpeg_command_fallback = ffmpeg_command.copy()
             try:
                 idx = ffmpeg_command_fallback.index("-c:v") + 1
@@ -246,10 +246,10 @@ def synthesize_video(
                 pass
             _run_ffmpeg(ffmpeg_command_fallback)
             sleep_with_cancel(1)
-            logger.info(f"Synthesized video (libx264 fallback): {output_video}")
+            logger.info(f"视频已生成(回退libx264): {output_video}")
             return
 
-        logger.error(f"FFmpeg failed: {e}")
+        logger.error(f"FFmpeg 失败: {e}")
         raise
 
 
@@ -282,6 +282,6 @@ def synthesize_all_video_under_folder(
             use_nvenc=use_nvenc,
         )
         count += 1
-    msg = f'Synthesized all videos under {folder} (processed {count} files)'
+    msg = f"视频合成完成: {folder}（处理 {count} 个文件）"
     logger.info(msg)
     return msg

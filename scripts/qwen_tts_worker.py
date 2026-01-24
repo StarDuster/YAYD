@@ -100,14 +100,14 @@ def main() -> int:
             try:
                 req = json.loads(raw)
             except Exception:
-                print(json.dumps({"ok": False, "error": "invalid json"}), flush=True)
+                print(json.dumps({"ok": False, "error": "JSON无效"}), flush=True)
                 continue
 
             cmd = req.get("cmd")
             if cmd == "shutdown":
                 break
             if cmd not in {"synthesize", "synthesize_batch"}:
-                print(json.dumps({"ok": False, "error": f"unknown cmd: {cmd}"}), flush=True)
+                print(json.dumps({"ok": False, "error": f"未知命令: {cmd}"}), flush=True)
                 continue
 
             try:
@@ -117,7 +117,7 @@ def main() -> int:
                     speaker_wav = str(req.get("speaker_wav", ""))
                     output_path = str(req.get("output_path", ""))
                     if not speaker_wav or not output_path:
-                        raise ValueError("missing speaker_wav/output_path")
+                        raise ValueError("缺少 speaker_wav/output_path")
 
                     if args.stub:
                         sr = 24000
@@ -130,7 +130,7 @@ def main() -> int:
                             voice_clone_prompt=prompt,
                         )
                         if not wavs:
-                            raise RuntimeError("empty wav list")
+                            raise RuntimeError("返回空音频")
                         wav = np.asarray(wavs[0], dtype=np.float32)
 
                     _write_wav(output_path, wav, int(sr))
@@ -145,19 +145,19 @@ def main() -> int:
                 # cmd == "synthesize_batch"
                 items = req.get("items", None)
                 if not isinstance(items, list) or not items:
-                    raise ValueError("missing items")
+                    raise ValueError("缺少 items")
 
                 # Collect and validate
                 parsed: list[tuple[int, str, str, str, str]] = []
                 for idx, it in enumerate(items):
                     if not isinstance(it, dict):
-                        raise ValueError(f"items[{idx}] is not an object")
+                        raise ValueError(f"items[{idx}] 不是对象")
                     text = str(it.get("text", ""))
                     language = str(it.get("language", "Auto") or "Auto")
                     speaker_wav = str(it.get("speaker_wav", ""))
                     output_path = str(it.get("output_path", ""))
                     if not speaker_wav or not output_path:
-                        raise ValueError(f"items[{idx}] missing speaker_wav/output_path")
+                        raise ValueError(f"items[{idx}] 缺少 speaker_wav/output_path")
                     parsed.append((idx, text, language, speaker_wav, output_path))
 
                 results: list[dict] = [{"ok": False, "error": "not processed"} for _ in parsed]
@@ -190,9 +190,9 @@ def main() -> int:
                             voice_clone_prompt=prompt,
                         )
                         if not wavs:
-                            raise RuntimeError("empty wav list")
+                            raise RuntimeError("返回空音频")
                         if len(wavs) != len(group):
-                            raise RuntimeError(f"batch wav count mismatch: got {len(wavs)}, expected {len(group)}")
+                            raise RuntimeError(f"批量返回数量不匹配: got {len(wavs)}, expected {len(group)}")
 
                         for wav, (idx, _text, _lang, out) in zip(wavs, group):
                             wav_np = np.asarray(wav, dtype=np.float32)

@@ -12,7 +12,7 @@ from youdub.config import Settings
 try:
     from huggingface_hub import snapshot_download
 except ImportError:
-    logger.error("Please install huggingface_hub: pip install huggingface-hub")
+    logger.error("缺少 huggingface_hub：请运行 `pip install huggingface-hub`（或 `uv sync`）")
     sys.exit(1)
 
 # --- REPRODUCIBILITY CONFIG ---
@@ -44,28 +44,28 @@ MODELS_TO_DOWNLOAD = {
 
 def verify_offline_readiness():
     """Ensure that enforced offline mode variables will work with what we downloaded."""
-    logger.info("--- Verifying Offline Readiness ---")
+    logger.info("--- 检查离线模型就绪情况 ---")
     
     # 1. Check Whisper model
     settings = Settings()
     whisper_path = settings.resolve_path(settings.whisper_model_path)
     if not (whisper_path / "model.bin").exists():
-        logger.warning(f" [FAIL] Whisper model.bin not found in {whisper_path}")
+        logger.warning(f" [失败] 未找到 Whisper model.bin: {whisper_path}")
     else:
-        logger.info(f" [OK] Whisper model found at {whisper_path}")
+        logger.info(f" [成功] Whisper 模型已就绪: {whisper_path}")
 
     # 2. Check Diarization Cache
     # We can't easily check HF cache structure without library, but we can check if directory is not empty
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     if not diar_dir.exists() or not any(diar_dir.iterdir()):
-         logger.warning(f" [FAIL] Diarization cache empty at {diar_dir}")
+         logger.warning(f" [失败] 说话人分离缓存为空: {diar_dir}")
     else:
-         logger.info(f" [OK] Diarization cache populated at {diar_dir}")
+         logger.info(f" [成功] 说话人分离缓存已就绪: {diar_dir}")
          
     # 3. Check Demucs
     # Harder to verify location as it's hidden in torch hub, but we trust the download step.
     
-    logger.info("Environment is ready for reproducible offline execution.")
+    logger.info("离线环境检查完成。")
 
 
 def download_models():
@@ -78,14 +78,14 @@ def download_models():
     env_vars_to_clear = ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
     for var in env_vars_to_clear:
         if var in os.environ:
-            logger.info(f"Temporarily clearing {var} for download script")
+            logger.info(f"临时清除环境变量: {var}（用于下载）")
             del os.environ[var]
 
-    logger.info("Starting reproducible model downloads...")
-    logger.info(f"Target Root: {settings.root_folder}")
+    logger.info("开始下载离线模型...")
+    logger.info(f"目标目录: {settings.root_folder}")
     
     # 1. Demucs
-    logger.info("\n=== 1. Demucs Model (htdemucs_ft) ===")
+    logger.info("\n=== 1. Demucs 模型 (htdemucs_ft) ===")
     try:
         import torch
         from demucs_infer.pretrained import get_model
@@ -95,27 +95,27 @@ def download_models():
         if demucs_dir:
             demucs_dir.mkdir(parents=True, exist_ok=True)
             torch.hub.set_dir(str(demucs_dir))
-            logger.info(f"Set torch hub dir to {demucs_dir}")
+            logger.info(f"设置 torch hub 目录: {demucs_dir}")
 
         model_name = settings.demucs_model_name
-        logger.info(f"Downloading Demucs model: {model_name}...")
+        logger.info(f"下载 Demucs 模型: {model_name} ...")
         # demucs-infer downloads the same official weights via torch.hub cache.
         get_model(model_name)
-        logger.info("Demucs model downloaded.")
+        logger.info("Demucs 模型下载完成。")
     except Exception as e:
-        logger.error(f"Failed to download Demucs: {e}")
+        logger.error(f"Demucs 下载失败: {e}")
 
     # 2. Hugging Face Models (Pinned)
-    logger.info("\n=== 2. Hugging Face Models ===")
+    logger.info("\n=== 2. Hugging Face 模型 ===")
     
     token = settings.hf_token
     if not token:
-        logger.warning("HF_TOKEN missing. Pyannote downloads may fail 401 Unauthorized.")
+        logger.warning("缺少 HF_TOKEN：下载 pyannote 可能会 401（需先同意协议并设置 token）。")
 
     # A. Whisper model (Direct Download)
     wx_conf = MODELS_TO_DOWNLOAD["whisper"]
     wx_path = settings.resolve_path(settings.whisper_model_path)
-    logger.info(f"Downloading Whisper model ({wx_conf['revision'][:7]}) to {wx_path}...")
+    logger.info(f"下载 Whisper 模型 ({wx_conf['revision'][:7]}) -> {wx_path} ...")
     try:
         snapshot_download(
             repo_id=wx_conf["repo_id"],
@@ -125,10 +125,10 @@ def download_models():
             resume_download=True
         )
     except Exception as e:
-        logger.error(f"Whisper model download failed: {e}")
+        logger.error(f"Whisper 下载失败: {e}")
 
     # B. Diarization (HF Cache Style)
-    logger.info("\n=== 3. Pyannote Diarization (HF Cache) ===")
+    logger.info("\n=== 3. Pyannote 说话人分离（HF Cache） ===")
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     
     # Set HF_HOME to the target diarization directory to build the cache there
@@ -136,7 +136,7 @@ def download_models():
     
     for key in ["diarization", "segmentation"]:
         conf = MODELS_TO_DOWNLOAD[key]
-        logger.info(f"Downloading {conf['repo_id']} ({conf['revision'][:7]})...")
+        logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
         try:
             snapshot_download(
                 repo_id=conf["repo_id"],
@@ -146,9 +146,9 @@ def download_models():
                 resume_download=True
             )
         except Exception as e:
-             logger.error(f"Failed to download {conf['repo_id']}: {e}")
+             logger.error(f"下载失败 {conf['repo_id']}: {e}")
 
-    logger.info("\nAll requests completed.")
+    logger.info("\n下载流程已结束。")
     verify_offline_readiness()
 
 if __name__ == "__main__":

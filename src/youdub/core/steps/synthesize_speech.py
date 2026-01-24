@@ -577,14 +577,14 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
             "model_type": 4, # 4: ICL2.0 (Voice Cloning 2.0)
         }
         
-        logger.info(f"--- 声音克隆上传请求 ---")
-        logger.info(f"URL: {url}")
-        logger.info(f"Headers: {header}")
+        logger.info("--- 声音克隆上传请求 ---")
+        logger.info(f"地址: {url}")
+        logger.info(f"请求头: {header}")
         debug_payload = payload.copy()
         if debug_payload.get('audios'):
              debug_payload['audios'] = [{'audio_bytes': '<hidden>', 'audio_format': a['audio_format']} for a in debug_payload['audios']]
-        logger.info(f"Payload: {json.dumps(debug_payload, ensure_ascii=False)}")
-        logger.info(f"------------------------------------")
+        logger.info(f"请求体: {json.dumps(debug_payload, ensure_ascii=False)}")
+        logger.info("------------------------------------")
         
         resp = requests.post(url, json=payload, headers=header, timeout=120)
         
@@ -739,7 +739,7 @@ class _QwenTtsWorker:
     def __init__(self, python_exe: str, model_path: str, stub: bool = False):
         script = _get_qwen_worker_script_path()
         if not script.exists():
-            raise ModelCheckError(f"Qwen3-TTS worker script not found: {script}")
+            raise ModelCheckError(f"未找到 Qwen3-TTS worker 脚本: {script}")
 
         cmd = [python_exe, "-u", str(script), "--model-path", model_path]
         if stub:
@@ -758,7 +758,7 @@ class _QwenTtsWorker:
                 bufsize=1,
             )
         except Exception as exc:
-            raise ModelCheckError(f"Failed to start Qwen3-TTS worker: {exc}") from exc
+            raise ModelCheckError(f"启动 Qwen3-TTS worker 失败: {exc}") from exc
 
         logger.info(f"Qwen3-TTS工作进程 pid={self._proc.pid}，等待就绪...")
 
@@ -861,20 +861,20 @@ class _QwenTtsWorker:
                 details.append("stderr:\n" + stderr_tail)
 
             extra = ("\n" + "\n".join(details)) if details else ""
-            raise ModelCheckError(f"Qwen3-TTS worker startup failed.{extra}")
+            raise ModelCheckError(f"Qwen3-TTS worker 启动失败。{extra}")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "_QwenTtsWorker":
         py = settings.resolve_path(settings.qwen_tts_python_path)
         if not py or not py.exists():
             raise ModelCheckError(
-                f"Qwen3-TTS Python not found: {py}. Please set QWEN_TTS_PYTHON to a valid python executable (the environment needs qwen-tts installed)."
+                f"未找到 Qwen3-TTS Python: {py}。请设置 QWEN_TTS_PYTHON 为有效的 python 可执行文件（该环境需安装 qwen-tts）。"
             )
 
         model_dir = settings.resolve_path(settings.qwen_tts_model_path)
         if not model_dir or not model_dir.exists():
             raise ModelCheckError(
-                f"Qwen3-TTS model directory not found: {model_dir}. Please download model weights locally and set QWEN_TTS_MODEL_PATH."
+                f"未找到 Qwen3-TTS 模型目录: {model_dir}。请先下载模型权重并设置 QWEN_TTS_MODEL_PATH。"
             )
 
         stub = os.getenv(_QWEN_WORKER_STUB_ENV, "").strip() in {"1", "true", "TRUE", "yes", "YES"}
@@ -904,7 +904,7 @@ class _QwenTtsWorker:
         self, text: str, speaker_wav: str, output_path: str, language: str = "Auto"
     ) -> dict:
         if self._proc.poll() is not None:
-            raise RuntimeError("Qwen3-TTS worker has exited")
+            raise RuntimeError("Qwen3-TTS worker 已退出")
 
         req = {
             "cmd": "synthesize",
@@ -928,12 +928,12 @@ class _QwenTtsWorker:
                 if self._proc.poll() is not None:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                    raise RuntimeError("Qwen3-TTS worker has exited" + extra)
+                    raise RuntimeError("Qwen3-TTS worker 已退出" + extra)
                 continue
             if not line:
                 stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                 extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
+                raise RuntimeError("Qwen3-TTS worker 无输出" + extra)
 
             s = line.strip()
             if not s:
@@ -964,7 +964,7 @@ class _QwenTtsWorker:
 
     def synthesize_batch(self, items: list[dict]) -> dict:
         if self._proc.poll() is not None:
-            raise RuntimeError("Qwen3-TTS worker has exited")
+            raise RuntimeError("Qwen3-TTS worker 已退出")
 
         req = {
             "cmd": "synthesize_batch",
@@ -985,12 +985,12 @@ class _QwenTtsWorker:
                 if self._proc.poll() is not None:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                    raise RuntimeError("Qwen3-TTS worker has exited" + extra)
+                    raise RuntimeError("Qwen3-TTS worker 已退出" + extra)
                 continue
             if not line:
                 stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                 extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
+                raise RuntimeError("Qwen3-TTS worker 无输出" + extra)
 
             s = line.strip()
             if not s:
@@ -1188,7 +1188,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
     num_speakers = len(speakers)
     total_segments = len(transcript)
     logger.info(
-        f"TTS({tts_method}) started: segments={total_segments}, speakers={num_speakers}, folder={folder}"
+        f"TTS({tts_method}) 开始: segments={total_segments}, speakers={num_speakers}, folder={folder}"
     )
 
     # 防止历史数据/旧逻辑生成超长 SPEAKER/*.wav 导致 voice cloning 显存/时间爆炸
@@ -1420,7 +1420,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
                     qwen_extra = f", sr={sr}, n_samples={n_samples}"
             source = "cached" if was_cached else ("tts" if valid_wav else "silence")
             logger.info(
-                f"TTS({tts_method}) {seg_no}/{total_segments} done: source={source}, "
+                f"TTS({tts_method}) {seg_no}/{total_segments} 完成: source={source}, "
                 f"tts={tts_elapsed:.2f}s, adjust={adjust_elapsed:.2f}s, desired={desired_len:.2f}s, actual={actual_len:.2f}s"
                 f"{qwen_extra}"
             )
@@ -1535,6 +1535,6 @@ def generate_all_wavs_under_folder(
                 pass
         generate_wavs(root, tts_method, qwen_tts_batch_size=qwen_tts_batch_size)
         count += 1
-    msg = f'Generated all wavs under {root_folder} (processed {count} files)'
+    msg = f"语音合成完成: {root_folder}（处理 {count} 个文件）"
     logger.info(msg)
     return msg

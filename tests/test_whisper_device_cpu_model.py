@@ -182,7 +182,7 @@ def test_pipeline_warmup_loads_cpu_model_when_whisper_device_cpu(tmp_path: Path,
         whisper_model=str(gpu_dir),
         whisper_cpu_model=str(cpu_dir),
     )
-    assert "Success: 0" in out
+    assert "成功: 0" in out
     assert calls == [(str(cpu_dir), "cpu")]
 
 
@@ -224,6 +224,6 @@ def test_pipeline_warmup_loads_gpu_model_when_whisper_device_cuda(tmp_path: Path
         whisper_model=str(gpu_dir),
         whisper_cpu_model=str(cpu_dir),
     )
-    assert "Success: 0" in out
+    assert "成功: 0" in out
     assert calls == [(str(gpu_dir), "cuda")]
 

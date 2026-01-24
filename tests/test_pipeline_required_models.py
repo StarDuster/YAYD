@@ -57,7 +57,7 @@ def test_pipeline_builds_required_model_list_for_method(
         tts_method=tts_method,
         auto_upload_video=False,
     )
-    assert "Success: 0" in out
+    assert "成功: 0" in out
 
     names = captured["names"]
     assert any(n.startswith("Demucs") for n in names)

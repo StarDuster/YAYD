@@ -73,7 +73,7 @@ def generate_all_info_under_folder(root_folder):
         if 'download.info.json' in files:
             generate_info(root)
             count += 1
-    msg = f'Generated all info under {root_folder} (processed {count} folders) in {time.time() - start:.1f}s'
+    msg = f"信息生成完成: {root_folder}（处理 {count} 个目录），耗时 {time.time() - start:.1f}s"
     logger.info(msg)
     return msg
 
@@ -95,10 +95,10 @@ def generate_all_info_under_folder_stream(root_folder: str) -> Iterator[str]:
         return "\n".join(lines)
 
     if not root_folder:
-        yield _emit("错误：Folder 不能为空")
+        yield _emit("错误：目录不能为空")
         return
     if not os.path.exists(root_folder):
-        yield _emit(f"错误：Folder 不存在：{root_folder}")
+        yield _emit(f"错误：目录不存在：{root_folder}")
         return
 
     processed = 0
@@ -108,7 +108,7 @@ def generate_all_info_under_folder_stream(root_folder: str) -> Iterator[str]:
     skipped_no_cover_src = 0
     errors = 0
 
-    yield _emit(f"开始生成信息：{root_folder}")
+    yield _emit(f"开始生成信息: {root_folder}")
 
     for root, _dirs, files in os.walk(root_folder):
         check_cancelled()

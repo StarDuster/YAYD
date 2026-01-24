@@ -9,14 +9,14 @@ from ..interrupts import check_cancelled
 
 
 def sanitize_title(title: str) -> str:
-    """Sanitize the video title for file system usage."""
+    """清理标题以便作为目录名。"""
     title = re.sub(r'[^\w\u4e00-\u9fff \d_-]', '', title)
     title = re.sub(r'\s+', ' ', title)
     return title.strip()
 
 
 def get_target_folder(info: dict[str, Any], folder_path: str) -> str | None:
-    """Determine the target folder for a video."""
+    """计算视频的目标目录。"""
     sanitized_title = sanitize_title(info.get('title', 'Unknown'))
     sanitized_uploader = sanitize_title(info.get('uploader', 'Unknown'))
     upload_date = info.get('upload_date', 'Unknown')
@@ -40,9 +40,9 @@ def download_single_video(info: dict[str, Any], folder_path: str, resolution: st
     if os.path.exists(download_mp4):
         try:
             if os.path.getsize(download_mp4) >= 1024:
-                logger.info(f'Video already downloaded in {output_folder}')
+                logger.info(f"已下载: {output_folder}")
                 return output_folder
-            logger.warning(f"Existing download.mp4 looks invalid (too small), will re-download: {download_mp4}")
+            logger.warning(f"download.mp4 疑似无效(过小)，将重新下载: {download_mp4}")
             os.remove(download_mp4)
         except Exception:
             # Best-effort: proceed to re-download
@@ -65,17 +65,17 @@ def download_single_video(info: dict[str, Any], folder_path: str, resolution: st
         check_cancelled()
         rc = ydl.download([info['webpage_url']])
         if rc not in (0, None):
-            logger.warning(f"yt-dlp returned non-zero code: {rc} ({info.get('webpage_url')})")
+            logger.warning(f"yt-dlp 返回非 0: {rc} ({info.get('webpage_url')})")
     
     if os.path.exists(download_mp4):
-        logger.info(f'Video downloaded in {output_folder}')
+        logger.info(f"下载完成: {output_folder}")
         return output_folder
-    logger.error(f"Download failed, missing file: {download_mp4}")
+    logger.error(f"下载失败，文件不存在: {download_mp4}")
     return None
 
 
 def get_info_list_from_url(url: str | list[str], num_videos: int) -> Generator[dict[str, Any], None, None]:
-    """Yield video info dictionaries from one or more URLs."""
+    """从一个或多个 URL 迭代产出视频信息。"""
     if isinstance(url, str):
         url = [url]
 
@@ -102,7 +102,7 @@ def get_info_list_from_url(url: str | list[str], num_videos: int) -> Generator[d
 
 
 def download_from_url(url: str | list[str], folder_path: str, resolution: str = '1080p', num_videos: int = 5) -> None:
-    """Download multiple videos from URLs (wrapper for standalone usage)."""
+    """批量下载（供独立调用）。"""
     if isinstance(url, str):
         url = [url]
     

@@ -63,7 +63,7 @@ def _build_chat_backend(settings: Settings) -> _ChatBackend:
     timeout_s = 240.0
     api_key = settings.openai_api_key
     if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY: Please configure OpenAI-compatible API Key in .env file.")
+        raise RuntimeError("缺少 OPENAI_API_KEY：请在 .env 中配置 OpenAI 兼容的 API Key。")
     base_url = settings.openai_api_base or "https://api.openai.com/v1"
     client = OpenAI(base_url=base_url, api_key=api_key)
     return _ChatBackend(client=client, model=settings.model_name, timeout_s=timeout_s)
@@ -93,7 +93,7 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
             continue
         if isinstance(obj, dict):
             return cast(dict[str, Any], obj)
-    raise ValueError("No JSON object found in model response.")
+    raise ValueError("No JSON object found (模型输出中未找到 JSON 对象)。")
 
 
 def _chat_completion_text(backend: _ChatBackend, messages: list[dict[str, str]]) -> str:
@@ -504,7 +504,7 @@ def _translate_single_with_guide(
                 raise
             sleep_with_cancel(delay)
 
-    raise RuntimeError("Translation failed: retries exhausted")
+    raise RuntimeError("翻译失败：重试次数已耗尽。")
 
 
 def _translate_chunk_with_guide(
@@ -787,6 +787,6 @@ def translate_all_transcript_under_folder(folder: str, target_language: str, set
         if translate_folder(root, target_language, settings=settings):
             if need:
                 count += 1
-    msg = f'Translated all videos under {folder} (processed {count} files)'
+    msg = f"翻译完成: {folder}（处理 {count} 个文件）"
     logger.info(msg)
     return msg

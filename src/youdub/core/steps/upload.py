@@ -100,7 +100,7 @@ def _ensure_cookie_file(cookie_path: Path) -> bool:
                 shutil.copy2(candidate, cookie_path)
                 logger.info(f"已采用现有cookies.json -> {cookie_path}")
             else:
-                logger.info(f"Using existing Bilibili cookie file: {cookie_path}")
+                logger.info(f"使用现有B站cookie文件: {cookie_path}")
             return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"采用现有cookies.json失败: {exc}")
@@ -294,7 +294,7 @@ def upload_video(folder: str) -> bool:
 
 def upload_all_videos_under_folder(folder: str) -> str:
     if stream_gears is None:
-        return f"Error: stream_gears not available. Install dependency 'biliup'. ({_STREAM_GEARS_IMPORT_ERROR})"
+        return f"错误：stream_gears 不可用。请安装依赖 'biliup'。({_STREAM_GEARS_IMPORT_ERROR})"
 
     proxy = (os.getenv("BILI_PROXY") or "").strip() or None
     upload_cdn = (os.getenv("BILI_UPLOAD_CDN") or "").strip() or None
@@ -309,8 +309,8 @@ def upload_all_videos_under_folder(folder: str) -> str:
     # Prepare cookie file once to avoid repeated attempts for each video folder.
     if not _ensure_cookie_file(cookie_path):
         return (
-            "Error: Bilibili cookie file not ready. "
-            "Run `biliup login` to generate cookies.json, then set BILI_COOKIE_PATH (or keep cookies.json in place)."
+            "错误：B站 cookie 未就绪。"
+            "请先运行 `biliup login` 生成 cookies.json，再设置 BILI_COOKIE_PATH（或直接放在默认位置）。"
         )
 
     count = 0
@@ -319,4 +319,4 @@ def upload_all_videos_under_folder(folder: str) -> str:
         if "video.mp4" in files:
             if _upload_video_with_biliup(root, proxy, upload_cdn, cookie_path):
                 count += 1
-    return f"All videos under {folder} processed. Uploaded count: {count}."
+    return f"上传完成: {folder}（成功 {count} 个）"

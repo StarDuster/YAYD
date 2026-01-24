@@ -73,30 +73,30 @@ class VideoPipeline:
             try:
                 def _require_file(path: str, desc: str, min_bytes: int = 1) -> None:
                     if not os.path.exists(path):
-                        raise FileNotFoundError(f"Missing {desc}: {path}")
+                        raise FileNotFoundError(f"缺少{desc}: {path}")
                     try:
                         if os.path.getsize(path) < min_bytes:
-                            raise FileNotFoundError(f"{desc} file too small or corrupted: {path}")
+                            raise FileNotFoundError(f"{desc}文件过小/疑似损坏: {path}")
                     except OSError:
-                        raise FileNotFoundError(f"Cannot read {desc}: {path}") from None
+                        raise FileNotFoundError(f"无法读取{desc}: {path}") from None
 
                 check_cancelled()
                 folder = download.get_target_folder(info, root_folder)
                 if folder is None:
-                    logger.warning(f"Failed to get target folder for video {info.get('title')}")
+                    logger.warning(f"获取视频目录失败: {info.get('title')}")
                     return False
 
                 if self._already_uploaded(folder):
-                    logger.info(f"Video already uploaded in {folder}")
+                    logger.info(f"已上传: {folder}")
                     return True
 
                 check_cancelled()
                 folder = download.download_single_video(info, root_folder, resolution)
                 if folder is None:
-                    logger.warning(f"Failed to download video {info.get('title')}")
+                    logger.warning(f"下载失败: {info.get('title')}")
                     return False
 
-                logger.info(f"Process video in {folder}")
+                logger.info(f"开始处理: {folder}")
 
                 _require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
 
@@ -179,10 +179,10 @@ class VideoPipeline:
                     check_cancelled()
                     upload_all_videos_under_folder(folder)
                     if not self._already_uploaded(folder):
-                        raise RuntimeError(f"Auto upload failed: {folder}")
+                        raise RuntimeError(f"自动上传失败: {folder}")
                 return True
             except Exception as exc:  # pylint: disable=broad-except
-                logger.exception(f"Error processing video {info.get('title')}: {exc}")
+                logger.exception(f"处理失败: {info.get('title')} ({exc})")
         return False
 
     def run(
@@ -289,12 +289,12 @@ class VideoPipeline:
         try:
             separate_vocals.init_demucs(self.settings, self.model_manager)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"Demucs warm-up failed (ignored): {exc}")
+            logger.warning(f"Demucs 预热失败（忽略）: {exc}")
         check_cancelled()
         try:
             synthesize_speech.init_TTS(self.settings, self.model_manager)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"TTS warm-up failed (ignored): {exc}")
+            logger.warning(f"TTS 预热失败（忽略）: {exc}")
         check_cancelled()
         try:
             # Preload ASR model best-effort to reduce first-request latency.
@@ -316,7 +316,7 @@ class VideoPipeline:
             else:
                 transcribe.init_asr(self.settings, self.model_manager)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"ASR warm-up failed (ignored): {exc}")
+            logger.warning(f"ASR 预热失败（忽略）: {exc}")
 
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
@@ -356,7 +356,7 @@ class VideoPipeline:
                 else:
                     fail_list.append(info)
         else:
-            logger.info(f"Processing {len(info_list)} videos with max_workers={max_workers}")
+            logger.info(f"并发处理 {len(info_list)} 个视频: max_workers={max_workers}")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_info = {
                     executor.submit(
@@ -393,11 +393,11 @@ class VideoPipeline:
                     try:
                         success = future.result()
                     except Exception as exc:  # pylint: disable=broad-except
-                        logger.error(f"Unhandled exception processing {info.get('title')}: {exc}")
+                        logger.error(f"未处理异常: {info.get('title')} ({exc})")
                         success = False
                     if success:
                         success_list.append(info)
                     else:
                         fail_list.append(info)
 
-        return f"Success: {len(success_list)}\nFail: {len(fail_list)}"
+        return f"成功: {len(success_list)}\n失败: {len(fail_list)}"

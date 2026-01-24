@@ -64,7 +64,7 @@ def main() -> int:
         if cmd == "shutdown":
             break
         if cmd != "synthesize":
-            print(json.dumps({"ok": False, "error": f"unknown cmd: {cmd}"}), flush=True)
+            print(json.dumps({"ok": False, "error": f"未知命令: {cmd}"}), flush=True)
             continue
 
         # Noise between request and response (stdout)

@@ -71,7 +71,7 @@ def test_upload_all_videos_returns_error_when_stream_gears_missing(monkeypatch, 
     monkeypatch.setattr(up, "stream_gears", None, raising=False)
     monkeypatch.setattr(up, "_STREAM_GEARS_IMPORT_ERROR", RuntimeError("no"), raising=False)
     out = up.upload_all_videos_under_folder(str(tmp_path))
-    assert out.startswith("Error: stream_gears not available.")
+    assert out.startswith("错误：stream_gears 不可用")
 
 
 def test_ensure_cookie_file_uses_existing_nonempty_cookie(monkeypatch, tmp_path: Path):
@@ -230,7 +230,7 @@ def test_upload_all_videos_counts_uploaded_folders(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr(up, "_upload_video_with_biliup", _fake_impl)
     out = up.upload_all_videos_under_folder(str(tmp_path))
-    assert "Uploaded count: 1" in out
+    assert "成功 1 个" in out
 
 
 def test_upload_video_with_biliup_respects_cancellation(monkeypatch, tmp_path: Path):
