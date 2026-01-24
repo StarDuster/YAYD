@@ -1,11 +1,11 @@
 [project]
-name = "youdub-webui"
+name = "yet-another-youdub-webui"
 version = "0.1.0"
 description = "Translate and dub YouTube videos to Chinese using AI"
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
 license = { text = "MIT" }
-authors = [{ name = "liuzhao1225" }]
+authors = [{ name = "StarDuster" }, { name = "liuzhao1225" }]
 keywords = ["youtube", "translation", "dubbing", "ai", "tts", "whisper"]
 
 dependencies = [
@@ -15,7 +15,6 @@ dependencies = [
 
     # Logging
     "loguru>=0.7.0,<1.0.0",
-
 
     # Configuration
     "pydantic>=2.0.0,<3.0.0",
@@ -41,10 +40,17 @@ dependencies = [
 
     # Speech recognition (offline / GPU-friendly)
     "faster-whisper>=1.2.1",
+    # Use CTranslate2 >= 4.5.0 to align with cuDNN 9 (avoid cuDNN 8 split libs like libcudnn_ops_infer.so.8).
+    "ctranslate2>=4.5.0,<5.0.0",
+    # faster-whisper VAD uses onnxruntime. Prefer GPU build on Linux.
+    "onnxruntime-gpu; sys_platform == 'linux'",
+    "onnxruntime; sys_platform != 'linux'",
 
-    # Speaker diarization (required by bytedance TTS for speaker matching)
-    # Note: Keep <4.0.0 for Torchaudio 2.1.x compatibility
-    "pyannote.audio>=3.1.0,<4.0.0",
+    # Speaker diarization / speaker embedding (used by diarization + bytedance voice matching; optional at runtime)
+    "pyannote.audio>=3.1.0,<5.0.0",
+
+    # Local TTS (Qwen3-TTS / Qwen-Audio worker)
+    "qwen-tts==0.0.5",
 
     # Translation API
     "openai>=1.0.0,<2.0.0",
@@ -58,12 +64,13 @@ dependencies = [
     "requests>=2.31.0,<3.0.0",
 
     # Bilibili upload
-    # Bilibili upload
     "bilibili_toolman",
 
-    # PyTorch ecosystem (CUDA 12.1)
-    "torch==2.1.2",
-    "torchaudio==2.1.2",
+    # PyTorch ecosystem (CUDA 12.8 on Linux via uv index)
+    # Keep as a range so you can upgrade without editing this file again.
+    "torch>=2.10.0,<3.0.0",
+    "torchaudio>=2.10.0,<3.0.0",
+    "torchcodec>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -92,10 +99,40 @@ target-version = ["py310"]
 # --- UV Package Manager Configuration ---
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[tool.uv]
+# faster-whisper / qwen-tts depend on `onnxruntime`, but on Linux we intentionally provide the
+# `onnxruntime` module via the GPU build (`onnxruntime-gpu`) to enable CUDA execution providers.
+dependency-metadata = [
+    # Patch faster-whisper to avoid forcing the CPU-only `onnxruntime` wheel.
+    { name = "faster-whisper", version = "1.2.1", provides-extra = ["conversion", "dev"], requires-dist = [
+        "ctranslate2<5,>=4.0",
+        "huggingface-hub>=0.21",
+        "tokenizers<1,>=0.13",
+        "av>=11",
+        "tqdm",
+        "transformers[torch]>=4.23; extra == \"conversion\"",
+        "black==23.*; extra == \"dev\"",
+        "flake8==6.*; extra == \"dev\"",
+        "isort==5.*; extra == \"dev\"",
+        "pytest==7.*; extra == \"dev\"",
+    ] },
+    # Patch qwen-tts to avoid forcing the CPU-only `onnxruntime` wheel.
+    { name = "qwen-tts", version = "0.0.5", requires-dist = [
+        "transformers==4.57.3",
+        "accelerate==1.12.0",
+        "gradio",
+        "librosa",
+        "torchaudio",
+        "soundfile",
+        "sox",
+        "einops",
+    ] },
+]
+
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
-torchaudio = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
