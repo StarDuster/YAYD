@@ -1,7 +1,12 @@
 import os
 import shutil
 import subprocess
+import sys
+import time
+import queue
+import threading
 from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 import gradio as gr
 from loguru import logger
@@ -26,6 +31,161 @@ model_manager = ModelManager(settings)
 pipeline = VideoPipeline(settings=settings, model_manager=model_manager)
 
 DEFAULT_SPEED_UP = 1.2
+
+
+class _QueueWriter:
+    """File-like writer which forwards lines to a queue."""
+
+    def __init__(self, q: "queue.Queue[str]", prefix: str = "", mirror: Any | None = None) -> None:
+        self._q = q
+        self._prefix = prefix
+        self._mirror = mirror
+        self._buf = ""
+
+    def write(self, s: str) -> int:  # file-like
+        if not s:
+            return 0
+        # Mirror raw bytes to original stream (keep terminal logs).
+        if self._mirror is not None:
+            try:
+                self._mirror.write(s)
+            except Exception:
+                pass
+
+        # tqdm/progress bars often use '\r' updates; translate to '\n' for UI friendliness.
+        s_ui = s.replace("\r", "\n")
+        self._buf += s_ui
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip()
+            if line:
+                self._q.put(f"{self._prefix}{line}")
+        return len(s)
+
+    def flush(self) -> None:  # file-like
+        if self._mirror is not None:
+            try:
+                self._mirror.flush()
+            except Exception:
+                pass
+        line = self._buf.strip()
+        if line:
+            self._q.put(f"{self._prefix}{line}")
+        self._buf = ""
+
+
+@contextmanager
+def _capture_output_to_queue(q: "queue.Queue[str]"):
+    """Temporarily mirror loguru + stdout/stderr into a queue (per Gradio run)."""
+    old_stdout = sys.stdout
+
+    def _sink(message: Any) -> None:
+        try:
+            text = str(message).rstrip("\n")
+        except Exception:
+            return
+        if text:
+            q.put(text)
+
+    sink_id: int | None
+    try:
+        # Match loguru's common terminal style (module:function:line) for readability.
+        sink_id = logger.add(
+            _sink,
+            level="INFO",
+            enqueue=True,
+            colorize=False,
+            backtrace=False,
+            diagnose=False,
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}",
+        )
+    except Exception:
+        sink_id = None
+
+    try:
+        sys.stdout = _QueueWriter(q, mirror=old_stdout)  # type: ignore[assignment]
+        yield
+    finally:
+        sys.stdout = old_stdout
+        if sink_id is not None:
+            try:
+                logger.remove(sink_id)
+            except Exception:
+                pass
+
+
+def _stream_run(fn: Callable[[], Any], *, max_lines: int = 400) -> Iterator[str]:
+    """Run `fn` in a thread and stream collected logs to Gradio output."""
+
+    q: "queue.Queue[str]" = queue.Queue()
+    done = threading.Event()
+    result_box: dict[str, Any] = {}
+    exc_box: dict[str, BaseException] = {}
+
+    def _runner() -> None:
+        try:
+            with _capture_output_to_queue(q):
+                result_box["result"] = fn()
+        except BaseException as exc:  # pylint: disable=broad-except
+            exc_box["exc"] = exc
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+
+    lines: list[str] = []
+
+    def _append_text(text: str) -> None:
+        for part in str(text).replace("\r", "\n").split("\n"):
+            part = part.rstrip()
+            if part:
+                lines.append(part)
+        if len(lines) > max_lines:
+            # Drop oldest lines to keep UI payload bounded.
+            del lines[: max(50, max_lines // 5)]
+
+    last_yield = 0.0
+    while True:
+        try:
+            item = q.get(timeout=0.2)
+        except queue.Empty:
+            if done.is_set():
+                break
+            continue
+        _append_text(item)
+        now = time.monotonic()
+        if (now - last_yield) >= 0.2:
+            last_yield = now
+            yield "\n".join(lines)
+
+    t.join(timeout=0)
+
+    if "exc" in exc_box:
+        exc = exc_box["exc"]
+        _append_text(f"异常: {type(exc).__name__}: {exc}")
+        yield "\n".join(lines)
+        return
+
+    # Always show final result (if any).
+    result = result_box.get("result")
+    if result is not None:
+        if isinstance(result, str):
+            _append_text(result)
+        else:
+            _append_text(str(result))
+
+    # Flush one last time (may include final result line).
+    yield "\n".join(lines)
+
+
+def _streamify(fn: Callable[..., Any]) -> Callable[..., Iterator[str]]:
+    """Wrap a non-streaming function so its logs show up in Gradio Output."""
+
+    def _wrapped(*args: Any, **kwargs: Any) -> Iterator[str]:
+        return _stream_run(lambda: fn(*args, **kwargs))
+
+    return _wrapped
 
 
 def _default_use_nvenc() -> bool:
@@ -162,7 +322,7 @@ def show_model_status():
 
 
 do_everything_interface = gr.Interface(
-    fn=run_pipeline,
+    fn=_streamify(run_pipeline),
     inputs=[
         gr.Textbox(label="Root Folder", value=str(settings.root_folder)),
         gr.Textbox(
@@ -222,11 +382,11 @@ do_everything_interface = gr.Interface(
         gr.Slider(minimum=1, maximum=10, step=1, label="Max Retries", value=3),
         gr.Checkbox(label="Auto Upload Video", value=False),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 youtube_interface = gr.Interface(
-    fn=download_from_url,
+    fn=_streamify(download_from_url),
     inputs=[
         gr.Textbox(
             label="Video URL",
@@ -241,11 +401,11 @@ youtube_interface = gr.Interface(
         ),
         gr.Slider(minimum=1, maximum=100, step=1, label="Number of videos to download", value=5),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 demucs_interface = gr.Interface(
-    fn=lambda folder, model, device, progress, shifts: _safe_run(
+    fn=_streamify(lambda folder, model, device, progress, shifts: _safe_run(
         [model_manager._demucs_requirement().name],  # type: ignore[attr-defined]
         separate_all_audio_under_folder,
         folder,
@@ -255,7 +415,7 @@ demucs_interface = gr.Interface(
         shifts=shifts,
         settings=settings,
         model_manager=model_manager,
-    ),
+    )),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Radio(
@@ -267,11 +427,11 @@ demucs_interface = gr.Interface(
         gr.Checkbox(label="Progress Bar in Console", value=True),
         gr.Slider(minimum=0, maximum=10, step=1, label="Number of shifts", value=settings.demucs_shifts),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 whisper_inference = gr.Interface(
-    fn=lambda folder, model, cpu_model, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
+    fn=_streamify(lambda folder, model, cpu_model, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
         (
             [model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
             if diarization
@@ -288,7 +448,7 @@ whisper_inference = gr.Interface(
         max_speakers=max_speakers,
         settings=settings,
         model_manager=model_manager,
-    ),
+    )),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Textbox(label="Model", value=str(settings.whisper_model_path)),
@@ -299,7 +459,7 @@ whisper_inference = gr.Interface(
         gr.Radio([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], label="Whisper Min Speakers", value=None),
         gr.Radio([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], label="Whisper Max Speakers", value=None),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 
@@ -323,7 +483,7 @@ def run_translation(
 
 
 translation_interface = gr.Interface(
-    fn=run_translation,
+    fn=_streamify(run_translation),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Dropdown(
@@ -336,7 +496,7 @@ translation_interface = gr.Interface(
         gr.Slider(minimum=1, maximum=64, step=1, label="Translation Chunk Size", value=8),
         gr.Slider(minimum=800, maximum=5000, step=100, label="Translation Guide Max Chars", value=2500),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 
@@ -363,7 +523,7 @@ def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
 
 
 tts_interface = gr.Interface(
-    fn=_tts_wrapper,
+    fn=_streamify(_tts_wrapper),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Dropdown(
@@ -373,11 +533,11 @@ tts_interface = gr.Interface(
         ),
         gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS Batch Size", value=settings.qwen_tts_batch_size),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 syntehsize_video_interface = gr.Interface(
-    fn=synthesize_all_video_under_folder,
+    fn=_streamify(synthesize_all_video_under_folder),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Checkbox(label="Subtitles", value=True),
@@ -390,7 +550,7 @@ syntehsize_video_interface = gr.Interface(
         ),
         gr.Checkbox(label="Use NVENC (h264_nvenc)", value=DEFAULT_USE_NVENC),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 genearte_info_interface = gr.Interface(
@@ -398,21 +558,21 @@ genearte_info_interface = gr.Interface(
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 upload_bilibili_interface = gr.Interface(
-    fn=upload_all_videos_under_folder,
+    fn=_streamify(upload_all_videos_under_folder),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
     ],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )
 
 model_status_interface = gr.Interface(
-    fn=show_model_status,
+    fn=_streamify(show_model_status),
     inputs=[],
-    outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
+    outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
     description="当前需要的 ASR/TTS 模型状态（仅本地，不会自动下载）。",
 )
 
@@ -433,10 +593,16 @@ app = gr.TabbedInterface(
     title='YouDub',
 )
 
+try:
+    # Enable Gradio queue so generator outputs can stream progressively.
+    if hasattr(app, "queue"):
+        app = app.queue()
+except Exception:
+    pass
+
 
 def main():
     import inspect
-    import time
 
     install_signal_handlers()
 
