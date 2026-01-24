@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import importlib.util
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -31,13 +34,61 @@ def _import_faster_whisper():
 _DEFAULT_SETTINGS = Settings()
 _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
 
-# --- Global caches ---
 _ASR_MODEL = None
 _ASR_PIPELINE = None
 _ASR_KEY: str | None = None
 
 _DIARIZATION_PIPELINE = None
 _DIARIZATION_KEY: str | None = None
+
+
+_CUDNN_PRELOADED = False
+
+
+def _preload_cudnn_for_onnxruntime_gpu() -> None:
+    """Ensure onnxruntime-gpu can find cuDNN shipped as pip wheels.
+
+    In some environments (notably WSL / minimal containers), CUDA libraries are available
+    system-wide, but cuDNN is installed via `nvidia-cudnn-cu12` inside the venv only.
+    `onnxruntime-gpu` loads `libonnxruntime_providers_cuda.so`, which depends on `libcudnn.so.9`.
+    The dynamic loader won't search the venv site-packages directory by default, leading to
+    a hard crash/abort in downstream libraries.
+
+    We preload `libcudnn.so.9` via an absolute path and RTLD_GLOBAL so that subsequent loads
+    can resolve the dependency by SONAME.
+    """
+
+    global _CUDNN_PRELOADED  # noqa: PLW0603
+
+    if _CUDNN_PRELOADED:
+        return
+    _CUDNN_PRELOADED = True
+
+    if sys.platform != "linux":
+        return
+
+    try:
+        ort_spec = importlib.util.find_spec("onnxruntime")
+        if not ort_spec or not ort_spec.submodule_search_locations:
+            return
+        ort_root = Path(list(ort_spec.submodule_search_locations)[0])
+        if not (ort_root / "capi" / "libonnxruntime_providers_cuda.so").exists():
+            # CPU-only build; nothing to do.
+            return
+
+        cudnn_spec = importlib.util.find_spec("nvidia.cudnn")
+        if not cudnn_spec or not cudnn_spec.submodule_search_locations:
+            return
+        cudnn_root = Path(list(cudnn_spec.submodule_search_locations)[0])
+        cudnn_lib = cudnn_root / "lib" / "libcudnn.so.9"
+        if not cudnn_lib.exists():
+            return
+
+        ctypes.CDLL(str(cudnn_lib), mode=ctypes.RTLD_GLOBAL)
+        logger.info(f"Preloaded cuDNN for onnxruntime-gpu: {cudnn_lib}")
+    except Exception as exc:  # pylint: disable=broad-except
+        # Never hard-fail here; downstream may still work if the system has cuDNN installed.
+        logger.warning(f"Failed to preload cuDNN for onnxruntime-gpu: {exc}")
 
 
 def unload_all_models() -> None:
@@ -198,7 +249,11 @@ def load_diarize_model(
         token = settings.hf_token
         if not token:
             raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+        # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
+        try:
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+        except TypeError:
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
 
     pipeline.to(torch.device(device))
     _DIARIZATION_PIPELINE = pipeline
@@ -345,6 +400,8 @@ def transcribe_audio(
 
     logger.info(f"Transcribing {wav_path}")
     t0 = time.time()
+
+    _preload_cudnn_for_onnxruntime_gpu()
 
     # Prefer batched pipeline if available (much higher throughput on GPU).
     if _ASR_PIPELINE is not None:
