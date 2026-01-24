@@ -37,6 +37,7 @@ from .synthesize_video import (
 )
 from .generate_info import (
     generate_all_info_under_folder,
+    generate_all_info_under_folder_stream,
     generate_info,
     generate_summary_txt,
     resize_thumbnail,
@@ -73,6 +74,7 @@ __all__ = [
     "generate_summary_txt",
     "generate_info",
     "generate_all_info_under_folder",
+    "generate_all_info_under_folder_stream",
     "upload_all_videos_under_folder",
     "upload_video",
 ]

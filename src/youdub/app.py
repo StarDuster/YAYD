@@ -4,7 +4,7 @@ from youdub.config import Settings
 from youdub.core.pipeline import VideoPipeline
 from youdub.core.steps import (
     download_from_url,
-    generate_all_info_under_folder,
+    generate_all_info_under_folder_stream,
     generate_all_wavs_under_folder,
     separate_all_audio_under_folder,
     synthesize_all_video_under_folder,
@@ -290,7 +290,7 @@ syntehsize_video_interface = gr.Interface(
 )
 
 genearte_info_interface = gr.Interface(
-    fn=generate_all_info_under_folder,
+    fn=generate_all_info_under_folder_stream,
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
     ],

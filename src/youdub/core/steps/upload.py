@@ -9,6 +9,14 @@ from loguru import logger
 
 load_dotenv()
 
+# 设置 SOCKS5 代理（如果 ss-local 在本地运行）
+_proxy_url = os.getenv("BILI_PROXY", "socks5h://127.0.0.1:1080")
+if _proxy_url:
+    os.environ["HTTP_PROXY"] = _proxy_url
+    os.environ["HTTPS_PROXY"] = _proxy_url
+    os.environ["ALL_PROXY"] = _proxy_url
+    logger.info(f"Bilibili upload proxy set to: {_proxy_url}")
+
 
 def bili_login() -> BiliSession:
     sessdata = os.getenv('BILI_SESSDATA')

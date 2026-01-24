@@ -25,7 +25,13 @@ def test_pipeline_builds_required_model_list_for_method(
 ):
     import youdub.core.pipeline as pl
 
-    settings = Settings(root_folder=tmp_path)
+    # Pipeline now validates Whisper model.bin paths early (outside ModelManager.ensure_ready),
+    # so provide a minimal dummy model directory.
+    whisper_dir = tmp_path / "whisper"
+    whisper_dir.mkdir(parents=True, exist_ok=True)
+    (whisper_dir / "model.bin").write_bytes(b"0")
+
+    settings = Settings(root_folder=tmp_path, whisper_model_path=whisper_dir)
     manager = ModelManager(settings)
 
     captured: dict[str, list[str]] = {"names": []}
@@ -55,7 +61,6 @@ def test_pipeline_builds_required_model_list_for_method(
 
     names = captured["names"]
     assert any(n.startswith("Demucs") for n in names)
-    assert any(n.startswith("Whisper ASR") for n in names)
 
     assert any("Speaker Diarization" in n for n in names) is expect_diar
     assert any("Gemini TTS" in n for n in names) is expect_gemini

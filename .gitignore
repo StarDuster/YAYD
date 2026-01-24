@@ -189,6 +189,7 @@ remove_mp4.py
 
 # Local misc (not for repo)
 misc/
+ss-config.json
 
 # Debug artifacts from misc scripts
 debug_gemini_output.bin
