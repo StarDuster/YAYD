@@ -1,172 +1,153 @@
-# YAYD: Yet another YouDub
+# YouDub-webui
 
-`YouDub-webui` 是一个基于Gradio的开源项目，它集成了多种AI技术，提供一个可视化的操作界面，用于处理视频的翻译和配音任务。
+**YouDub-webui** 是一个基于 Gradio 的开源 AI 视频本地化工作流工具。它提供了一站式的 Web 界面，能够自动下载视频、分离人声、识别语音、翻译文本、合成目标语言配音，并最终生成带有字幕和配音的本地化视频。
 
-本项目 fork 并重构自 https://github.com/liuzhao1225/YouDub-webui/blob/master/README.md 。
+本项目旨在提供高质量、可定制且易于部署的视频本地化解决方案，集成了业界领先的开源模型和商业 API。
 
-## 工作原理
+## 核心特性
 
-本项目实现了一条端到端的视频本地化流水线，将外语视频自动转换为目标语言配音版本。核心处理流程如下：
+本项目实现了一条模块化、端到端的处理流水线：
 
-1.  **视频获取**: 使用 `yt-dlp` 从 YouTube 等平台下载源视频及元数据。
-2.  **音频分离**: 通过 **Demucs** (Facebook Research) 将音轨分离为人声与背景音乐/音效。
-3.  **语音识别与说话人分离**: 使用 **faster-whisper** 对人声进行自动语音识别 (ASR)，生成带时间戳的逐句文本；可选调用 **Pyannote** 进行说话人分离 (Speaker Diarization)，标记每句话的说话人身份。
-4.  **文本翻译**: 通过 OpenAI 兼容 API 调用大语言模型，逐句将原文翻译为目标语言。
-5.  **语音合成**: 使用 TTS 引擎（支持 **火山引擎 TTS** / **Gemini TTS** / 本地 **Qwen3-TTS（声音克隆）**）将翻译后的文本合成为语音，并尝试通过音色匹配模拟原说话人声音特征。
-6.  **视频合成**: 将合成语音与原背景音轨混音，叠加字幕轨道，输出最终的本地化视频文件。
+1.  **视频获取**: 集成 `yt-dlp`，支持从 YouTube 及其他主流平台下载视频，自动提取元数据。
+2.  **人声分离**: 使用 **Demucs (htdemucs_ft)** 模型，高质量分离人声与背景音乐/音效，确保配音后保留原视频的背景氛围。
+3.  **语音识别 (ASR) 与 说话人分离 (Diarization)**:
+    *   采用 **faster-whisper** (Large-v3) 进行高精度、快速的语音识别。
+    *   集成 **Pyannote Audio 3.1** 进行说话人区分，支持多角色识别。
+4.  **文本翻译**: 支持 OpenAI 兼容格式的 API (如 OpenAI GPT-4o, DeepSeek, Claude 等)，实现上下文感知的精准翻译。
+5.  **语音合成 (TTS)**:
+    *   **ByteDance (火山引擎)**: 支持高质量的语音合成，包含 **ICL 2.0 声音克隆**功能（需配置 API）。
+    *   **Qwen2-Audio / Qwen3-TTS**: 支持通过 Worker 模式运行本地离线 TTS 模型。
+    *   **Google Gemini**: 实验性支持 Gemini TTS。
+6.  **视频合成**: 智能音频对齐、变速处理，自动混音背景音轨，生成带字幕的最终视频。
 
-项目提供 Gradio Web UI，支持全自动流水线执行或分步手动操作。
+## 系统要求
+
+*   **操作系统**: Linux (推荐 Ubuntu 22.04+) 或 WSL2 (Windows Subsystem for Linux)。
+*   **Python**: 3.10 或 3.11。
+*   **GPU**: 推荐 NVIDIA GPU，显存 8GB+ (如需运行本地 LLM 或 TTS 可能需要更多)。
+*   **CUDA**: 推荐版本 12.1。
+*   **FFmpeg**: 必须安装并配置在系统 PATH 中。
 
 ## 安装指南
 
-项目中含有较古老的依赖，避免使用过高版本的 Python
+本项目推荐使用 [uv](https://github.com/astral-sh/uv) 进行高效的依赖管理。
 
-#### 第1步: 克隆仓库并进入目录
+### 1. 克隆仓库
 
 ```bash
-git clone git@github.com:StarDuster/YAYD.git
+git clone https://github.com/StarDuster/YAYD.git
 cd YAYD
 ```
 
-#### 第2步: 创建虚拟环境
+### 2. 环境配置与安装
+
+确保已安装 `uv`，然后同步依赖：
 
 ```bash
-# (推荐) 使用 uv
-uv venv
-```
-激活虚拟环境:
-```bash
-source .venv/bin/activate
-```
-
-#### 第3步: 安装 yt-dlp 所需运行环境（Deno / 插件）
-
-由于 https://github.com/yt-dlp/yt-dlp/issues/15012 所提及的限制，下载 YouTube 等站点时，`yt-dlp` 可能需要可用的 JavaScript 运行时（推荐 `deno`）以及 `yt-dlp-ejs` 等插件支持。
-
-```bash
-curl -fsSL https://deno.land/install.sh | sh
-deno --version
-```
-
-#### 第4步: 安装主程序和依赖
-
-```bash
-# (推荐) 使用 uv + lockfile，避免装到错误的 torch/CUDA 变体
+# 创建虚拟环境并安装依赖
 uv sync
 ```
 
-- **说明：人声分离已内置**
-  本项目默认使用 `demucs-infer`（Demucs 的推理版维护分支），无需再单独安装 Demucs。
+或者使用传统的 pip 安装方式（建议在虚拟环境中）：
 
-- **安装 Qwen3-TTS（本地声音克隆，可选）:**
-  为避免把重量级依赖混进主环境、以及潜在依赖冲突，推荐创建独立环境（例如 `.venv_qwen`）：
-  ```bash
-  uv venv .venv_qwen
-  uv pip install -U -p .venv_qwen/bin/python qwen-tts
-  ```
+```bash
+pip install -e .
+```
 
+### 3. 安装外部依赖
 
-#### 第5步: 运行模型下载脚本
+**FFmpeg** (必需):
+```bash
+sudo apt update && sudo apt install ffmpeg
+```
 
-本项目为保证环境一致性与离线可用性，提供了一键下载脚本。此脚本会下载所有必需的 AI 模型（Demucs, Whisper(faster-whisper), Pyannote Diarization）并锁定到验证过的版本。
+**yt-dlp 插件支持** (可选，解决部分 YouTube 下载限速问题):
+需安装 Deno 运行时以支持 yt-dlp 的某些解密插件：
+```bash
+curl -fsSL https://deno.land/install.sh | sh
+# 确保 ~/.deno/bin 在 PATH 中
+```
 
-1. **配置 Hugging Face 权限**:
-   - 访问 https://huggingface.co/pyannote/speaker-diarization-3.1 并接受许可协议。
-   - 访问 https://huggingface.co/pyannote/segmentation-3.0 并接受许可协议。
-   - 在 `.env` 文件中填入你的 `HF_TOKEN`。
+### 4. 下载模型
 
-2. **运行下载脚本**:
-   ```bash
-   uv run python scripts/download_models.py
-   ```
-   
-   脚本会自动执行以下操作：
-   - 从 PyTorch Hub 下载 **Demucs (htdemucs_ft)** 模型。
-   - 从 Hugging Face 下载 **Whisper (large-v3)** 的 CTranslate2 格式模型（faster-whisper 可直接加载）。
-   - 下载并缓存 **Pyannote Speaker Diarization 3.1** 及其依赖。
-   - （不包含 Qwen3-TTS 权重，体积较大；请按 Qwen3-TTS 文档自行下载到本地并配置 QWEN_TTS_MODEL_PATH）
-   
-   > 脚本运行完成后，您可以再次运行 `uv run youdub`，此时“模型检查”页面应全部通过，且程序可在无网络环境下（除翻译/TTS API外）运行。
+项目提供了一键脚本下载所需的离线模型（Whisper, Demucs, Pyannote 等）。
 
-## 配置
+**注意**：下载 `pyannote` 模型需要 Hugging Face 访问令牌，并同意相关模型的使用协议。
+1.  访问 [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) 和 [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) 接受用户协议。
+2.  在环境变量或 `.env` 中设置 `HF_TOKEN`。
 
-在运行程序之前，需要配置必要的API密钥。
+运行下载脚本：
+```bash
+uv run python scripts/download_models.py
+```
+此脚本将下载并验证以下模型：
+*   `Systran/faster-whisper-large-v3`
+*   `pyannote/speaker-diarization-3.1`
+*   `demucs (htdemucs_ft)`
 
-1.  **创建 `.env` 文件**:
-    复制 `.env.example` 文件并重命名为 `.env`。
-    ```bash
-    cp .env.example .env
-    ```
+## 配置指南
 
-2.  **编辑 `.env` 文件**:
-    打开 `.env` 文件并填入以下信息。
+复制 `.env.example` 为 `.env` 并填入关键配置：
 
-    **核心配置 (建议填写):**
-    ```env
-    # 用于翻译（OpenAI 兼容接口，支持将 OPENAI_API_BASE 指向任意兼容网关）
-    OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    # 可选：自定义 OpenAI 兼容网关（如自建/第三方）
-    OPENAI_API_BASE=https://api.openai.com/v1
-    # 可选：模型名（不同网关可能不同）
-    MODEL_NAME=gpt-3.5-turbo
+```bash
+cp .env.example .env
+```
 
-    # 用于从Hugging Face下载说话人识别模型
-    HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    ```
+### 核心配置项
 
-    **可选功能配置:**
-    ```env
-    # 如果你想使用字节跳动TTS
-    BYTEDANCE_APPID=xxxxxxxxxx
-    BYTEDANCE_ACCESS_TOKEN=xxxxxxxxxx
+```ini
+# --- 基础配置 ---
+# Hugging Face Token (用于下载 Pyannote 模型)
+HF_TOKEN=hf_xxxxxxxxxxxxxxx
 
-    # 如果你想使用 Gemini TTS
-    GEMINI_API_KEY=xxxxxxxxxx
-    GEMINI_TTS_MODEL=gemini-2.5-flash-preview-tts
-    GEMINI_TTS_VOICE=Kore
+# OpenAI 兼容 API (用于翻译)
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxx
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
 
-    # 如果你想自动上传到Bilibili
-    BILI_SESSDATA=xxxxxxxxxx
-    BILI_BILI_JCT=xxxxxxxxxx
-    ```
+# --- TTS 配置 (选填) ---
 
-    **高级配置 (模型本地路径):**
-    为避免程序自动下载，可预先下载模型并在此处指定本地路径。
-    ```env
-    WHISPER_MODEL_PATH=models/ASR/whisper
-    # 可选：如果开启说话人分离，需要准备 pyannote 的离线缓存目录
-    WHISPER_DIARIZATION_MODEL_DIR=models/ASR/whisper/diarization
-    QWEN_TTS_MODEL_PATH=models/TTS/Qwen3-TTS-12Hz-1.7B-Base
-    QWEN_TTS_PYTHON=.venv_qwen/bin/python
-    # ... 其他模型路径
-    ```
+# 1. ByteDance (火山引擎) - 推荐，支持克隆
+BYTEDANCE_APPID=xxxxxxxxxx
+BYTEDANCE_ACCESS_TOKEN=xxxxxxxxxx
 
-## 如何使用
+# 2. Gemini TTS
+GEMINI_API_KEY=AIzaSyxxxxxxxxxx
 
-1.  **启动Web服务器**:
-    在您的终端中（确保虚拟环境已激活），运行以下命令：
-    ```bash
-    youdub
-    ```
+# 3. Qwen TTS (本地 Worker 模式)
+# 需单独配置 Qwen TTS 的 Python 环境和模型路径
+# QWEN_TTS_PYTHON=/path/to/qwen-env/bin/python
+# QWEN_TTS_MODEL_PATH=/path/to/Qwen2-Audio-7B-Instruct
+```
 
-2.  **访问Web界面**:
-    打开浏览器，访问终端中显示的URL (通常是 `http://1.2.3.4:7860`)。
+## 使用说明
 
-3.  **开始使用**:
+启动 Web UI 服务：
 
-    - **模型检查**: 访问 **“模型检查”** 标签页，可查看模型是否已准备就绪。
+```bash
+uv run youdub
+```
 
-    - **自动模式**:
-        - 切换到 **“全自动”** 标签页。
-        - 输入一个视频或播放列表的 **URL**。
-        - 调整下方的配置参数。
-        - 点击 **“提交”** 按钮，流水线将开始运行。
+服务启动后，在浏览器访问显示的地址（默认 `http://127.0.0.1:7860`）。
 
-    - **手动模式**:
-        - 按照标签页的顺序，从 **“下载视频”** 开始。
-        - 在每个标签页中，指定要处理的文件夹。
-        - 完成一步后，进入下一个标签页继续处理。
+### 操作流程
 
-## 许可协议
+1.  **模型检查**: 首次运行建议在“模型检查”标签页确认所有模型加载正常。
+2.  **全自动模式**:
+    *   输入视频 URL。
+    *   选择目标语言。
+    *   点击“提交”，系统将自动执行下载、分离、识别、翻译、合成全流程。
+3.  **分步模式**:
+    *   可在各标签页单独执行特定步骤（如仅下载、仅翻译、仅 TTS），便于调试或人工修正中间结果（如修正 `translation.json`）。
 
-本项目遵循 `Apache-2.0` 许可协议。使用本工具时，请务必尊重并遵守原始内容的版权，以及相关的法律法规。
+## 高级功能：Qwen TTS Worker
+
+若需使用本地 Qwen 模型进行 TTS：
+1.  准备一个独立的 Python 环境，安装 Qwen-Audio/TTS 所需依赖。
+2.  下载 Qwen 模型权重。
+3.  在 `.env` 中配置 `QWEN_TTS_PYTHON` 和 `QWEN_TTS_MODEL_PATH`。
+4.  程序运行时会自动拉起 `scripts/qwen_tts_worker.py` 子进程进行推理。
+
+## 许可证
+
+MIT License. 详见 `pyproject.toml`。
