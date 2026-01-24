@@ -87,9 +87,11 @@ def upload_video(folder: str) -> bool:
         logger.error(f"Login skipped/failed: {e}")
         return False
     
+    video_endpoint: str | None = None
     for retry in range(5):
         try:
-            video_endpoint, _ = session.UploadVideo(video_path)
+            if video_endpoint is None:
+                video_endpoint, _ = session.UploadVideo(video_path)
 
             submission = Submission(
                 title=title,
@@ -137,8 +139,9 @@ def upload_video(folder: str) -> bool:
                 json.dump(response, f, ensure_ascii=False, indent=4)
             return True
             
-        except Exception as e:
-            logger.error(f"Error submitting (retry {retry+1}/5):\n{e}")
+        except Exception:
+            # Use full traceback; upstream (bilibili_toolman) can raise confusing KeyError like: KeyError('OK')
+            logger.exception(f"Bilibili upload/submit failed (retry {retry+1}/5)")
             time.sleep(10)
             
     logger.error("Failed to upload after retries.")
