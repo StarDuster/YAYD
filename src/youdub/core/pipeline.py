@@ -58,6 +58,7 @@ class VideoPipeline:
         translation_target_language: str,
         tts_method: str,
         qwen_tts_batch_size: int,
+        tts_adaptive_segment_stretch: bool,
         subtitles: bool,
         speed_up: float,
         fps: int,
@@ -156,6 +157,7 @@ class VideoPipeline:
                     folder, 
                     tts_method=tts_method,
                     qwen_tts_batch_size=qwen_tts_batch_size,
+                    adaptive_segment_stretch=tts_adaptive_segment_stretch,
                 )
 
                 _require_file(os.path.join(folder, "audio_combined.wav"), "配音合成(audio_combined.wav)", min_bytes=44)
@@ -204,6 +206,7 @@ class VideoPipeline:
         translation_target_language: str | None = None,
         tts_method: str | None = None,
         qwen_tts_batch_size: int | None = None,
+        tts_adaptive_segment_stretch: bool = False,
         subtitles: bool = True,
         speed_up: float = 1.2,
         fps: int = 30,
@@ -341,6 +344,7 @@ class VideoPipeline:
                     translation_target_language,
                     tts_method,
                     int(qwen_tts_batch_size),
+                    bool(tts_adaptive_segment_stretch),
                     subtitles,
                     speed_up,
                     fps,
@@ -375,6 +379,7 @@ class VideoPipeline:
                         translation_target_language,
                         tts_method,
                         int(qwen_tts_batch_size),
+                        bool(tts_adaptive_segment_stretch),
                         subtitles,
                         speed_up,
                         fps,

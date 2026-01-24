@@ -268,6 +268,7 @@ def run_pipeline(
     translation_guide_max_chars,
     tts_method,
     qwen_tts_batch_size,
+    tts_adaptive_segment_stretch,
     subtitles,
     speed_up,
     fps,
@@ -304,6 +305,7 @@ def run_pipeline(
                 translation_target_language=translation_target_language,
                 tts_method=tts_method,
                 qwen_tts_batch_size=qwen_tts_batch_size,
+                tts_adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
                 subtitles=subtitles,
                 speed_up=speed_up,
                 fps=fps,
@@ -369,6 +371,7 @@ do_everything_interface = gr.Interface(
             value=settings.tts_method
         ),
         gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS Batch Size", value=settings.qwen_tts_batch_size),
+        gr.Checkbox(label="按段自适应拉伸语音(减少无声)", value=False),
         gr.Checkbox(label="Subtitles", value=True),
         gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=DEFAULT_SPEED_UP),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30),
@@ -500,7 +503,7 @@ translation_interface = gr.Interface(
 )
 
 
-def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
+def _tts_wrapper(folder, tts_method, qwen_tts_batch_size, tts_adaptive_segment_stretch):
     names = (
         [model_manager._bytedance_requirement().name]  # type: ignore[attr-defined]
         if tts_method == "bytedance"
@@ -519,6 +522,7 @@ def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
         folder,
         tts_method=tts_method,
         qwen_tts_batch_size=qwen_tts_batch_size,
+        adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
     )
 
 
@@ -532,6 +536,7 @@ tts_interface = gr.Interface(
             value=settings.tts_method
         ),
         gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS Batch Size", value=settings.qwen_tts_batch_size),
+        gr.Checkbox(label="按段自适应拉伸语音(减少无声)", value=False),
     ],
     outputs=gr.Textbox(label="Output", lines=20, max_lines=200, autoscroll=True),
 )

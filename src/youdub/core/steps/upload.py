@@ -182,8 +182,10 @@ def _upload_video_with_biliup(
         model_info_parts.append(f"配音模型: {tts_display}")
     model_info_line = " | ".join(model_info_parts) if model_info_parts else ""
 
+    # Note: webpage_url is already shown by Bilibili as "source" for reprinted videos (copyright=2),
+    # so we don't include it in description to avoid duplication.
     description = (
-        f"{webpage_url}\n{title_english}\n{summary_text}\n\n"
+        f"{title_english}\n{summary_text}\n\n"
         + (f"{model_info_line}\n" if model_info_line else "")
         + "项目地址：https://github.com/StarDuster/YAYD\n"
         "YAYD 是 YouDub-webui 的一个 fork，旨在将 YouTube 和其他平台上的高质量视频翻译和配音成中文版本。"

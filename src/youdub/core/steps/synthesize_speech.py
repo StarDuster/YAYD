@@ -1170,7 +1170,12 @@ def init_TTS(settings: Settings | None = None, model_manager: ModelManager | Non
     return
 
 
-def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_size: int = 1) -> None:
+def generate_wavs(
+    folder: str,
+    tts_method: str = "bytedance",
+    qwen_tts_batch_size: int = 1,
+    adaptive_segment_stretch: bool = False,
+) -> None:
     check_cancelled()
     transcript_path = os.path.join(folder, 'translation.json')
     output_folder = os.path.join(folder, 'wavs')
@@ -1397,7 +1402,14 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             if valid_wav:
                 adjust_begin = time.monotonic()
                 check_cancelled()
-                wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
+                # 默认限制“放慢(拉长)”幅度，避免明显失真；但有些语言对（如英->中）
+                # 可能需要更大的拉伸才能消除无声段，因此提供可选的更激进模式。
+                max_stretch = 1.35 if adaptive_segment_stretch else 1.1
+                wav_chunk, actual_len = adjust_audio_length(
+                    output_path,
+                    desired_len,
+                    max_speed_factor=max_stretch,
+                )
                 adjust_elapsed = time.monotonic() - adjust_begin
             else:
                 logger.warning(f"TTS生成失败 {tts_method} 段 {i}，使用静音回退。")
@@ -1511,7 +1523,10 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
 
 
 def generate_all_wavs_under_folder(
-    root_folder: str, tts_method: str = "bytedance", qwen_tts_batch_size: int = 1
+    root_folder: str,
+    tts_method: str = "bytedance",
+    qwen_tts_batch_size: int = 1,
+    adaptive_segment_stretch: bool = False,
 ) -> str:
     count = 0
     for root, _dirs, files in os.walk(root_folder):
@@ -1533,7 +1548,12 @@ def generate_all_wavs_under_folder(
             except Exception:
                 # Treat as not done and re-generate.
                 pass
-        generate_wavs(root, tts_method, qwen_tts_batch_size=qwen_tts_batch_size)
+        generate_wavs(
+            root,
+            tts_method,
+            qwen_tts_batch_size=qwen_tts_batch_size,
+            adaptive_segment_stretch=adaptive_segment_stretch,
+        )
         count += 1
     msg = f"语音合成完成: {root_folder}（处理 {count} 个文件）"
     logger.info(msg)

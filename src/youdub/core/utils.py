@@ -19,10 +19,11 @@ def ensure_torchaudio_backend_compat() -> None:
     """
     Compatibility shim for torchaudio>=2.10.
 
-    `pyannote.audio==3.1.1` calls `torchaudio.set_audio_backend("soundfile")` at import time.
-    Newer torchaudio versions removed `set_audio_backend`, causing pyannote to fail importing.
+    `pyannote.audio==3.1.1` calls `torchaudio.set_audio_backend("soundfile")` and
+    `torchaudio.get_audio_backend()` at import time. Newer torchaudio versions removed
+    these functions, causing pyannote to fail importing.
 
-    We provide a best-effort no-op `set_audio_backend` so pyannote can import and rely on the
+    We provide best-effort no-op shims so pyannote can import and rely on the
     default audio I/O stack (torchcodec / soundfile).
     """
 
@@ -31,17 +32,25 @@ def ensure_torchaudio_backend_compat() -> None:
     except Exception:
         return
 
-    if hasattr(torchaudio, "set_audio_backend"):
-        return
+    # Patch set_audio_backend if missing
+    if not hasattr(torchaudio, "set_audio_backend"):
+        def _set_audio_backend(_backend: str) -> None:  # noqa: ARG001
+            return None
 
-    def _set_audio_backend(_backend: str) -> None:  # noqa: ARG001
-        return None
+        try:
+            setattr(torchaudio, "set_audio_backend", _set_audio_backend)
+        except Exception:
+            pass
 
-    try:
-        setattr(torchaudio, "set_audio_backend", _set_audio_backend)
-    except Exception:
-        # Best-effort only; do not fail the main pipeline.
-        return
+    # Patch get_audio_backend if missing
+    if not hasattr(torchaudio, "get_audio_backend"):
+        def _get_audio_backend() -> str:
+            return "soundfile"
+
+        try:
+            setattr(torchaudio, "get_audio_backend", _get_audio_backend)
+        except Exception:
+            pass
 
 
 def sanitize_filename(filename: str) -> str:
