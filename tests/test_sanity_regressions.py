@@ -14,6 +14,30 @@ def _write_dummy_wav(path: Path, sr: int = 24000, seconds: float = 1.0) -> None:
     save_wav(wav, str(path), sample_rate=sr)
 
 
+def test_is_valid_wav_rejects_non_wav_content_even_if_soundfile_can_read(tmp_path: Path):
+    # Regression: cached "*.wav" files might actually be FLAC/OGG/etc (content-based readable by libsndfile),
+    # but downstream `audiostretchy` uses stdlib `wave` and will crash. We should treat those as invalid.
+    import soundfile as sf
+
+    from youdub.core.steps.synthesize_speech import is_valid_wav
+    from youdub.core.utils import save_wav
+
+    if "FLAC" not in sf.available_formats():
+        pytest.skip("libsndfile without FLAC support")
+
+    sr = 24000
+    t = np.linspace(0, 0.1, int(sr * 0.1), endpoint=False, dtype=np.float32)
+    wav = 0.1 * np.sin(2 * np.pi * 220.0 * t).astype(np.float32)
+
+    real_wav = tmp_path / "real.wav"
+    save_wav(wav, str(real_wav), sample_rate=sr)
+    assert is_valid_wav(str(real_wav)) is True
+
+    fake_wav = tmp_path / "fake.wav"
+    sf.write(str(fake_wav), wav, sr, format="FLAC")  # content is FLAC, name is *.wav
+    assert is_valid_wav(str(fake_wav)) is False
+
+
 def test_download_single_video_returns_none_when_file_missing(tmp_path: Path, monkeypatch):
     import youdub.core.steps.download as dl
 
