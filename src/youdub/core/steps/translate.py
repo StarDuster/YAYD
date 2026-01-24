@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any, cast
@@ -64,6 +66,19 @@ def _build_chat_backend(settings: Settings) -> _ChatBackend:
     base_url = settings.openai_api_base or "https://api.openai.com/v1"
     client = OpenAI(base_url=base_url, api_key=api_key)
     return _ChatBackend(client=client, model=settings.model_name, timeout_s=timeout_s)
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def _get_thread_backend(settings: Settings) -> _ChatBackend:
+    """Get a per-thread OpenAI client to avoid thread-safety issues."""
+    backend = getattr(_THREAD_LOCAL, "backend", None)
+    if isinstance(backend, _ChatBackend):
+        return backend
+    backend = _build_chat_backend(settings)
+    _THREAD_LOCAL.backend = backend
+    return backend
 
 
 def _extract_first_json_object(text: str) -> dict[str, Any]:
@@ -303,10 +318,10 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
         sentences = split_text_into_sentences(translation_text)
         
         if not translation_text:
-             # Handle empty translation
-             duration_per_char = 0
+            # Handle empty translation
+            duration_per_char = 0
         else:
-             duration_per_char = (item['end'] - item['start']) / len(translation_text)
+            duration_per_char = (item['end'] - item['start']) / len(translation_text)
              
         sentence_start_idx = 0
         for sentence in sentences:
@@ -327,6 +342,251 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output_data
 
 
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _normalize_translation_strategy(raw: str | None) -> str:
+    s = (raw or "history").strip().lower()
+    if s in {"history", "serial", "chain", "seq"}:
+        return "history"
+    if s in {"guide_parallel", "parallel", "parallel_guide", "guide", "p2", "2"}:
+        return "guide_parallel"
+    return "history"
+
+
+def _build_translation_guide(
+    summary: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    target_language: str,
+    settings: Settings,
+) -> dict[str, Any]:
+    max_chars = max(800, _read_int_env("TRANSLATION_GUIDE_MAX_CHARS", 2500))
+
+    transcript_text = " ".join(cast(str, line.get("text", "")) for line in transcript).strip()
+    transcript_text = ensure_transcript_length(transcript_text, max_length=max_chars)
+
+    title = str(summary.get("title", "")).strip()
+    summary_text = str(summary.get("summary", "")).strip()
+
+    system = (
+        f"你是专业译者，目标语言：{target_language}。\n"
+        "请基于给定的视频信息与字幕样本，生成一份“翻译指南”，用于后续并发分块翻译。\n"
+        "必须只输出 JSON（不要任何额外文本）。\n"
+        'JSON 格式：{"style": ["..."], "glossary": {"term": "translation"}, "dont_translate": ["..."], "notes": "..."}\n'
+        "- style：5~12 条风格/语气/术语偏好（list of strings）\n"
+        "- glossary：只收录重要专有名词/术语/人名/机构/产品名等（object mapping string->string）\n"
+        "- dont_translate：必须原样保留的 token（如代码/公式/缩写/产品名）\n"
+        "- notes：额外注意事项\n"
+        "硬性要求：\n"
+        "- 将人工智能的“agent”翻译为“智能体”\n"
+        "- 强化学习中写作 `Q-Learning`（不要写 Queue Learning）\n"
+        "- 变压器指模型时保留 `Transformer`\n"
+        "- 数学公式写成 plain text，不要使用 LaTeX\n"
+    )
+    user = (
+        f'Title: "{title}"\n'
+        f"Summary: {summary_text}\n"
+        f"Transcript sample:\n{transcript_text}\n"
+    )
+
+    backend = _build_chat_backend(settings)
+    for attempt in range(5):
+        try:
+            content = _chat_completion_text(backend, [{"role": "system", "content": system}, {"role": "user", "content": user}])
+            guide_raw = _extract_first_json_object(content)
+
+            style_raw = guide_raw.get("style", [])
+            if isinstance(style_raw, str):
+                style = [style_raw.strip()] if style_raw.strip() else []
+            elif isinstance(style_raw, list):
+                style = [str(x).strip() for x in style_raw if str(x).strip()]
+            else:
+                style = []
+
+            glossary_raw = guide_raw.get("glossary", {})
+            glossary: dict[str, str] = {}
+            if isinstance(glossary_raw, dict):
+                for k, v in glossary_raw.items():
+                    ks = str(k).strip()
+                    vs = str(v).strip()
+                    if ks and vs:
+                        glossary[ks] = vs
+
+            dont_raw = guide_raw.get("dont_translate", [])
+            if isinstance(dont_raw, str):
+                dont_translate = [dont_raw.strip()] if dont_raw.strip() else []
+            elif isinstance(dont_raw, list):
+                dont_translate = [str(x).strip() for x in dont_raw if str(x).strip()]
+            else:
+                dont_translate = []
+
+            notes = str(guide_raw.get("notes", "")).strip()
+
+            # Always enforce core term preferences even if the guide omitted them.
+            glossary.setdefault("agent", "智能体")
+            glossary.setdefault("Agent", "智能体")
+            dont_translate = list(dict.fromkeys(dont_translate + ["Q-Learning", "Transformer"]))
+
+            return {
+                "style": style,
+                "glossary": glossary,
+                "dont_translate": dont_translate,
+                "notes": notes,
+            }
+        except (ValueError, JSONDecodeError) as exc:
+            logger.warning(f"翻译指南解析失败（attempt={attempt + 1}/5）：{exc}")
+            time.sleep(1)
+        except Exception as exc:
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+    logger.warning("翻译指南生成失败，降级为空指南")
+    return {"style": [], "glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
+
+
+def _translate_single_with_guide(
+    settings: Settings,
+    info: str,
+    guide: dict[str, Any],
+    text: str,
+    target_language: str,
+) -> str:
+    src = (text or "").strip()
+    if not src:
+        return ""
+
+    guide_json = json.dumps(guide, ensure_ascii=False)
+    system = (
+        f"你是专业字幕翻译，目标语言：{target_language}。\n"
+        f"{info}\n"
+        f"翻译指南（JSON）：{guide_json}\n"
+        "请只输出译文本身：\n"
+        "- 不要包含“翻译”二字\n"
+        "- 不要加引号\n"
+        "- 不要换行\n"
+        "- 不要解释\n"
+        "硬性要求：agent -> 智能体；强化学习中写 `Q-Learning`（不要写 Queue Learning）；"
+        "变压器指模型时保留 `Transformer`；数学公式用 plain text，不要 LaTeX。\n"
+    )
+    user = src
+
+    backend = _get_thread_backend(settings)
+    for attempt in range(30):
+        try:
+            cand = _chat_completion_text(backend, [{"role": "system", "content": system}, {"role": "user", "content": user}])
+            cand = cand.replace("\n", "").strip()
+            ok, processed = valid_translation(src, cand)
+            if not ok:
+                raise _TranslationValidationError(processed)
+            return processed
+        except _TranslationValidationError as exc:
+            logger.warning(f"译文校验失败（attempt={attempt + 1}/30）：{exc}")
+            time.sleep(0.5)
+        except Exception as exc:
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+    raise RuntimeError("翻译失败：重试耗尽")
+
+
+def _translate_chunk_with_guide(
+    settings: Settings,
+    info: str,
+    guide: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    indexes: list[int],
+    target_language: str,
+) -> dict[int, str]:
+    payload: dict[str, str] = {}
+    for i in indexes:
+        payload[str(i)] = cast(str, transcript[i].get("text", "")).strip()
+
+    # Skip empty-only chunks quickly.
+    if not any(payload.values()):
+        return {i: "" for i in indexes}
+
+    guide_json = json.dumps(guide, ensure_ascii=False)
+    system = (
+        f"你是专业字幕翻译，目标语言：{target_language}。\n"
+        f"{info}\n"
+        f"翻译指南（JSON）：{guide_json}\n"
+        "你会收到一个 JSON 对象：key 是句子编号（字符串），value 是原文。\n"
+        "请只返回 JSON 对象，保持相同 key，value 只包含译文本身：\n"
+        "- 不要包含“翻译”二字\n"
+        "- 不要加引号\n"
+        "- 不要换行\n"
+        "- 不要解释\n"
+        "硬性要求：agent -> 智能体；强化学习中写 `Q-Learning`（不要写 Queue Learning）；"
+        "变压器指模型时保留 `Transformer`；数学公式用 plain text，不要 LaTeX。\n"
+    )
+    user = json.dumps(payload, ensure_ascii=False)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    backend = _get_thread_backend(settings)
+    for attempt in range(10):
+        try:
+            content = _chat_completion_text(backend, messages)
+            obj = _extract_first_json_object(content)
+            if isinstance(obj.get("translations"), dict):
+                obj = cast(dict[str, Any], obj["translations"])
+
+            out: dict[int, str] = {}
+            for i in indexes:
+                src = payload.get(str(i), "")
+                if not src:
+                    out[i] = ""
+                    continue
+                v = obj.get(str(i), obj.get(i))
+                if v is None:
+                    continue
+                cand = str(v).replace("\n", "").strip()
+                ok, processed = valid_translation(src, cand)
+                if not ok:
+                    raise _TranslationValidationError(processed)
+                out[i] = processed
+
+            missing = [i for i in indexes if payload.get(str(i), "") and not out.get(i)]
+            if missing:
+                raise ValueError(f"missing translations: {missing[:10]}")
+            return out
+        except _TranslationValidationError as exc:
+            logger.warning(f"分块译文校验失败（attempt={attempt + 1}/10）：{exc}")
+            time.sleep(0.8)
+        except (ValueError, JSONDecodeError) as exc:
+            logger.warning(f"分块翻译解析失败（attempt={attempt + 1}/10）：{exc}")
+            time.sleep(0.8)
+        except Exception as exc:
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+    # Fallback: translate each line in this chunk sequentially (still no cross-chunk history).
+    logger.warning(f"分块翻译失败，降级逐句翻译：indexes={indexes[:5]}.. (len={len(indexes)})")
+    out: dict[int, str] = {}
+    for i in indexes:
+        src = payload.get(str(i), "")
+        if not src:
+            out[i] = ""
+            continue
+        out[i] = _translate_single_with_guide(settings, info, guide, src, target_language)
+    return out
+
+
 def _translate_content(
     summary: dict[str, Any],
     transcript: list[dict[str, Any]],
@@ -334,11 +594,40 @@ def _translate_content(
     settings: Settings | None = None,
 ) -> list[str]:
     cfg = settings or _DEFAULT_SETTINGS
-    backend = _build_chat_backend(cfg)
+    strategy = _normalize_translation_strategy(os.getenv("TRANSLATION_STRATEGY"))
 
     info = f'This is a video called "{summary.get("title", "")}". {summary.get("summary", "")}.'
-    full_translation = []
-    
+
+    if strategy == "guide_parallel":
+        max_workers = max(1, min(_read_int_env("TRANSLATION_MAX_CONCURRENCY", 4), 32))
+        chunk_size = max(1, min(_read_int_env("TRANSLATION_CHUNK_SIZE", 8), 64))
+
+        guide = _build_translation_guide(summary, transcript, target_language, settings=cfg)
+
+        results: list[str] = [""] * len(transcript)
+        chunks = [list(range(i, min(i + chunk_size, len(transcript)))) for i in range(0, len(transcript), chunk_size)]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_translate_chunk_with_guide, cfg, info, guide, transcript, chunk, target_language): chunk
+                for chunk in chunks
+            }
+            try:
+                for future in as_completed(futures):
+                    mapping = future.result()
+                    for idx, tr in mapping.items():
+                        if 0 <= idx < len(results):
+                            results[idx] = tr
+            except Exception:
+                for f in futures:
+                    f.cancel()
+                raise
+
+        return results
+
+    backend = _build_chat_backend(cfg)
+    full_translation: list[str] = []
+
     fixed_message = [
         {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。'},
         {'role': 'user', 'content': '使用地道的中文Translate:"Knowledge is power."'},
@@ -346,7 +635,7 @@ def _translate_content(
         {'role': 'user', 'content': '使用地道的中文Translate:"To be or not to be, that is the question."'},
         {'role': 'assistant', 'content': '翻译：“生存还是毁灭，这是一个值得考虑的问题。”'},
     ]
-    
+
     history: list[dict[str, str]] = []
     for line in transcript:
         text = cast(str, line.get("text", ""))
