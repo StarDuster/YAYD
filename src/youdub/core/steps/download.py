@@ -5,6 +5,8 @@ from typing import Any, Generator
 import yt_dlp
 from loguru import logger
 
+from ..interrupts import check_cancelled
+
 
 def sanitize_title(title: str) -> str:
     """Sanitize the video title for file system usage."""
@@ -29,6 +31,7 @@ def get_target_folder(info: dict[str, Any], folder_path: str) -> str | None:
 
 def download_single_video(info: dict[str, Any], folder_path: str, resolution: str = '1080p') -> str | None:
     """Download a single video based on its info dict."""
+    check_cancelled()
     output_folder = get_target_folder(info, folder_path)
     if output_folder is None:
         return None
@@ -59,6 +62,7 @@ def download_single_video(info: dict[str, Any], folder_path: str, resolution: st
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        check_cancelled()
         rc = ydl.download([info['webpage_url']])
         if rc not in (0, None):
             logger.warning(f"yt-dlp returned non-zero code: {rc} ({info.get('webpage_url')})")
@@ -84,6 +88,7 @@ def get_info_list_from_url(url: str | list[str], num_videos: int) -> Generator[d
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for u in url:
+            check_cancelled()
             result = ydl.extract_info(u, download=False)
             if not result:
                 continue
@@ -102,4 +107,5 @@ def download_from_url(url: str | list[str], folder_path: str, resolution: str = 
         url = [url]
     
     for info in get_info_list_from_url(url, num_videos):
+        check_cancelled()
         download_single_video(info, folder_path, resolution)

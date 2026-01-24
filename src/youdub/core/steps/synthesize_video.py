@@ -6,6 +6,8 @@ from typing import Any
 
 from loguru import logger
 
+from ..interrupts import check_cancelled, sleep_with_cancel
+
 
 def split_text(
     input_data: list[dict[str, Any]], 
@@ -92,6 +94,7 @@ def generate_srt(
 
 
 def get_aspect_ratio(video_path: str) -> float:
+    check_cancelled()
     command = [
         'ffprobe', '-v', 'error', '-select_streams', 'v:0',
         '-show_entries', 'stream=width,height', '-of', 'json', video_path
@@ -124,11 +127,12 @@ def convert_resolution(aspect_ratio: float, resolution: str = '1080p') -> tuple[
 def synthesize_video(
     folder: str, 
     subtitles: bool = True, 
-    speed_up: float = 1.05, 
+    speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
     use_nvenc: bool = False,
 ) -> None:
+    check_cancelled()
     output_video = os.path.join(folder, 'video.mp4')
     if os.path.exists(output_video):
         try:
@@ -156,6 +160,7 @@ def synthesize_video(
     
     generate_srt(translation, srt_path, speed_up)
 
+    check_cancelled()
     aspect_ratio = get_aspect_ratio(input_video)
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
@@ -199,9 +204,35 @@ def synthesize_video(
         '-y'
     ]
     
+    def _run_ffmpeg(cmd: list[str]) -> None:
+        proc = subprocess.Popen(cmd, start_new_session=True)  # noqa: S603
+        try:
+            while True:
+                check_cancelled()
+                rc = proc.poll()
+                if rc is not None:
+                    if rc != 0:
+                        raise subprocess.CalledProcessError(rc, cmd)
+                    return
+                time.sleep(0.2)
+        except BaseException:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
+
     try:
-        subprocess.run(ffmpeg_command, check=True)
-        time.sleep(1)
+        _run_ffmpeg(ffmpeg_command)
+        sleep_with_cancel(1)
         logger.info(f"Synthesized video: {output_video}")
     except subprocess.CalledProcessError as e:
         if use_nvenc:
@@ -213,8 +244,8 @@ def synthesize_video(
             except ValueError:
                 # Should not happen: keep best-effort fallback.
                 pass
-            subprocess.run(ffmpeg_command_fallback, check=True)
-            time.sleep(1)
+            _run_ffmpeg(ffmpeg_command_fallback)
+            sleep_with_cancel(1)
             logger.info(f"Synthesized video (libx264 fallback): {output_video}")
             return
 
@@ -225,13 +256,14 @@ def synthesize_video(
 def synthesize_all_video_under_folder(
     folder: str, 
     subtitles: bool = True, 
-    speed_up: float = 1.05, 
+    speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
     use_nvenc: bool = False,
 ) -> str:
     count = 0
     for root, _dirs, files in os.walk(folder):
+        check_cancelled()
         if 'download.mp4' not in files:
             continue
         video_path = os.path.join(root, 'video.mp4')

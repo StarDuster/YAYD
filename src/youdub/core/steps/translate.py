@@ -4,7 +4,7 @@ import json
 import os
 import re
 import threading
-import time
+import time  # noqa: F401 - tests monkeypatch translate.time.sleep
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from json import JSONDecodeError
@@ -22,6 +22,7 @@ from openai import (
 )
 
 from ...config import Settings
+from ..interrupts import check_cancelled, sleep_with_cancel
 
 @dataclass(frozen=True)
 class _ChatBackend:
@@ -140,6 +141,7 @@ def summarize(
     target_language: str = "简体中文",
     settings: Settings | None = None,
 ) -> dict[str, Any]:
+    check_cancelled()
     cfg = settings or _DEFAULT_SETTINGS
     backend = _build_chat_backend(cfg)
 
@@ -155,6 +157,7 @@ def summarize(
 
     summary_data: dict[str, str] | None = None
     for attempt in range(5):
+        check_cancelled()
         try:
             messages = [
                 {
@@ -177,12 +180,12 @@ def summarize(
             break
         except (ValueError, JSONDecodeError) as exc:
             logger.warning(f"Summary parsing failed (attempt={attempt + 1}/5): {exc}")
-            time.sleep(1)
+            sleep_with_cancel(1)
         except Exception as exc:  # SDK/network errors handled explicitly below
             delay = _handle_sdk_exception(exc, attempt)
             if delay is None:
                 raise
-            time.sleep(delay)
+            sleep_with_cancel(delay)
 
     if not summary_data:
         raise RuntimeError("Summary generation failed: Unable to parse JSON from model output.")
@@ -209,6 +212,7 @@ def summarize(
     ]
 
     for attempt in range(5):
+        check_cancelled()
         try:
             content = _chat_completion_text(backend, translate_messages).replace("\n", " ")
             logger.info(content)
@@ -234,12 +238,12 @@ def summarize(
             }
         except (ValueError, JSONDecodeError) as exc:
             logger.warning(f"Summary translation parsing failed (attempt={attempt + 1}/5): {exc}")
-            time.sleep(1)
+            sleep_with_cancel(1)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
             if delay is None:
                 raise
-            time.sleep(delay)
+            sleep_with_cancel(delay)
 
     raise RuntimeError("Summary translation failed: Unable to parse JSON from model output.")
 
@@ -399,6 +403,7 @@ def _build_translation_guide(
 
     backend = _build_chat_backend(settings)
     for attempt in range(5):
+        check_cancelled()
         try:
             content = _chat_completion_text(backend, [{"role": "system", "content": system}, {"role": "user", "content": user}])
             guide_raw = _extract_first_json_object(content)
@@ -443,12 +448,12 @@ def _build_translation_guide(
             }
         except (ValueError, JSONDecodeError) as exc:
             logger.warning(f"Translation guide parsing failed (attempt={attempt + 1}/5): {exc}")
-            time.sleep(1)
+            sleep_with_cancel(1)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
             if delay is None:
                 raise
-            time.sleep(delay)
+            sleep_with_cancel(delay)
 
     logger.warning("Translation guide generation failed, falling back to empty guide")
     return {"style": [], "glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
@@ -482,6 +487,7 @@ def _translate_single_with_guide(
 
     backend = _get_thread_backend(settings)
     for attempt in range(30):
+        check_cancelled()
         try:
             cand = _chat_completion_text(backend, [{"role": "system", "content": system}, {"role": "user", "content": user}])
             cand = cand.replace("\n", "").strip()
@@ -491,12 +497,12 @@ def _translate_single_with_guide(
             return processed
         except _TranslationValidationError as exc:
             logger.warning(f"Translation validation failed (attempt={attempt + 1}/30): {exc}")
-            time.sleep(0.5)
+            sleep_with_cancel(0.5)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
             if delay is None:
                 raise
-            time.sleep(delay)
+            sleep_with_cancel(delay)
 
     raise RuntimeError("Translation failed: retries exhausted")
 
@@ -536,6 +542,7 @@ def _translate_chunk_with_guide(
 
     backend = _get_thread_backend(settings)
     for attempt in range(10):
+        check_cancelled()
         try:
             content = _chat_completion_text(backend, messages)
             obj = _extract_first_json_object(content)
@@ -563,15 +570,15 @@ def _translate_chunk_with_guide(
             return out
         except _TranslationValidationError as exc:
             logger.warning(f"Chunk translation validation failed (attempt={attempt + 1}/10): {exc}")
-            time.sleep(0.8)
+            sleep_with_cancel(0.8)
         except (ValueError, JSONDecodeError) as exc:
             logger.warning(f"Chunk translation parsing failed (attempt={attempt + 1}/10): {exc}")
-            time.sleep(0.8)
+            sleep_with_cancel(0.8)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
             if delay is None:
                 raise
-            time.sleep(delay)
+            sleep_with_cancel(delay)
 
     # Fallback: translate each line in this chunk sequentially (still no cross-chunk history).
     logger.warning(f"Chunk translation failed, falling back to sentence-by-sentence: indexes={indexes[:5]}.. (len={len(indexes)})")
@@ -612,11 +619,15 @@ def _translate_content(
             }
             try:
                 for future in as_completed(futures):
+                    check_cancelled()
                     mapping = future.result()
                     for idx, tr in mapping.items():
                         if 0 <= idx < len(results):
                             results[idx] = tr
-            except Exception:
+                            src = cast(str, transcript[idx].get("text", ""))
+                            logger.info(f"Original: {src}")
+                            logger.info(f"Translation: {tr}")
+            except BaseException:
                 for f in futures:
                     f.cancel()
                 raise
@@ -636,10 +647,12 @@ def _translate_content(
 
     history: list[dict[str, str]] = []
     for line in transcript:
+        check_cancelled()
         text = cast(str, line.get("text", ""))
         translation = ""
         
         for attempt in range(30):
+            check_cancelled()
             # Keep history short to avoid token limit
             current_history = history[-30:]
             messages = fixed_message + current_history + [
@@ -659,24 +672,25 @@ def _translate_content(
                 break
             except _TranslationValidationError as exc:
                 logger.warning(f"Translation validation failed (attempt={attempt + 1}/30): {exc}")
-                time.sleep(0.5)
+                sleep_with_cancel(0.5)
             except Exception as exc:
                 delay = _handle_sdk_exception(exc, attempt)
                 if delay is None:
                     raise
-                time.sleep(delay)
+                sleep_with_cancel(delay)
         
         full_translation.append(translation)
         
         history.append({'role': 'user', 'content': f'Translate:"{text}"'})
         history.append({'role': 'assistant', 'content': f'翻译：“{translation}”'})
         # Avoid rate limits
-        time.sleep(0.1)
+        sleep_with_cancel(0.1)
 
     return full_translation
 
 
 def translate_folder(folder: str, target_language: str = '简体中文', settings: Settings | None = None) -> bool:
+    check_cancelled()
     translation_path = os.path.join(folder, 'translation.json')
     summary_path = os.path.join(folder, 'summary.json')
 
@@ -739,6 +753,7 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
         return True
     
     # Perform translation
+    check_cancelled()
     translations = _translate_content(summary, transcript, target_language, settings=settings)
     
     for i, line in enumerate(transcript):
@@ -755,6 +770,7 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
 def translate_all_transcript_under_folder(folder: str, target_language: str, settings: Settings | None = None) -> str:
     count = 0
     for root, dirs, files in os.walk(folder):
+        check_cancelled()
         if 'transcript.json' not in files:
             continue
         need = ('translation.json' not in files) or ('summary.json' not in files)

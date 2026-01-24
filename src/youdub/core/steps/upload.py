@@ -1,21 +1,69 @@
 import json
 import os
-import time
 
+import requests
 from bilibili_toolman.bilisession.common.submission import Submission
 from bilibili_toolman.bilisession.web import BiliSession
 from dotenv import load_dotenv
 from loguru import logger
 
+from ..interrupts import check_cancelled, sleep_with_cancel
+
 load_dotenv()
 
-# 设置 SOCKS5 代理（如果 ss-local 在本地运行）
-_proxy_url = os.getenv("BILI_PROXY", "socks5h://127.0.0.1:1080")
-if _proxy_url:
-    os.environ["HTTP_PROXY"] = _proxy_url
-    os.environ["HTTPS_PROXY"] = _proxy_url
-    os.environ["ALL_PROXY"] = _proxy_url
-    logger.info(f"Bilibili upload proxy set to: {_proxy_url}")
+# 代理配置（仅用于 B 站上传，不影响其他模块）
+_BILI_PROXY = os.getenv("BILI_PROXY", "").strip()
+if _BILI_PROXY:
+    logger.info(f"Bilibili upload proxy configured: {_BILI_PROXY}")
+
+# UPOS 上传 CDN（bilibili_toolman 的 preupload 参数 upcdn）
+# 说明：不同 upcdn 会返回不同的 bilivideo 上传入口；有些入口在某些网络/代理下会 TLS 握手失败。
+_BILI_UPLOAD_CDN = os.getenv("BILI_UPLOAD_CDN", "").strip()
+
+
+def _iter_upload_cdns() -> list[str]:
+    # 默认顺序：优先用户指定，其次常见可用项
+    # 目前验证：bda2/bda/tx 常见可用；cos/ali 在部分网络会出现 SSL unexpected EOF
+    candidates = [_BILI_UPLOAD_CDN, "bda2", "bda", "tx"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        c = (c or "").strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def _upload_video_endpoint_with_fallback(session: BiliSession, video_path: str) -> str:
+    last_exc: Exception | None = None
+    for cdn in _iter_upload_cdns():
+        try:
+            session.UPLOAD_CDN = cdn
+            logger.info(f"Uploading video via UPOS CDN: {cdn}")
+            video_endpoint, _biz_id = session.UploadVideo(video_path)
+            return video_endpoint
+        except (
+            requests.exceptions.SSLError,
+            requests.exceptions.ProxyError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            last_exc = e
+            logger.warning(f"UploadVideo failed via CDN={cdn} (network/proxy): {e}")
+            continue
+        except Exception as e:  # noqa: BLE001 - keep behavior simple, bubble up if not obviously endpoint issue
+            last_exc = e
+            msg = str(e)
+            # 最常见的“入口不可用/上传会话无效”表现：NoSuchUpload / unexpected eof
+            if "NoSuchUpload" in msg or "UNEXPECTED_EOF_WHILE_READING" in msg or "unexpected eof" in msg.lower():
+                logger.warning(f"UploadVideo failed via CDN={cdn}: {msg}")
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("UploadVideo failed: no CDN candidates available")
 
 
 def bili_login() -> BiliSession:
@@ -27,6 +75,15 @@ def bili_login() -> BiliSession:
         
     try:
         session = BiliSession(f'SESSDATA={sessdata};bili_jct={bili_jct}')
+        # 设置代理（仅影响此 session，不影响其他模块）
+        if _BILI_PROXY:
+            session.proxies = {
+                'http': _BILI_PROXY,
+                'https': _BILI_PROXY,
+            }
+            logger.info(f"Bilibili session using proxy: {_BILI_PROXY}")
+            # 代理环境下强烈建议关闭并发分块上传，避免代理/网络抖动导致 multipart 会话失效
+            session.WORKERS_UPLOAD = 1
         logger.info("Bilibili session created.")
         return session
     except Exception as e:
@@ -35,6 +92,7 @@ def bili_login() -> BiliSession:
 
 
 def upload_video(folder: str) -> bool:
+    check_cancelled()
     submission_result_path = os.path.join(folder, 'bilibili.json')
     if os.path.exists(submission_result_path):
         with open(submission_result_path, 'r', encoding='utf-8') as f:
@@ -97,9 +155,10 @@ def upload_video(folder: str) -> bool:
     
     video_endpoint: str | None = None
     for retry in range(5):
+        check_cancelled()
         try:
             if video_endpoint is None:
-                video_endpoint, _ = session.UploadVideo(video_path)
+                video_endpoint = _upload_video_endpoint_with_fallback(session, video_path)
 
             submission = Submission(
                 title=title,
@@ -150,7 +209,7 @@ def upload_video(folder: str) -> bool:
         except Exception:
             # Use full traceback; upstream (bilibili_toolman) can raise confusing KeyError like: KeyError('OK')
             logger.exception(f"Bilibili upload/submit failed (retry {retry+1}/5)")
-            time.sleep(10)
+            sleep_with_cancel(10)
             
     logger.error("Failed to upload after retries.")
     return False
@@ -159,6 +218,7 @@ def upload_video(folder: str) -> bool:
 def upload_all_videos_under_folder(folder: str) -> str:
     count = 0
     for root, _, files in os.walk(folder):
+        check_cancelled()
         if 'video.mp4' in files:
             if upload_video(root):
                 count += 1

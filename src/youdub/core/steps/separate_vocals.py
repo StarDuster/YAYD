@@ -1,5 +1,6 @@
 import gc
 import os
+import subprocess
 import time
 from typing import Any
 
@@ -8,6 +9,7 @@ from loguru import logger
 
 from ...config import Settings
 from ...models import ModelManager
+from ..interrupts import check_cancelled, sleep_with_cancel
 from ..utils import save_wav
 
 
@@ -118,6 +120,7 @@ def separate_audio(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> None:
+    check_cancelled()
     audio_path = os.path.join(folder, 'audio.wav')
     if not os.path.exists(audio_path):
         return
@@ -250,6 +253,7 @@ def separate_audio(
                 ) as out_i,
             ):
                 while start_frame < total_frames:
+                    check_cancelled()
                     nominal_end = min(total_frames, start_frame + chunk_frames)
                     end_frame = total_frames if nominal_end >= total_frames else _pick_cut_frame(
                         in_f, start_frame, nominal_end, total_frames, target_sr
@@ -267,6 +271,7 @@ def separate_audio(
                     wav_t = torch.from_numpy(np.asarray(audio_chunk.T, dtype=np.float32))  # [C, T]
                     mix = wav_t.unsqueeze(0)  # [1, C, T]
 
+                    check_cancelled()
                     sources = apply_model(model, mix, shifts=shifts, split=True, progress=False, device=target_device)
                     sources = sources[0]  # [S, C, T]
                     vocals_tensor = sources[vocals_idx]
@@ -332,6 +337,7 @@ def separate_audio(
             pass
 
         logger.info(f"Loading audio from {audio_path}...")
+        check_cancelled()
         wav, sr = torchaudio.load(audio_path)
         logger.info(f"Audio loaded. Shape: {wav.shape}, SR: {sr}")
 
@@ -349,6 +355,7 @@ def separate_audio(
         mix = wav.unsqueeze(0)  # [1, C, T]
 
         logger.info(f"Running Demucs ({model_name}) on {target_device} (shifts={shifts})...")
+        check_cancelled()
         sources = apply_model(model, mix, shifts=shifts, split=True, progress=progress, device=target_device)
         sources = sources[0]  # [S, C, T]
 
@@ -385,15 +392,67 @@ def extract_audio_from_video(folder: str) -> bool:
         return True
         
     logger.info(f'Extracting audio from {folder}')
+    check_cancelled()
 
-    cmd = f'ffmpeg -loglevel error -y -i "{video_path}" -vn -acodec pcm_s16le -ar 44100 -ac 2 "{audio_path}"'
-    ret = os.system(cmd)
-    
-    if ret != 0:
-        logger.error(f"FFmpeg failed to extract audio from {video_path}")
+    cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        video_path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        audio_path,
+    ]
+
+    proc = subprocess.Popen(  # noqa: S603
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        while True:
+            check_cancelled()
+            rc = proc.poll()
+            if rc is not None:
+                break
+            time.sleep(0.2)
+    except BaseException:
+        # Best-effort: stop ffmpeg quickly on Ctrl+C.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+
+    stdout = ""
+    stderr = ""
+    try:
+        stdout, stderr = proc.communicate(timeout=1)
+    except Exception:
+        pass
+
+    if proc.returncode not in (0, None):
+        logger.error(f"FFmpeg failed to extract audio from {video_path} (rc={proc.returncode})\n{stderr or stdout}")
         return False
 
-    time.sleep(1)
+    sleep_with_cancel(1)
     logger.info(f'Audio extracted from {folder}')
     return True
 
@@ -418,6 +477,7 @@ def separate_all_audio_under_folder(
 
     count = 0
     for subdir, _dirs, files in os.walk(root_folder):
+        check_cancelled()
         if 'download.mp4' not in files:
             continue
             

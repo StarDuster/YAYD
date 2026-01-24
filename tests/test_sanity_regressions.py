@@ -120,7 +120,7 @@ def test_generate_all_wavs_requires_marker_not_just_audio_file(tmp_path: Path, m
 
     called = {"n": 0}
 
-    def _fake_generate_wavs(_folder: str, _tts_method: str = "bytedance") -> None:
+    def _fake_generate_wavs(_folder: str, _tts_method: str = "bytedance", **_kwargs) -> None:
         called["n"] += 1
         # Simulate success marker creation
         (Path(_folder) / ".tts_done.json").write_text(json.dumps({"tts_method": _tts_method}), encoding="utf-8")

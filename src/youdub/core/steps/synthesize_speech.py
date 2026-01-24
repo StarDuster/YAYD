@@ -19,6 +19,7 @@ from scipy.spatial.distance import cosine
 
 from ...config import Settings
 from ...models import ModelCheckError, ModelManager
+from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
 from ..utils import ensure_torchaudio_backend_compat, save_wav, save_wav_norm
 
@@ -269,6 +270,7 @@ def bytedance_tts_v3_api(
     }
     
     try:
+        check_cancelled()
         logger.debug(f"V3 TTS Submit: speaker={speaker}, text={text[:30]}...")
         resp = requests.post(_BYTEDANCE_V3_SUBMIT_URL, json=submit_payload, headers=headers, timeout=30)
         resp_json = resp.json()
@@ -294,7 +296,9 @@ def bytedance_tts_v3_api(
     
     for _ in range(max_polls):
         try:
-            time.sleep(poll_interval)
+            check_cancelled()
+            sleep_with_cancel(poll_interval)
+            check_cancelled()
             resp = requests.post(_BYTEDANCE_V3_QUERY_URL, json=query_payload, headers=headers, timeout=30)
             resp_json = resp.json()
             
@@ -660,6 +664,7 @@ def bytedance_tts(
     is_cloned = voice_type.startswith('S_') if voice_type else False
     
     for _ in range(3):
+        check_cancelled()
         try:
             # ICL 2.0 当前使用 V1 接口更稳定
             audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=is_cloned)
@@ -669,19 +674,19 @@ def bytedance_tts(
                 
                 if is_valid_wav(output_path):
                     logger.info(f'ByteDance TTS saved: {output_path}')
-                    time.sleep(0.1)
+                    sleep_with_cancel(0.1)
                     break
                 else:
                     logger.warning("Saved wav file seems corrupted or invalid.")
                     if os.path.exists(output_path):
                         os.remove(output_path)
             
-            time.sleep(0.5)
+            sleep_with_cancel(0.5)
         except Exception as e:
             logger.error(f"ByteDance TTS loop failed: {e}")
             if os.path.exists(output_path):
                 os.remove(output_path)
-            time.sleep(0.5)
+            sleep_with_cancel(0.5)
 
 
 _QWEN_WORKER_READY = "__READY__"
@@ -773,7 +778,12 @@ class _QwenTtsWorker:
         ready_ok = False
         try:
             while True:
-                line = self._proc.stdout.readline()
+                check_cancelled()
+                line = self._read_stdout_line(timeout_sec=0.2)
+                if line is None:
+                    if self._proc.poll() is not None:
+                        break
+                    continue
                 if not line:
                     break
                 s = line.strip()
@@ -785,6 +795,9 @@ class _QwenTtsWorker:
                 startup_stdout_tail.append(s)
                 if len(startup_stdout_tail) > 50:
                     startup_stdout_tail = startup_stdout_tail[-50:]
+        except CancelledByUser:
+            self.close()
+            raise
         finally:
             startup_done.set()
 
@@ -830,6 +843,26 @@ class _QwenTtsWorker:
         stub = os.getenv(_QWEN_WORKER_STUB_ENV, "").strip() in {"1", "true", "TRUE", "yes", "YES"}
         return cls(python_exe=str(py), model_path=str(model_dir), stub=stub)
 
+    def _read_stdout_line(self, timeout_sec: float = 0.2) -> str | None:
+        """Read one line from worker stdout with a small timeout.
+
+        On Linux, use select() so Ctrl+C cancellation can be observed promptly.
+        On Windows, fall back to blocking readline(); Ctrl+C will typically also stop the child.
+        """
+        assert self._proc.stdout is not None
+        if os.name == "nt":
+            return self._proc.stdout.readline()
+        try:
+            import select
+
+            r, _w, _x = select.select([self._proc.stdout], [], [], max(0.0, float(timeout_sec)))
+            if not r:
+                return None
+        except Exception:
+            # Fallback: best-effort blocking read.
+            return self._proc.stdout.readline()
+        return self._proc.stdout.readline()
+
     def synthesize(
         self, text: str, speaker_wav: str, output_path: str, language: str = "Auto"
     ) -> dict:
@@ -864,7 +897,14 @@ class _QwenTtsWorker:
         max_skip = 50
         try:
             while True:
-                line = self._proc.stdout.readline()
+                check_cancelled()
+                line = self._read_stdout_line(timeout_sec=0.2)
+                if line is None:
+                    if self._proc.poll() is not None:
+                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                        raise RuntimeError("Qwen3-TTS worker has exited" + extra)
+                    continue
                 if not line:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
@@ -927,7 +967,14 @@ class _QwenTtsWorker:
         max_skip = 50
         try:
             while True:
-                line = self._proc.stdout.readline()
+                check_cancelled()
+                line = self._read_stdout_line(timeout_sec=0.2)
+                if line is None:
+                    if self._proc.poll() is not None:
+                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                        raise RuntimeError("Qwen3-TTS worker has exited" + extra)
+                    continue
                 if not line:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
@@ -972,8 +1019,33 @@ class _QwenTtsWorker:
                 proc.stdin.flush()
         except Exception:
             pass
+        # Close stdin early so the worker can exit its read loop.
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
         try:
             proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            if proc.stderr is not None:
+                proc.stderr.close()
         except Exception:
             pass
 
@@ -1014,6 +1086,7 @@ def gemini_tts(
     retry_count = 0
     
     while retry_count < max_retries:
+        check_cancelled()
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -1045,7 +1118,7 @@ def gemini_tts(
                 
                 if is_valid_wav(output_path):
                     logger.info(f'Gemini TTS saved: {output_path}')
-                    time.sleep(0.1)
+                    sleep_with_cancel(0.1)
                     return # Success
                 else:
                     logger.warning("Gemini TTS wrote invalid file, retrying...")
@@ -1058,7 +1131,7 @@ def gemini_tts(
                 except Exception:
                     pass
                 retry_count += 1
-                time.sleep(1)
+                sleep_with_cancel(1)
                 continue
 
         except Exception as e:
@@ -1070,7 +1143,7 @@ def gemini_tts(
                 delay += 1.0
                 
                 logger.warning(f"Gemini TTS Rate Limit (429). Retrying in {delay}s... (Attempt {retry_count+1}/{max_retries})")
-                time.sleep(delay)
+                sleep_with_cancel(delay)
                 retry_count += 1
                 continue
             else:
@@ -1078,7 +1151,7 @@ def gemini_tts(
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 retry_count += 1
-                time.sleep(1)
+                sleep_with_cancel(1)
         
 
 
@@ -1088,6 +1161,7 @@ def init_TTS(settings: Settings | None = None, model_manager: ModelManager | Non
 
 
 def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_size: int = 1) -> None:
+    check_cancelled()
     transcript_path = os.path.join(folder, 'translation.json')
     output_folder = os.path.join(folder, 'wavs')
     if not os.path.exists(output_folder):
@@ -1118,10 +1192,12 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
     vocals_path = os.path.join(folder, "audio_vocals.wav")
     if os.path.exists(vocals_path):
         for spk in speakers:
+            check_cancelled()
             spk_path = os.path.join(speaker_dir, f"{spk}.wav")
             if os.path.exists(spk_path):
                 continue
             try:
+                check_cancelled()
                 wav, _sr = librosa.load(vocals_path, sr=24000, mono=True, duration=max_ref_seconds)
                 if wav.size > 0:
                     save_wav(wav.astype(np.float32), spk_path, sample_rate=24000)
@@ -1130,6 +1206,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
                 logger.warning(f"Failed to generate speaker ref wav for {spk}: {exc}")
 
     for spk in speakers:
+        check_cancelled()
         _ensure_wav_max_duration(os.path.join(speaker_dir, f"{spk}.wav"), max_ref_seconds, sample_rate=24000)
     
     full_wav = np.zeros((0, ))
@@ -1152,6 +1229,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
         if tts_method == "qwen" and qwen_worker is not None and qwen_batch_size > 1:
             logger.info(f"Qwen3-TTS batch enabled: batch_size={qwen_batch_size}")
             for i in range(total_segments):
+                check_cancelled()
                 out = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
                 if os.path.exists(out) and is_valid_wav(out):
                     qwen_cached_before.add(i)
@@ -1163,9 +1241,11 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             def _run_qwen_batch(batch_indices: list[int]) -> None:
                 if not batch_indices:
                     return
+                check_cancelled()
 
                 batch_items: list[dict] = []
                 for j in batch_indices:
+                    check_cancelled()
                     seg = transcript[j]
                     speaker = seg["speaker"]
                     text = preprocess_text(seg["translation"])
@@ -1187,6 +1267,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
                     )
 
                 try:
+                    check_cancelled()
                     resp = qwen_worker.synthesize_batch(batch_items)
                 except Exception as exc:
                     if len(batch_indices) > 1 and _looks_like_oom(str(exc)):
@@ -1228,6 +1309,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
                     _run_qwen_batch(oom_failed[mid:])
 
         for i, line in enumerate(transcript):
+            check_cancelled()
             speaker = line["speaker"]
             text = preprocess_text(line["translation"])
             output_path = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
@@ -1251,12 +1333,14 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             if needs_tts:
                 tts_begin = time.monotonic()
                 try:
+                    check_cancelled()
                     if tts_method == "qwen" and qwen_worker is not None:
                         if qwen_batch_size > 1:
                             # Generate current + upcoming missing segments in one worker call.
                             batch_indices: list[int] = []
                             j = i
                             while j < total_segments and len(batch_indices) < qwen_batch_size:
+                                check_cancelled()
                                 out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
                                 if not (os.path.exists(out) and is_valid_wav(out)):
                                     batch_indices.append(j)
@@ -1296,6 +1380,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             valid_wav = os.path.exists(output_path) and is_valid_wav(output_path)
             if valid_wav:
                 adjust_begin = time.monotonic()
+                check_cancelled()
                 wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
                 adjust_elapsed = time.monotonic() - adjust_begin
             else:
@@ -1335,10 +1420,12 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
 
     vocal_wav_path = os.path.join(folder, 'audio_vocals.wav')
     if os.path.exists(vocal_wav_path):
+        check_cancelled()
         vocal_wav, _ = librosa.load(vocal_wav_path, sr=24000)
         if len(full_wav) > 0 and np.max(np.abs(full_wav)) > 0:
             full_wav = full_wav / np.max(np.abs(full_wav)) * np.max(np.abs(vocal_wav))
             
+    check_cancelled()
     save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'), sample_rate=24000)
     logger.info(f'Generated {os.path.join(folder, "audio_tts.wav")}')
     
@@ -1347,6 +1434,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
 
     instruments_path = os.path.join(folder, 'audio_instruments.wav')
     if os.path.exists(instruments_path):
+        check_cancelled()
         instruments_wav, _ = librosa.load(instruments_path, sr=24000)
         
         len_full = len(full_wav)
@@ -1358,10 +1446,12 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             full_wav = np.pad(full_wav, (0, len_inst - len_full), mode='constant')
             
         combined_wav = full_wav + instruments_wav
+        check_cancelled()
         save_wav_norm(combined_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
         logger.info(f'Generated {os.path.join(folder, "audio_combined.wav")}')
     else:
         logger.warning("No instruments audio found, saving TTS only as combined.")
+        check_cancelled()
         save_wav_norm(full_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
 
     # Write a small marker so we can distinguish "valid result" from stale/partial artifacts.
@@ -1384,6 +1474,7 @@ def generate_all_wavs_under_folder(
 ) -> str:
     count = 0
     for root, _dirs, files in os.walk(root_folder):
+        check_cancelled()
         if 'translation.json' not in files:
             continue
         combined_path = os.path.join(root, 'audio_combined.wav')

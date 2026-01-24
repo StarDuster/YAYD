@@ -1,7 +1,14 @@
+import os
+import shutil
+import subprocess
+from contextlib import contextmanager
+
 import gradio as gr
+from loguru import logger
 
 from youdub.config import Settings
 from youdub.core.pipeline import VideoPipeline
+from youdub.core.interrupts import cancel_requested, ignore_signals_during_shutdown, install_signal_handlers, request_cancel
 from youdub.core.steps import (
     download_from_url,
     generate_all_info_under_folder_stream,
@@ -18,6 +25,36 @@ settings = Settings()
 model_manager = ModelManager(settings)
 pipeline = VideoPipeline(settings=settings, model_manager=model_manager)
 
+DEFAULT_SPEED_UP = 1.2
+
+
+def _default_use_nvenc() -> bool:
+    # Best-effort NVIDIA GPU detection for NVENC default.
+    # Keep this independent of torch installation/config, since NVENC only needs GPU+ffmpeg.
+    nvidia_paths = ("/dev/nvidia0", "/dev/nvidiactl", "/proc/driver/nvidia/version")
+    if any(os.path.exists(p) for p in nvidia_paths):
+        return True
+
+    candidates: list[str] = []
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        candidates.append(exe)
+    # WSL2: nvidia-smi is often available but not on PATH.
+    if os.path.exists("/usr/lib/wsl/lib/nvidia-smi"):
+        candidates.append("/usr/lib/wsl/lib/nvidia-smi")
+
+    for exe in candidates:
+        try:
+            r = subprocess.run([exe, "-L"], capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        if r.returncode == 0 and "GPU" in (r.stdout or ""):
+            return True
+    return False
+
+
+DEFAULT_USE_NVENC = _default_use_nvenc()
+
 
 def _safe_run(names, func, *args, **kwargs):
     try:
@@ -27,6 +64,26 @@ def _safe_run(names, func, *args, **kwargs):
         return func(*args, **kwargs)
     except ModelCheckError as exc:
         return str(exc)
+
+
+@contextmanager
+def _temp_env(updates: dict[str, str | None]):
+    """Temporarily set environment variables for this run only."""
+    old: dict[str, str | None] = {}
+    try:
+        for k, v in updates.items():
+            old[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def run_pipeline(
@@ -45,6 +102,10 @@ def run_pipeline(
     whisper_min_speakers,
     whisper_max_speakers,
     translation_target_language,
+    translation_strategy,
+    translation_max_concurrency,
+    translation_chunk_size,
+    translation_guide_max_chars,
     tts_method,
     qwen_tts_batch_size,
     subtitles,
@@ -57,33 +118,41 @@ def run_pipeline(
     auto_upload_video,
 ):
     try:
-        return pipeline.run(
-            root_folder=root_folder,
-            url=url,
-            num_videos=num_videos,
-            resolution=resolution,
-            demucs_model=demucs_model,
-            device=device,
-            shifts=shifts,
-            whisper_model=whisper_model,
-            whisper_device=whisper_device,
-            whisper_cpu_model=whisper_cpu_model,
-            whisper_batch_size=whisper_batch_size,
-            whisper_diarization=whisper_diarization,
-            whisper_min_speakers=whisper_min_speakers,
-            whisper_max_speakers=whisper_max_speakers,
-            translation_target_language=translation_target_language,
-            tts_method=tts_method,
-            qwen_tts_batch_size=qwen_tts_batch_size,
-            subtitles=subtitles,
-            speed_up=speed_up,
-            fps=fps,
-            target_resolution=target_resolution,
-            use_nvenc=use_nvenc,
-            max_workers=max_workers,
-            max_retries=max_retries,
-            auto_upload_video=auto_upload_video,
-        )
+        with _temp_env(
+            {
+                "TRANSLATION_STRATEGY": translation_strategy,
+                "TRANSLATION_MAX_CONCURRENCY": str(int(translation_max_concurrency)),
+                "TRANSLATION_CHUNK_SIZE": str(int(translation_chunk_size)),
+                "TRANSLATION_GUIDE_MAX_CHARS": str(int(translation_guide_max_chars)),
+            }
+        ):
+            return pipeline.run(
+                root_folder=root_folder,
+                url=url,
+                num_videos=num_videos,
+                resolution=resolution,
+                demucs_model=demucs_model,
+                device=device,
+                shifts=shifts,
+                whisper_model=whisper_model,
+                whisper_device=whisper_device,
+                whisper_cpu_model=whisper_cpu_model,
+                whisper_batch_size=whisper_batch_size,
+                whisper_diarization=whisper_diarization,
+                whisper_min_speakers=whisper_min_speakers,
+                whisper_max_speakers=whisper_max_speakers,
+                translation_target_language=translation_target_language,
+                tts_method=tts_method,
+                qwen_tts_batch_size=qwen_tts_batch_size,
+                subtitles=subtitles,
+                speed_up=speed_up,
+                fps=fps,
+                target_resolution=target_resolution,
+                use_nvenc=use_nvenc,
+                max_workers=max_workers,
+                max_retries=max_retries,
+                auto_upload_video=auto_upload_video,
+            )
     except ModelCheckError as exc:
         return str(exc)
 
@@ -127,15 +196,23 @@ do_everything_interface = gr.Interface(
             value=settings.translation_target_language,
         ),
         gr.Dropdown(
+            ["history", "guide_parallel"],
+            label="Translation Strategy",
+            value="history",
+        ),
+        gr.Slider(minimum=1, maximum=32, step=1, label="Translation Max Concurrency", value=4),
+        gr.Slider(minimum=1, maximum=64, step=1, label="Translation Chunk Size", value=8),
+        gr.Slider(minimum=800, maximum=5000, step=100, label="Translation Guide Max Chars", value=2500),
+        gr.Dropdown(
             ["bytedance", "qwen", "gemini"],
             label="TTS Method",
             value=settings.tts_method
         ),
         gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS Batch Size", value=settings.qwen_tts_batch_size),
         gr.Checkbox(label="Subtitles", value=True),
-        gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=1.05),
+        gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=DEFAULT_SPEED_UP),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30),
-        gr.Checkbox(label="Use NVENC (h264_nvenc)", value=False),
+        gr.Checkbox(label="Use NVENC (h264_nvenc)", value=DEFAULT_USE_NVENC),
         gr.Radio(
             ["4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
             label="Resolution",
@@ -225,10 +302,28 @@ whisper_inference = gr.Interface(
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )
 
+
+def run_translation(
+    folder,
+    target_language,
+    translation_strategy,
+    translation_max_concurrency,
+    translation_chunk_size,
+    translation_guide_max_chars,
+):
+    with _temp_env(
+        {
+            "TRANSLATION_STRATEGY": translation_strategy,
+            "TRANSLATION_MAX_CONCURRENCY": str(int(translation_max_concurrency)),
+            "TRANSLATION_CHUNK_SIZE": str(int(translation_chunk_size)),
+            "TRANSLATION_GUIDE_MAX_CHARS": str(int(translation_guide_max_chars)),
+        }
+    ):
+        return translate_all_transcript_under_folder(folder, target_language, settings=settings)
+
+
 translation_interface = gr.Interface(
-    fn=lambda folder, target_language: translate_all_transcript_under_folder(
-        folder, target_language, settings=settings
-    ),
+    fn=run_translation,
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Dropdown(
@@ -236,6 +331,10 @@ translation_interface = gr.Interface(
             label="Target Language",
             value=settings.translation_target_language,
         ),
+        gr.Dropdown(["history", "guide_parallel"], label="Translation Strategy", value="history"),
+        gr.Slider(minimum=1, maximum=32, step=1, label="Translation Max Concurrency", value=4),
+        gr.Slider(minimum=1, maximum=64, step=1, label="Translation Chunk Size", value=8),
+        gr.Slider(minimum=800, maximum=5000, step=100, label="Translation Guide Max Chars", value=2500),
     ],
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )
@@ -282,14 +381,14 @@ syntehsize_video_interface = gr.Interface(
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Checkbox(label="Subtitles", value=True),
-        gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=1.05),
+        gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=DEFAULT_SPEED_UP),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30),
         gr.Radio(
             ["4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
             label="Resolution",
             value="1080p",
         ),
-        gr.Checkbox(label="Use NVENC (h264_nvenc)", value=False),
+        gr.Checkbox(label="Use NVENC (h264_nvenc)", value=DEFAULT_USE_NVENC),
     ],
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )
@@ -336,7 +435,35 @@ app = gr.TabbedInterface(
 
 
 def main():
-    app.launch()
+    import inspect
+    import time
+
+    install_signal_handlers()
+
+    launch_kwargs: dict[str, object] = {}
+    try:
+        if "prevent_thread_lock" in inspect.signature(app.launch).parameters:
+            launch_kwargs["prevent_thread_lock"] = True
+    except Exception:
+        # Best-effort: fall back to default launch behavior.
+        pass
+
+    try:
+        app.launch(**launch_kwargs)
+        if launch_kwargs.get("prevent_thread_lock"):
+            while not cancel_requested():
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        request_cancel("SIGINT")
+        logger.info("收到 Ctrl+C，正在退出…")
+    finally:
+        # Avoid double Ctrl+C breaking shutdown and causing hard aborts.
+        from contextlib import suppress
+
+        with ignore_signals_during_shutdown():
+            with suppress(Exception, KeyboardInterrupt):
+                if hasattr(app, "close"):
+                    app.close()
 
 
 if __name__ == "__main__":

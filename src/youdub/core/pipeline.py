@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
@@ -11,6 +10,7 @@ from loguru import logger
 
 from ..config import Settings
 from ..models import ModelCheckError, ModelManager
+from .interrupts import check_cancelled, sleep_with_cancel
 from .steps import (
     download,
     generate_all_info_under_folder,
@@ -69,6 +69,7 @@ class VideoPipeline:
         whisper_cpu_model: str | None = None,
     ) -> bool:
         for retry in range(max_retries):
+            check_cancelled()
             try:
                 def _require_file(path: str, desc: str, min_bytes: int = 1) -> None:
                     if not os.path.exists(path):
@@ -79,6 +80,7 @@ class VideoPipeline:
                     except OSError:
                         raise FileNotFoundError(f"Cannot read {desc}: {path}") from None
 
+                check_cancelled()
                 folder = download.get_target_folder(info, root_folder)
                 if folder is None:
                     logger.warning(f"Failed to get target folder for video {info.get('title')}")
@@ -88,6 +90,7 @@ class VideoPipeline:
                     logger.info(f"Video already uploaded in {folder}")
                     return True
 
+                check_cancelled()
                 folder = download.download_single_video(info, root_folder, resolution)
                 if folder is None:
                     logger.warning(f"Failed to download video {info.get('title')}")
@@ -97,43 +100,58 @@ class VideoPipeline:
 
                 _require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
 
-                separate_vocals.separate_all_audio_under_folder(
-                    folder,
-                    model_name=demucs_model,
-                    device=device,
-                    progress=True,
-                    shifts=shifts,
-                    settings=self.settings,
-                    model_manager=self.model_manager,
-                )
-                separate_vocals.unload_model()
+                check_cancelled()
+                try:
+                    separate_vocals.separate_all_audio_under_folder(
+                        folder,
+                        model_name=demucs_model,
+                        device=device,
+                        progress=True,
+                        shifts=shifts,
+                        settings=self.settings,
+                        model_manager=self.model_manager,
+                    )
+                finally:
+                    # Best-effort: reduce GPU memory leaks when interrupted.
+                    try:
+                        separate_vocals.unload_model()
+                    except Exception:
+                        pass
 
                 _require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
                 _require_file(os.path.join(folder, "audio_instruments.wav"), "伴奏轨(audio_instruments.wav)", min_bytes=44)
 
                 asr_device = whisper_device or device
-                transcribe.transcribe_all_audio_under_folder(
-                    folder,
-                    model_name=whisper_model,
-                    cpu_model_name=whisper_cpu_model,
-                    device=asr_device,
-                    batch_size=whisper_batch_size,
-                    diarization=whisper_diarization,
-                    min_speakers=whisper_min_speakers,
-                    max_speakers=whisper_max_speakers,
-                    settings=self.settings,
-                    model_manager=self.model_manager,
-                )
-                transcribe.unload_all_models()
+                check_cancelled()
+                try:
+                    transcribe.transcribe_all_audio_under_folder(
+                        folder,
+                        model_name=whisper_model,
+                        cpu_model_name=whisper_cpu_model,
+                        device=asr_device,
+                        batch_size=whisper_batch_size,
+                        diarization=whisper_diarization,
+                        min_speakers=whisper_min_speakers,
+                        max_speakers=whisper_max_speakers,
+                        settings=self.settings,
+                        model_manager=self.model_manager,
+                    )
+                finally:
+                    try:
+                        transcribe.unload_all_models()
+                    except Exception:
+                        pass
 
                 _require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
 
+                check_cancelled()
                 translate.translate_all_transcript_under_folder(
                     folder, target_language=translation_target_language, settings=self.settings
                 )
 
                 _require_file(os.path.join(folder, "translation.json"), "翻译结果(translation.json)", min_bytes=2)
 
+                check_cancelled()
                 synthesize_speech.generate_all_wavs_under_folder(
                     folder, 
                     tts_method=tts_method,
@@ -142,6 +160,7 @@ class VideoPipeline:
 
                 _require_file(os.path.join(folder, "audio_combined.wav"), "配音合成(audio_combined.wav)", min_bytes=44)
 
+                check_cancelled()
                 synthesize_all_video_under_folder(
                     folder,
                     subtitles=subtitles,
@@ -153,9 +172,11 @@ class VideoPipeline:
 
                 _require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
 
+                check_cancelled()
                 generate_all_info_under_folder(folder)
                 if auto_upload_video:
-                    time.sleep(1)
+                    sleep_with_cancel(1)
+                    check_cancelled()
                     upload_all_videos_under_folder(folder)
                     if not self._already_uploaded(folder):
                         raise RuntimeError(f"Auto upload failed: {folder}")
@@ -184,7 +205,7 @@ class VideoPipeline:
         tts_method: str | None = None,
         qwen_tts_batch_size: int | None = None,
         subtitles: bool = True,
-        speed_up: float = 1.05,
+        speed_up: float = 1.2,
         fps: int = 30,
         target_resolution: str = "1080p",
         use_nvenc: bool = False,
@@ -263,29 +284,39 @@ class VideoPipeline:
         url = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
         urls = [_ for _ in url.split("\n") if _]
 
-        with ThreadPoolExecutor() as executor:
-            executor.submit(separate_vocals.init_demucs, self.settings, self.model_manager)
-            executor.submit(synthesize_speech.init_TTS, self.settings, self.model_manager)
+        # Warm-up models best-effort. Keep it sequential so Ctrl+C can stop cleanly.
+        check_cancelled()
+        try:
+            separate_vocals.init_demucs(self.settings, self.model_manager)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Demucs warm-up failed (ignored): {exc}")
+        check_cancelled()
+        try:
+            synthesize_speech.init_TTS(self.settings, self.model_manager)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"TTS warm-up failed (ignored): {exc}")
+        check_cancelled()
+        try:
             # Preload ASR model best-effort to reduce first-request latency.
             # Respect explicit Whisper device selection from UI; for "auto" keep legacy behavior.
             if wd == "cpu":
-                executor.submit(
-                    transcribe.load_asr_model,
+                transcribe.load_asr_model(
                     whisper_cpu_model or whisper_model,
                     device="cpu",
                     settings=self.settings,
                     model_manager=self.model_manager,
                 )
             elif wd == "cuda":
-                executor.submit(
-                    transcribe.load_asr_model,
+                transcribe.load_asr_model(
                     whisper_model,
                     device="cuda",
                     settings=self.settings,
                     model_manager=self.model_manager,
                 )
             else:
-                executor.submit(transcribe.init_asr, self.settings, self.model_manager)
+                transcribe.init_asr(self.settings, self.model_manager)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"ASR warm-up failed (ignored): {exc}")
 
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
@@ -294,6 +325,7 @@ class VideoPipeline:
 
         if max_workers <= 1:
             for info in info_list:
+                check_cancelled()
                 success = self.process_single(
                     info,
                     root_folder,
@@ -356,6 +388,7 @@ class VideoPipeline:
                     for info in info_list
                 }
                 for future in as_completed(future_to_info):
+                    check_cancelled()
                     info = future_to_info[future]
                     try:
                         success = future.result()

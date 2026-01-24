@@ -92,126 +92,134 @@ def main() -> int:
             prompt_cache[key] = prompt
         return prompt
 
-    for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            req = json.loads(raw)
-        except Exception:
-            print(json.dumps({"ok": False, "error": "invalid json"}), flush=True)
-            continue
+    try:
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                req = json.loads(raw)
+            except Exception:
+                print(json.dumps({"ok": False, "error": "invalid json"}), flush=True)
+                continue
 
-        cmd = req.get("cmd")
-        if cmd == "shutdown":
-            break
-        if cmd not in {"synthesize", "synthesize_batch"}:
-            print(json.dumps({"ok": False, "error": f"unknown cmd: {cmd}"}), flush=True)
-            continue
+            cmd = req.get("cmd")
+            if cmd == "shutdown":
+                break
+            if cmd not in {"synthesize", "synthesize_batch"}:
+                print(json.dumps({"ok": False, "error": f"unknown cmd: {cmd}"}), flush=True)
+                continue
 
-        try:
-            if cmd == "synthesize":
-                text = str(req.get("text", ""))
-                language = str(req.get("language", "Auto") or "Auto")
-                speaker_wav = str(req.get("speaker_wav", ""))
-                output_path = str(req.get("output_path", ""))
-                if not speaker_wav or not output_path:
-                    raise ValueError("missing speaker_wav/output_path")
+            try:
+                if cmd == "synthesize":
+                    text = str(req.get("text", ""))
+                    language = str(req.get("language", "Auto") or "Auto")
+                    speaker_wav = str(req.get("speaker_wav", ""))
+                    output_path = str(req.get("output_path", ""))
+                    if not speaker_wav or not output_path:
+                        raise ValueError("missing speaker_wav/output_path")
+
+                    if args.stub:
+                        sr = 24000
+                        wav = np.zeros(int(sr * 0.2), dtype=np.float32)
+                    else:
+                        prompt = _get_prompt(speaker_wav)
+                        wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
+                            text=text,
+                            language=language,
+                            voice_clone_prompt=prompt,
+                        )
+                        if not wavs:
+                            raise RuntimeError("empty wav list")
+                        wav = np.asarray(wavs[0], dtype=np.float32)
+
+                    _write_wav(output_path, wav, int(sr))
+                    print(
+                        json.dumps(
+                            {"ok": True, "output_path": output_path, "sr": int(sr), "n_samples": int(wav.shape[0])}
+                        ),
+                        flush=True,
+                    )
+                    continue
+
+                # cmd == "synthesize_batch"
+                items = req.get("items", None)
+                if not isinstance(items, list) or not items:
+                    raise ValueError("missing items")
+
+                # Collect and validate
+                parsed: list[tuple[int, str, str, str, str]] = []
+                for idx, it in enumerate(items):
+                    if not isinstance(it, dict):
+                        raise ValueError(f"items[{idx}] is not an object")
+                    text = str(it.get("text", ""))
+                    language = str(it.get("language", "Auto") or "Auto")
+                    speaker_wav = str(it.get("speaker_wav", ""))
+                    output_path = str(it.get("output_path", ""))
+                    if not speaker_wav or not output_path:
+                        raise ValueError(f"items[{idx}] missing speaker_wav/output_path")
+                    parsed.append((idx, text, language, speaker_wav, output_path))
+
+                results: list[dict] = [{"ok": False, "error": "not processed"} for _ in parsed]
 
                 if args.stub:
                     sr = 24000
-                    wav = np.zeros(int(sr * 0.2), dtype=np.float32)
-                else:
-                    prompt = _get_prompt(speaker_wav)
-                    wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
-                        text=text,
-                        language=language,
-                        voice_clone_prompt=prompt,
-                    )
-                    if not wavs:
-                        raise RuntimeError("empty wav list")
-                    wav = np.asarray(wavs[0], dtype=np.float32)
+                    for idx, _text, _lang, _spk, out in parsed:
+                        wav = np.zeros(int(sr * 0.2), dtype=np.float32)
+                        _write_wav(out, wav, int(sr))
+                        results[idx] = {"ok": True, "output_path": out, "sr": int(sr), "n_samples": int(wav.shape[0])}
+                    print(json.dumps({"ok": True, "results": results}, ensure_ascii=False), flush=True)
+                    continue
 
-                _write_wav(output_path, wav, int(sr))
-                print(
-                    json.dumps(
-                        {"ok": True, "output_path": output_path, "sr": int(sr), "n_samples": int(wav.shape[0])}
-                    ),
-                    flush=True,
-                )
-                continue
+                assert tts is not None
+                # Group by speaker_wav to maximize prompt reuse.
+                by_spk: dict[str, list[tuple[int, str, str, str]]] = {}
+                for idx, text, language, speaker_wav, output_path in parsed:
+                    key = os.path.abspath(speaker_wav)
+                    by_spk.setdefault(key, []).append((idx, text, language, output_path))
 
-            # cmd == "synthesize_batch"
-            items = req.get("items", None)
-            if not isinstance(items, list) or not items:
-                raise ValueError("missing items")
+                for key, group in by_spk.items():
+                    speaker_wav = key
+                    try:
+                        prompt = _get_prompt(speaker_wav)
+                        texts = [t for (_idx, t, _lang, _out) in group]
+                        langs = [lang for (_idx, _t, lang, _out) in group]
+                        wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
+                            text=texts,
+                            language=langs,
+                            voice_clone_prompt=prompt,
+                        )
+                        if not wavs:
+                            raise RuntimeError("empty wav list")
+                        if len(wavs) != len(group):
+                            raise RuntimeError(f"batch wav count mismatch: got {len(wavs)}, expected {len(group)}")
 
-            # Collect and validate
-            parsed: list[tuple[int, str, str, str, str]] = []
-            for idx, it in enumerate(items):
-                if not isinstance(it, dict):
-                    raise ValueError(f"items[{idx}] is not an object")
-                text = str(it.get("text", ""))
-                language = str(it.get("language", "Auto") or "Auto")
-                speaker_wav = str(it.get("speaker_wav", ""))
-                output_path = str(it.get("output_path", ""))
-                if not speaker_wav or not output_path:
-                    raise ValueError(f"items[{idx}] missing speaker_wav/output_path")
-                parsed.append((idx, text, language, speaker_wav, output_path))
+                        for wav, (idx, _text, _lang, out) in zip(wavs, group):
+                            wav_np = np.asarray(wav, dtype=np.float32)
+                            _write_wav(out, wav_np, int(sr))
+                            results[idx] = {
+                                "ok": True,
+                                "output_path": out,
+                                "sr": int(sr),
+                                "n_samples": int(wav_np.shape[0]),
+                            }
+                    except Exception as exc:
+                        err_res = _error_result(exc)
+                        for idx, _text, _lang, _out in group:
+                            results[idx] = {
+                                "ok": False,
+                                "error": err_res.get("error", "unknown"),
+                                "trace": err_res.get("trace"),
+                            }
 
-            results: list[dict] = [{"ok": False, "error": "not processed"} for _ in parsed]
-
-            if args.stub:
-                sr = 24000
-                for idx, _text, _lang, _spk, out in parsed:
-                    wav = np.zeros(int(sr * 0.2), dtype=np.float32)
-                    _write_wav(out, wav, int(sr))
-                    results[idx] = {"ok": True, "output_path": out, "sr": int(sr), "n_samples": int(wav.shape[0])}
                 print(json.dumps({"ok": True, "results": results}, ensure_ascii=False), flush=True)
-                continue
+            except Exception as exc:
+                print(json.dumps(_error_result(exc), ensure_ascii=False), flush=True)
 
-            assert tts is not None
-            # Group by speaker_wav to maximize prompt reuse.
-            by_spk: dict[str, list[tuple[int, str, str, str]]] = {}
-            for idx, text, language, speaker_wav, output_path in parsed:
-                key = os.path.abspath(speaker_wav)
-                by_spk.setdefault(key, []).append((idx, text, language, output_path))
-
-            for key, group in by_spk.items():
-                speaker_wav = key
-                try:
-                    prompt = _get_prompt(speaker_wav)
-                    texts = [t for (_idx, t, _lang, _out) in group]
-                    langs = [lang for (_idx, _t, lang, _out) in group]
-                    wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
-                        text=texts,
-                        language=langs,
-                        voice_clone_prompt=prompt,
-                    )
-                    if not wavs:
-                        raise RuntimeError("empty wav list")
-                    if len(wavs) != len(group):
-                        raise RuntimeError(f"batch wav count mismatch: got {len(wavs)}, expected {len(group)}")
-
-                    for wav, (idx, _text, _lang, out) in zip(wavs, group):
-                        wav_np = np.asarray(wav, dtype=np.float32)
-                        _write_wav(out, wav_np, int(sr))
-                        results[idx] = {
-                            "ok": True,
-                            "output_path": out,
-                            "sr": int(sr),
-                            "n_samples": int(wav_np.shape[0]),
-                        }
-                except Exception as exc:
-                    err_res = _error_result(exc)
-                    for idx, _text, _lang, _out in group:
-                        results[idx] = {"ok": False, "error": err_res.get("error", "unknown"), "trace": err_res.get("trace")}
-
-            print(json.dumps({"ok": True, "results": results}, ensure_ascii=False), flush=True)
-        except Exception as exc:
-            print(json.dumps(_error_result(exc), ensure_ascii=False), flush=True)
-
-    return 0
+        return 0
+    except KeyboardInterrupt:
+        # Quiet exit on Ctrl+C (parent will handle cancellation).
+        return 130
 
 
 if __name__ == "__main__":
