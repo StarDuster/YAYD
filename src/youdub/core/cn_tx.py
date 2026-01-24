@@ -4,21 +4,17 @@
 # Authors:
 #   2019.5 Zhiyang Zhou (https://github.com/Joee1995/chn_text_norm.git)
 #   2019.9 - 2022 Jiayu DU
-#
+
 # requirements:
 #   - python 3.X
 # notes: python 2.X WILL fail or produce misleading results
 
 import sys
-import os
 import argparse
 import string
 import re
 import csv
 
-# ================================================================================ #
-#                                    basic constant
-# ================================================================================ #
 CHINESE_DIGIS = u'零一二三四五六七八九'
 BIG_CHINESE_DIGIS_SIMPLIFIED = u'零壹贰叁肆伍陆柒捌玖'
 BIG_CHINESE_DIGIS_TRADITIONAL = u'零壹貳參肆伍陸柒捌玖'
@@ -36,8 +32,6 @@ TWO_ALTS = [u'两', u'兩']
 POSITIVE = [u'正', u'正']
 NEGATIVE = [u'负', u'負']
 POINT = [u'点', u'點']
-# PLUS = [u'加', u'加']
-# SIL = [u'杠', u'槓']
 
 FILLER_CHARS = ['呃', '啊']
 
@@ -391,11 +385,6 @@ IN_EN_CHARS = {c: True for c in EN_CHARS}
 VALID_CHARS = CN_CHARS + EN_CHARS + ' ' + PUNCS
 IN_VALID_CHARS = {c: True for c in VALID_CHARS}
 
-# ================================================================================ #
-#                                    basic class
-# ================================================================================ #
-
-
 class ChineseChar(object):
     """
     中文字符
@@ -407,7 +396,6 @@ class ChineseChar(object):
     def __init__(self, simplified, traditional):
         self.simplified = simplified
         self.traditional = traditional
-        # self.__repr__ = self.__str__
 
     def __str__(self):
         return self.simplified or self.traditional or None
@@ -514,22 +502,6 @@ class MathSymbol(object):
             yield v
 
 
-# class OtherSymbol(object):
-#     """
-#     其他符号
-#     """
-#
-#     def __init__(self, sil):
-#         self.sil = sil
-#
-#     def __iter__(self):
-#         for v in self.__dict__.values():
-#             yield v
-
-
-# ================================================================================ #
-#                                    basic utils
-# ================================================================================ #
 def create_system(numbering_type=NUMBERING_TYPES[1]):
     """
     根据数字系统类型返回创建相应的数字系统，默认为 mid
@@ -540,17 +512,14 @@ def create_system(numbering_type=NUMBERING_TYPES[1]):
     返回对应的数字系统
     """
 
-    # chinese number units of '亿' and larger
     all_larger_units = zip(
         LARGER_CHINESE_NUMERING_UNITS_SIMPLIFIED, LARGER_CHINESE_NUMERING_UNITS_TRADITIONAL)
     larger_units = [CNU.create(i, v, numbering_type, False)
                     for i, v in enumerate(all_larger_units)]
-    # chinese number units of '十, 百, 千, 万'
     all_smaller_units = zip(
         SMALLER_CHINESE_NUMERING_UNITS_SIMPLIFIED, SMALLER_CHINESE_NUMERING_UNITS_TRADITIONAL)
     smaller_units = [CNU.create(i, v, small_unit=True)
                      for i, v in enumerate(all_smaller_units)]
-    # digis
     chinese_digis = zip(CHINESE_DIGIS, CHINESE_DIGIS,
                         BIG_CHINESE_DIGIS_SIMPLIFIED, BIG_CHINESE_DIGIS_TRADITIONAL)
     digits = [CND.create(i, v) for i, v in enumerate(chinese_digis)]
@@ -558,17 +527,14 @@ def create_system(numbering_type=NUMBERING_TYPES[1]):
     digits[1].alt_s, digits[1].alt_t = ONE_ALT, ONE_ALT
     digits[2].alt_s, digits[2].alt_t = TWO_ALTS[0], TWO_ALTS[1]
 
-    # symbols
     positive_cn = CM(POSITIVE[0], POSITIVE[1], '+', lambda x: x)
     negative_cn = CM(NEGATIVE[0], NEGATIVE[1], '-', lambda x: -x)
     point_cn = CM(POINT[0], POINT[1], '.', lambda x,
                   y: float(str(x) + '.' + str(y)))
-    # sil_cn = CM(SIL[0], SIL[1], '-', lambda x, y: float(str(x) + '-' + str(y)))
     system = NumberSystem()
     system.units = smaller_units + larger_units
     system.digits = digits
     system.math = MathSymbol(positive_cn, negative_cn, point_cn)
-    # system.symbols = OtherSymbol(sil_cn)
     return system
 
 
@@ -733,9 +699,6 @@ def num2chn(number_string, numbering_type=NUMBERING_TYPES[1], big=False,
 
     result = ''.join([getattr(s, attr_name) for s in result_symbols])
 
-    # if not use_zeros:
-    #     result = result.strip(getattr(system.digits[0], attr_name))
-
     if alt_zero:
         result = result.replace(
             getattr(system.digits[0], attr_name), system.digits[0].alt_s)
@@ -757,9 +720,6 @@ def num2chn(number_string, numbering_type=NUMBERING_TYPES[1], big=False,
     return result
 
 
-# ================================================================================ #
-#                          different types of rewriters
-# ================================================================================ #
 class Cardinal:
     """
     CARDINAL类
@@ -785,9 +745,6 @@ class Digit:
         self.digit = digit
         self.chntext = chntext
 
-    # def chntext2digit(self):
-    #     return chn2num(self.chntext)
-
     def digit2chntext(self):
         return num2chn(self.digit, alt_two=False, use_units=False)
 
@@ -801,13 +758,6 @@ class TelePhone:
         self.telephone = telephone
         self.raw_chntext = raw_chntext
         self.chntext = chntext
-
-    # def chntext2telephone(self):
-    #     sil_parts = self.raw_chntext.split('<SIL>')
-    #     self.telephone = '-'.join([
-    #         str(chn2num(p)) for p in sil_parts
-    #     ])
-    #     return self.telephone
 
     def telephone2chntext(self, fixed=False):
 
@@ -853,30 +803,6 @@ class Date:
         self.date = date
         self.chntext = chntext
 
-    # def chntext2date(self):
-    #     chntext = self.chntext
-    #     try:
-    #         year, other = chntext.strip().split('年', maxsplit=1)
-    #         year = Digit(chntext=year).digit2chntext() + '年'
-    #     except ValueError:
-    #         other = chntext
-    #         year = ''
-    #     if other:
-    #         try:
-    #             month, day = other.strip().split('月', maxsplit=1)
-    #             month = Cardinal(chntext=month).chntext2cardinal() + '月'
-    #         except ValueError:
-    #             day = chntext
-    #             month = ''
-    #         if day:
-    #             day = Cardinal(chntext=day[:-1]).chntext2cardinal() + day[-1]
-    #     else:
-    #         month = ''
-    #         day = ''
-    #     date = year + month + day
-    #     self.date = date
-    #     return self.date
-
     def date2chntext(self):
         date = self.date
         try:
@@ -910,9 +836,6 @@ class Money:
     def __init__(self, money=None, chntext=None):
         self.money = money
         self.chntext = chntext
-
-    # def chntext2money(self):
-    #     return self.money
 
     def money2chntext(self):
         money = self.money
@@ -950,7 +873,6 @@ def normalize_nsw(raw_text):
         r"\D+((([089]\d|(19|20)\d{2})年)?(\d{1,2}月(\d{1,2}[日号])?)?)")
     matchers = pattern.findall(text)
     if matchers:
-        # print('date')
         for matcher in matchers:
             text = text.replace(matcher[0], Date(
                 date=matcher[0]).date2chntext(), 1)
@@ -960,7 +882,6 @@ def normalize_nsw(raw_text):
         r"\D+((\d+(\.\d+)?)[多余几]?" + CURRENCY_UNITS + r"(\d" + CURRENCY_UNITS + r"?)?)")
     matchers = pattern.findall(text)
     if matchers:
-        # print('money')
         for matcher in matchers:
             text = text.replace(matcher[0], Money(
                 money=matcher[0]).money2chntext(), 1)
@@ -975,7 +896,6 @@ def normalize_nsw(raw_text):
         r"\D((\+?86 ?)?1([38]\d|5[0-35-9]|7[678]|9[89])\d{8})\D")
     matchers = pattern.findall(text)
     if matchers:
-        # print('telephone')
         for matcher in matchers:
             text = text.replace(matcher[0], TelePhone(
                 telephone=matcher[0]).telephone2chntext(), 1)
@@ -983,7 +903,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"\D((0(10|2[1-3]|[3-9]\d{2})-?)?[1-9]\d{6,7})\D")
     matchers = pattern.findall(text)
     if matchers:
-        # print('fixed telephone')
         for matcher in matchers:
             text = text.replace(matcher[0], TelePhone(
                 telephone=matcher[0]).telephone2chntext(fixed=True), 1)
@@ -992,7 +911,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"(\d+/\d+)")
     matchers = pattern.findall(text)
     if matchers:
-        # print('fraction')
         for matcher in matchers:
             text = text.replace(matcher, Fraction(
                 fraction=matcher).fraction2chntext(), 1)
@@ -1002,7 +920,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"(\d+(\.\d+)?%)")
     matchers = pattern.findall(text)
     if matchers:
-        # print('percentage')
         for matcher in matchers:
             text = text.replace(matcher[0], Percentage(
                 percentage=matcher[0]).percentage2chntext(), 1)
@@ -1011,7 +928,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"(\d+(\.\d+)?)[多余几]?" + COM_QUANTIFIERS)
     matchers = pattern.findall(text)
     if matchers:
-        # print('cardinal+quantifier')
         for matcher in matchers:
             text = text.replace(matcher[0], Cardinal(
                 cardinal=matcher[0]).cardinal2chntext(), 1)
@@ -1020,7 +936,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"(\d{4,32})")
     matchers = pattern.findall(text)
     if matchers:
-        # print('digit')
         for matcher in matchers:
             text = text.replace(matcher, Digit(
                 digit=matcher).digit2chntext(), 1)
@@ -1029,7 +944,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"(\d+(\.\d+)?)")
     matchers = pattern.findall(text)
     if matchers:
-        # print('cardinal')
         for matcher in matchers:
             text = text.replace(matcher[0], Cardinal(
                 cardinal=matcher[0]).cardinal2chntext(), 1)
@@ -1038,7 +952,6 @@ def normalize_nsw(raw_text):
     pattern = re.compile(r"(([a-zA-Z]+)二([a-zA-Z]+))")
     matchers = pattern.findall(text)
     if matchers:
-        # print('particular')
         for matcher in matchers:
             text = text.replace(matcher[0], matcher[1]+'2'+matcher[2], 1)
 
@@ -1128,8 +1041,6 @@ class TextNorm:
             text = remove_erhua(text)
 
         text = normalize_nsw(text)
-
-        # text = text.translate(PUNCS_TRANSFORM)
 
         if self.check_chars:
             for c in text:
