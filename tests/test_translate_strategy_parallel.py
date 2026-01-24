@@ -1,11 +1,11 @@
 import json
 
 
-def test_normalize_translation_strategy_defaults_to_history():
+def test_normalize_translation_strategy_defaults_to_guide_parallel():
     from youdub.core.steps.translate import _normalize_translation_strategy
 
-    assert _normalize_translation_strategy(None) == "history"
-    assert _normalize_translation_strategy("") == "history"
+    assert _normalize_translation_strategy(None) == "guide_parallel"
+    assert _normalize_translation_strategy("") == "guide_parallel"
     assert _normalize_translation_strategy("history") == "history"
     assert _normalize_translation_strategy("serial") == "history"
 
@@ -23,7 +23,7 @@ def test_translate_content_default_history_includes_previous_turns(monkeypatch):
 
     monkeypatch.setattr(tr.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")
-    monkeypatch.delenv("TRANSLATION_STRATEGY", raising=False)
+    monkeypatch.setenv("TRANSLATION_STRATEGY", "history")
 
     calls = {"n": 0}
 

@@ -358,7 +358,7 @@ def _read_int_env(name: str, default: int) -> int:
 
 
 def _normalize_translation_strategy(raw: str | None) -> str:
-    s = (raw or "history").strip().lower()
+    s = (raw or "parallel").strip().lower()
     if s in {"history", "serial", "chain", "seq"}:
         return "history"
     if s in {"guide_parallel", "parallel", "parallel_guide", "guide", "p2", "2"}:

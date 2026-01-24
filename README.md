@@ -161,8 +161,8 @@ QWEN_TTS_MODEL_PATH=models/TTS/Qwen3-TTS-12Hz-1.7B-Base
 QWEN_TTS_PYTHON=.venv/bin/python
 
 # --- 翻译配置 (可选) ---
-# 翻译策略: history (默认，串行带上下文) / guide_parallel (先生成翻译指南，再并发翻译)
-TRANSLATION_STRATEGY=history
+# 翻译策略: history (串行带上下文) / guide_parallel (默认，先生成翻译指南，再并发翻译)
+TRANSLATION_STRATEGY=parallel
 # guide_parallel 模式下的并发数
 TRANSLATION_MAX_CONCURRENCY=4
 

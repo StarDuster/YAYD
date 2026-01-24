@@ -73,7 +73,7 @@ class Settings(BaseSettings):
         alias="QWEN_TTS_PYTHON",
     )
     qwen_tts_batch_size: int = Field(
-        default=2,
+        default=8,
         description="Batch size for Qwen3-TTS (only used when TTS_METHOD=qwen)",
         alias="QWEN_TTS_BATCH_SIZE",
     )

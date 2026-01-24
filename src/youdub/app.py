@@ -198,7 +198,7 @@ do_everything_interface = gr.Interface(
         gr.Dropdown(
             ["history", "guide_parallel"],
             label="Translation Strategy",
-            value="history",
+            value="guide_parallel",
         ),
         gr.Slider(minimum=1, maximum=32, step=1, label="Translation Max Concurrency", value=4),
         gr.Slider(minimum=1, maximum=64, step=1, label="Translation Chunk Size", value=8),
@@ -331,7 +331,7 @@ translation_interface = gr.Interface(
             label="Target Language",
             value=settings.translation_target_language,
         ),
-        gr.Dropdown(["history", "guide_parallel"], label="Translation Strategy", value="history"),
+        gr.Dropdown(["history", "guide_parallel"], label="Translation Strategy", value="guide_parallel"),
         gr.Slider(minimum=1, maximum=32, step=1, label="Translation Max Concurrency", value=4),
         gr.Slider(minimum=1, maximum=64, step=1, label="Translation Chunk Size", value=8),
         gr.Slider(minimum=800, maximum=5000, step=100, label="Translation Guide Max Chars", value=2500),
