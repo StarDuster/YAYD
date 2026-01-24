@@ -46,6 +46,7 @@ def run_pipeline(
     whisper_max_speakers,
     translation_target_language,
     tts_method,
+    qwen_tts_batch_size,
     subtitles,
     speed_up,
     fps,
@@ -73,6 +74,7 @@ def run_pipeline(
             whisper_max_speakers=whisper_max_speakers,
             translation_target_language=translation_target_language,
             tts_method=tts_method,
+            qwen_tts_batch_size=qwen_tts_batch_size,
             subtitles=subtitles,
             speed_up=speed_up,
             fps=fps,
@@ -129,6 +131,7 @@ do_everything_interface = gr.Interface(
             label="TTS Method",
             value=settings.tts_method
         ),
+        gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS Batch Size", value=settings.qwen_tts_batch_size),
         gr.Checkbox(label="Subtitles", value=True),
         gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Speed Up", value=1.05),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30),
@@ -238,7 +241,7 @@ translation_interface = gr.Interface(
 )
 
 
-def _tts_wrapper(folder, tts_method):
+def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
     names = (
         [model_manager._bytedance_requirement().name]  # type: ignore[attr-defined]
         if tts_method == "bytedance"
@@ -256,6 +259,7 @@ def _tts_wrapper(folder, tts_method):
         generate_all_wavs_under_folder,
         folder,
         tts_method=tts_method,
+        qwen_tts_batch_size=qwen_tts_batch_size,
     )
 
 
@@ -268,6 +272,7 @@ tts_interface = gr.Interface(
             label="TTS Method",
             value=settings.tts_method
         ),
+        gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS Batch Size", value=settings.qwen_tts_batch_size),
     ],
     outputs=gr.Textbox(label="Output", lines=5, max_lines=100, autoscroll=True),
 )

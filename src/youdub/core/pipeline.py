@@ -57,6 +57,7 @@ class VideoPipeline:
         whisper_max_speakers: int | None,
         translation_target_language: str,
         tts_method: str,
+        qwen_tts_batch_size: int,
         subtitles: bool,
         speed_up: float,
         fps: int,
@@ -136,6 +137,7 @@ class VideoPipeline:
                 synthesize_speech.generate_all_wavs_under_folder(
                     folder, 
                     tts_method=tts_method,
+                    qwen_tts_batch_size=qwen_tts_batch_size,
                 )
 
                 _require_file(os.path.join(folder, "audio_combined.wav"), "配音合成(audio_combined.wav)", min_bytes=44)
@@ -180,6 +182,7 @@ class VideoPipeline:
         whisper_max_speakers: int | None = None,
         translation_target_language: str | None = None,
         tts_method: str | None = None,
+        qwen_tts_batch_size: int | None = None,
         subtitles: bool = True,
         speed_up: float = 1.05,
         fps: int = 30,
@@ -204,6 +207,7 @@ class VideoPipeline:
         whisper_batch_size = whisper_batch_size or self.settings.whisper_batch_size
         translation_target_language = translation_target_language or self.settings.translation_target_language
         tts_method = tts_method or self.settings.tts_method
+        qwen_tts_batch_size = qwen_tts_batch_size or getattr(self.settings, "qwen_tts_batch_size", 1)
 
         def _has_whisper_model_bin(model_dir: str | None) -> bool:
             if not model_dir:
@@ -304,6 +308,7 @@ class VideoPipeline:
                     whisper_max_speakers,
                     translation_target_language,
                     tts_method,
+                    int(qwen_tts_batch_size),
                     subtitles,
                     speed_up,
                     fps,
@@ -337,6 +342,7 @@ class VideoPipeline:
                         whisper_max_speakers,
                         translation_target_language,
                         tts_method,
+                        int(qwen_tts_batch_size),
                         subtitles,
                         speed_up,
                         fps,

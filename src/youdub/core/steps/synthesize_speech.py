@@ -899,6 +899,69 @@ class _QwenTtsWorker:
             raise RuntimeError(err)
         return resp
 
+    def synthesize_batch(self, items: list[dict]) -> dict:
+        if self._proc.poll() is not None:
+            raise RuntimeError("Qwen3-TTS worker has exited")
+
+        req = {
+            "cmd": "synthesize_batch",
+            "items": items,
+        }
+
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+        self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+
+        begin = time.monotonic()
+        done = threading.Event()
+
+        def _heartbeat() -> None:
+            while not done.wait(10.0):
+                elapsed = time.monotonic() - begin
+                logger.info(f"Qwen3-TTS batch generating... ({elapsed:.1f}s) items={len(items)}")
+
+        threading.Thread(target=_heartbeat, daemon=True).start()
+
+        skipped: list[str] = []
+        max_skip = 50
+        try:
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                    extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                    raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
+
+                s = line.strip()
+                if not s:
+                    continue
+
+                try:
+                    resp = json.loads(s)
+                    break
+                except json.JSONDecodeError:
+                    skipped.append(s)
+                    if len(skipped) >= max_skip:
+                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                        noise = "\n".join(skipped[-10:])
+                        raise RuntimeError(
+                            "Qwen3-TTS worker 输出无法解析为 JSON（协议被日志污染）。"
+                            f"\nstdout_tail:\n{noise}{extra}"
+                        )
+                    continue
+        finally:
+            done.set()
+
+        if not resp.get("ok"):
+            err = str(resp.get("error", "unknown error"))
+            trace = resp.get("trace")
+            if trace:
+                raise RuntimeError(err + "\n" + str(trace))
+            raise RuntimeError(err)
+        return resp
+
     def close(self) -> None:
         proc = getattr(self, "_proc", None)
         if not proc:
@@ -1024,7 +1087,7 @@ def init_TTS(settings: Settings | None = None, model_manager: ModelManager | Non
     return
 
 
-def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
+def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_size: int = 1) -> None:
     transcript_path = os.path.join(folder, 'translation.json')
     output_folder = os.path.join(folder, 'wavs')
     if not os.path.exists(output_folder):
@@ -1040,7 +1103,9 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
     speakers = set(line["speaker"] for line in transcript)
     num_speakers = len(speakers)
     total_segments = len(transcript)
-    logger.info(f"TTS({tts_method}) started: segments={total_segments}, speakers={num_speakers}, folder={folder}")
+    logger.info(
+        f"TTS({tts_method}) started: segments={total_segments}, speakers={num_speakers}, folder={folder}"
+    )
 
     # 防止历史数据/旧逻辑生成超长 SPEAKER/*.wav 导致 voice cloning 显存/时间爆炸
     max_ref_seconds = _read_speaker_ref_seconds()
@@ -1074,14 +1139,105 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
         qwen_worker = _QwenTtsWorker.from_settings(_DEFAULT_SETTINGS)
 
     try:
+        qwen_batch_size = 1
+        if tts_method == "qwen":
+            try:
+                qwen_batch_size = int(qwen_tts_batch_size or 1)
+            except Exception:
+                qwen_batch_size = 1
+            qwen_batch_size = max(1, min(qwen_batch_size, 64))
+
+        qwen_resp_by_index: dict[int, dict] = {}
+        qwen_cached_before: set[int] = set()
+        if tts_method == "qwen" and qwen_worker is not None and qwen_batch_size > 1:
+            logger.info(f"Qwen3-TTS batch enabled: batch_size={qwen_batch_size}")
+            for i in range(total_segments):
+                out = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
+                if os.path.exists(out) and is_valid_wav(out):
+                    qwen_cached_before.add(i)
+
+            def _looks_like_oom(err: str) -> bool:
+                s = (err or "").lower()
+                return ("out of memory" in s) or ("cuda" in s and "memory" in s) or ("oom" in s)
+
+            def _run_qwen_batch(batch_indices: list[int]) -> None:
+                if not batch_indices:
+                    return
+
+                batch_items: list[dict] = []
+                for j in batch_indices:
+                    seg = transcript[j]
+                    speaker = seg["speaker"]
+                    text = preprocess_text(seg["translation"])
+                    out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
+                    spk_wav = os.path.join(folder, "SPEAKER", f"{speaker}.wav")
+                    # If invalid/corrupted file exists, remove so worker can rewrite cleanly.
+                    if os.path.exists(out) and not is_valid_wav(out):
+                        try:
+                            os.remove(out)
+                        except Exception:
+                            pass
+                    batch_items.append(
+                        {
+                            "text": text,
+                            "language": "Auto",
+                            "speaker_wav": spk_wav,
+                            "output_path": out,
+                        }
+                    )
+
+                try:
+                    resp = qwen_worker.synthesize_batch(batch_items)
+                except Exception as exc:
+                    if len(batch_indices) > 1 and _looks_like_oom(str(exc)):
+                        mid = len(batch_indices) // 2
+                        _run_qwen_batch(batch_indices[:mid])
+                        _run_qwen_batch(batch_indices[mid:])
+                        return
+                    logger.warning(f"Qwen3-TTS batch failed for segments {batch_indices}: {exc}")
+                    for j in batch_indices:
+                        qwen_resp_by_index[j] = {"ok": False, "error": str(exc)}
+                    return
+
+                results = resp.get("results")
+                if not isinstance(results, list) or len(results) != len(batch_items):
+                    logger.warning(
+                        f"Qwen3-TTS batch returned unexpected results: {type(results)} len={getattr(results, '__len__', lambda: -1)()}"
+                    )
+                    for j in batch_indices:
+                        qwen_resp_by_index[j] = {"ok": False, "error": "invalid batch results"}
+                    return
+
+                for j, r in zip(batch_indices, results):
+                    if isinstance(r, dict):
+                        qwen_resp_by_index[j] = r
+                        if not r.get("ok"):
+                            logger.warning(f"Qwen3-TTS batch item failed (segment={j}): {r.get('error')}")
+                    else:
+                        qwen_resp_by_index[j] = {"ok": False, "error": "invalid item result"}
+
+                # If the worker reports OOM for some items, retry those with smaller batches.
+                oom_failed: list[int] = []
+                for j in batch_indices:
+                    rj = qwen_resp_by_index.get(j) or {}
+                    if rj.get("ok") is False and _looks_like_oom(str(rj.get("error", ""))):
+                        oom_failed.append(j)
+                if len(oom_failed) > 1:
+                    mid = len(oom_failed) // 2
+                    _run_qwen_batch(oom_failed[:mid])
+                    _run_qwen_batch(oom_failed[mid:])
+
         for i, line in enumerate(transcript):
             speaker = line["speaker"]
             text = preprocess_text(line["translation"])
             output_path = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
             speaker_wav = os.path.join(folder, "SPEAKER", f"{speaker}.wav")
             seg_no = i + 1
-            cached_before = os.path.exists(output_path) and is_valid_wav(output_path)
-            cache_tag = " [cached]" if cached_before else ""
+            if tts_method == "qwen" and qwen_worker is not None and qwen_batch_size > 1:
+                was_cached = i in qwen_cached_before
+            else:
+                was_cached = os.path.exists(output_path) and is_valid_wav(output_path)
+            cache_tag = " [cached]" if was_cached else ""
             logger.info(
                 f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}"
             )
@@ -1090,14 +1246,27 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
             original_length = line["end"] - start
 
             tts_elapsed = 0.0
-            qwen_resp: dict | None = None
-            if not cached_before:
+            qwen_resp: dict | None = qwen_resp_by_index.get(i)
+            needs_tts = not (os.path.exists(output_path) and is_valid_wav(output_path))
+            if needs_tts:
                 tts_begin = time.monotonic()
                 try:
                     if tts_method == "qwen" and qwen_worker is not None:
-                        qwen_resp = qwen_worker.synthesize(
-                            text, speaker_wav, output_path, language="Auto"
-                        )
+                        if qwen_batch_size > 1:
+                            # Generate current + upcoming missing segments in one worker call.
+                            batch_indices: list[int] = []
+                            j = i
+                            while j < total_segments and len(batch_indices) < qwen_batch_size:
+                                out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
+                                if not (os.path.exists(out) and is_valid_wav(out)):
+                                    batch_indices.append(j)
+                                j += 1
+                            _run_qwen_batch(batch_indices)
+                            qwen_resp = qwen_resp_by_index.get(i)
+                        else:
+                            qwen_resp = qwen_worker.synthesize(
+                                text, speaker_wav, output_path, language="Auto"
+                            )
                     elif tts_method == "gemini":
                         gemini_tts(text, output_path)
                     else:
@@ -1146,7 +1315,7 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
                 n_samples = qwen_resp.get("n_samples")
                 if sr is not None and n_samples is not None:
                     qwen_extra = f", sr={sr}, n_samples={n_samples}"
-            source = "cached" if cached_before else ("tts" if valid_wav else "silence")
+            source = "cached" if was_cached else ("tts" if valid_wav else "silence")
             logger.info(
                 f"TTS({tts_method}) {seg_no}/{total_segments} done: source={source}, "
                 f"tts={tts_elapsed:.2f}s, adjust={adjust_elapsed:.2f}s, desired={desired_len:.2f}s, actual={actual_len:.2f}s"
@@ -1210,7 +1379,9 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
         pass
 
 
-def generate_all_wavs_under_folder(root_folder: str, tts_method: str = 'bytedance') -> str:
+def generate_all_wavs_under_folder(
+    root_folder: str, tts_method: str = "bytedance", qwen_tts_batch_size: int = 1
+) -> str:
     count = 0
     for root, _dirs, files in os.walk(root_folder):
         if 'translation.json' not in files:
@@ -1230,7 +1401,7 @@ def generate_all_wavs_under_folder(root_folder: str, tts_method: str = 'bytedanc
             except Exception:
                 # Treat as not done and re-generate.
                 pass
-        generate_wavs(root, tts_method)
+        generate_wavs(root, tts_method, qwen_tts_batch_size=qwen_tts_batch_size)
         count += 1
     msg = f'Generated all wavs under {root_folder} (processed {count} files)'
     logger.info(msg)
