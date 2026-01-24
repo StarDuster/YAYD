@@ -33,14 +33,14 @@ def test_translate_content_default_history_includes_previous_turns(monkeypatch):
         # The first request should not contain a turn with the first translated output yet.
         if calls["n"] == 1:
             assert not any(
-                m.get("role") == "assistant" and "翻译：“你好”" in str(m.get("content", ""))
+                m.get("role") == "assistant" and "你好" in str(m.get("content", ""))
                 for m in messages
             )
             return "你好"
 
         # The second request should include history from the first request.
         assert any(
-            m.get("role") == "assistant" and "翻译：“你好”" in str(m.get("content", ""))
+            m.get("role") == "assistant" and str(m.get("content", "")).strip() == "你好"
             for m in messages
         )
         return "世界"
