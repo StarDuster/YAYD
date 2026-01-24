@@ -59,9 +59,20 @@ def is_valid_wav(path: str) -> bool:
     if os.path.getsize(path) < 44:  # Minimal WAV header size
         return False
     try:
-        import soundfile as sf
-        with sf.SoundFile(path):
-            return True
+        # NOTE:
+        # We intentionally validate via stdlib `wave` here (instead of libsndfile/soundfile).
+        # Reason: downstream time-stretch (`audiostretchy`) also uses `wave` and will crash
+        # on files that libsndfile can decode (e.g. FLAC/OGG/MP3 content saved as *.wav).
+        with wave.open(path, "rb") as wf:
+            if int(wf.getframerate() or 0) <= 0:
+                return False
+            if int(wf.getnchannels() or 0) <= 0:
+                return False
+            if int(wf.getsampwidth() or 0) <= 0:
+                return False
+            # Allow zero-length wav (treated as valid but will be handled later).
+            _ = int(wf.getnframes() or 0)
+        return True
     except Exception:
         return False
 
@@ -150,10 +161,22 @@ def adjust_audio_length(
     new_desired_length = current_length * speed_factor
     
     target_path = wav_path.replace(".wav", "_adjusted.wav")
-    stretch_audio(wav_path, target_path, ratio=speed_factor, sample_rate=sample_rate)
-    
+    wav_stretched: np.ndarray | None = None
     try:
+        stretch_audio(wav_path, target_path, ratio=speed_factor, sample_rate=sample_rate)
         wav_stretched, _ = librosa.load(target_path, sr=sample_rate)
+    except Exception as exc:
+        # Don't crash the whole pipeline due to one bad/cached segment.
+        # Fallback: in-memory time-stretch via librosa; if that also fails, return original (trim/pad).
+        logger.warning(f"stretch_audio failed for {wav_path}: {exc} (fallback to librosa)")
+        try:
+            # librosa's `rate` is inverse of duration ratio:
+            # new_duration = old_duration / rate  => rate = 1 / speed_factor
+            rate = float(1.0 / max(float(speed_factor), 1e-6))
+            wav_stretched = librosa.effects.time_stretch(wav.astype(np.float32, copy=False), rate=rate)
+        except Exception as exc2:
+            logger.warning(f"librosa time_stretch failed for {wav_path}: {exc2} (fallback to trim/pad)")
+            wav_stretched = wav
     finally:
         # 临时文件仅用于中间 stretch，避免长期堆积占用磁盘。
         try:
@@ -161,9 +184,23 @@ def adjust_audio_length(
                 os.remove(target_path)
         except Exception:
             pass
-    
+
+    if wav_stretched is None:
+        wav_stretched = wav
+
     target_samples = int(new_desired_length * sample_rate)
-    return wav_stretched[:target_samples], new_desired_length
+    if target_samples <= 0:
+        return np.zeros((0,), dtype=np.float32), 0.0
+
+    wav_stretched = wav_stretched.astype(np.float32, copy=False)
+    if wav_stretched.shape[0] < target_samples:
+        wav_stretched = np.pad(wav_stretched, (0, target_samples - wav_stretched.shape[0]), mode="constant")
+    else:
+        wav_stretched = wav_stretched[:target_samples]
+
+    # Match reported length to actual returned samples to keep timeline consistent.
+    actual_len = float(target_samples) / float(sample_rate)
+    return wav_stretched, actual_len
 
 
 def load_embedding_model() -> None:
@@ -882,54 +919,40 @@ class _QwenTtsWorker:
         self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
 
-        begin = time.monotonic()
-        done = threading.Event()
-
-        def _heartbeat() -> None:
-            # 单段生成耗时较长时，提供可见的“还在跑”的日志
-            while not done.wait(10.0):
-                elapsed = time.monotonic() - begin
-                logger.info(f"Qwen3-TTS generating... ({elapsed:.1f}s) -> {output_path}")
-
-        threading.Thread(target=_heartbeat, daemon=True).start()
-
         skipped: list[str] = []
         max_skip = 50
-        try:
-            while True:
-                check_cancelled()
-                line = self._read_stdout_line(timeout_sec=0.2)
-                if line is None:
-                    if self._proc.poll() is not None:
-                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
-                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                        raise RuntimeError("Qwen3-TTS worker has exited" + extra)
-                    continue
-                if not line:
+        while True:
+            check_cancelled()
+            line = self._read_stdout_line(timeout_sec=0.2)
+            if line is None:
+                if self._proc.poll() is not None:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                    raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
+                    raise RuntimeError("Qwen3-TTS worker has exited" + extra)
+                continue
+            if not line:
+                stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
 
-                s = line.strip()
-                if not s:
-                    continue
+            s = line.strip()
+            if not s:
+                continue
 
-                try:
-                    resp = json.loads(s)
-                    break
-                except json.JSONDecodeError:
-                    skipped.append(s)
-                    if len(skipped) >= max_skip:
-                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
-                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                        noise = "\n".join(skipped[-10:])
-                        raise RuntimeError(
-                            "Qwen3-TTS worker 输出无法解析为 JSON（协议被日志污染）。"
-                            f"\nstdout_tail:\n{noise}{extra}"
-                        )
-                    continue
-        finally:
-            done.set()
+            try:
+                resp = json.loads(s)
+                break
+            except json.JSONDecodeError:
+                skipped.append(s)
+                if len(skipped) >= max_skip:
+                    stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                    extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                    noise = "\n".join(skipped[-10:])
+                    raise RuntimeError(
+                        "Qwen3-TTS worker 输出无法解析为 JSON（协议被日志污染）。"
+                        f"\nstdout_tail:\n{noise}{extra}"
+                    )
+                continue
 
         if not resp.get("ok"):
             err = str(resp.get("error", "unknown error"))
@@ -953,53 +976,40 @@ class _QwenTtsWorker:
         self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
 
-        begin = time.monotonic()
-        done = threading.Event()
-
-        def _heartbeat() -> None:
-            while not done.wait(10.0):
-                elapsed = time.monotonic() - begin
-                logger.info(f"Qwen3-TTS batch generating... ({elapsed:.1f}s) items={len(items)}")
-
-        threading.Thread(target=_heartbeat, daemon=True).start()
-
         skipped: list[str] = []
         max_skip = 50
-        try:
-            while True:
-                check_cancelled()
-                line = self._read_stdout_line(timeout_sec=0.2)
-                if line is None:
-                    if self._proc.poll() is not None:
-                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
-                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                        raise RuntimeError("Qwen3-TTS worker has exited" + extra)
-                    continue
-                if not line:
+        while True:
+            check_cancelled()
+            line = self._read_stdout_line(timeout_sec=0.2)
+            if line is None:
+                if self._proc.poll() is not None:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                    raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
+                    raise RuntimeError("Qwen3-TTS worker has exited" + extra)
+                continue
+            if not line:
+                stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
 
-                s = line.strip()
-                if not s:
-                    continue
+            s = line.strip()
+            if not s:
+                continue
 
-                try:
-                    resp = json.loads(s)
-                    break
-                except json.JSONDecodeError:
-                    skipped.append(s)
-                    if len(skipped) >= max_skip:
-                        stderr_tail = "\n".join(list(self._stderr_tail)).strip()
-                        extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                        noise = "\n".join(skipped[-10:])
-                        raise RuntimeError(
-                            "Qwen3-TTS worker 输出无法解析为 JSON（协议被日志污染）。"
-                            f"\nstdout_tail:\n{noise}{extra}"
-                        )
-                    continue
-        finally:
-            done.set()
+            try:
+                resp = json.loads(s)
+                break
+            except json.JSONDecodeError:
+                skipped.append(s)
+                if len(skipped) >= max_skip:
+                    stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                    extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                    noise = "\n".join(skipped[-10:])
+                    raise RuntimeError(
+                        "Qwen3-TTS worker 输出无法解析为 JSON（协议被日志污染）。"
+                        f"\nstdout_tail:\n{noise}{extra}"
+                    )
+                continue
 
         if not resp.get("ok"):
             err = str(resp.get("error", "unknown error"))
@@ -1209,7 +1219,10 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
         check_cancelled()
         _ensure_wav_max_duration(os.path.join(speaker_dir, f"{spk}.wav"), max_ref_seconds, sample_rate=24000)
     
-    full_wav = np.zeros((0, ))
+    # 使用分块累积，避免对 full_wav 反复 np.concatenate 造成 O(n^2) 内存峰值；
+    # 同时确保全程 float32，避免默认 np.zeros(float64) 导致整体上浮到 float64 占用翻倍。
+    chunks: list[np.ndarray] = []
+    full_samples = 0  # 已累积的总采样点数（24kHz）
 
     qwen_worker: _QwenTtsWorker | None = None
     if tts_method == "qwen":
@@ -1359,13 +1372,16 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
                     logger.warning(f"TTS({tts_method}) failed for segment {i}: {exc}")
                 tts_elapsed = time.monotonic() - tts_begin
             
-            current_full_end = len(full_wav) / 24000.0
+            current_full_end = full_samples / 24000.0
             
             if start > current_full_end:
                 silence_dur = start - current_full_end
-                full_wav = np.concatenate((full_wav, np.zeros((int(silence_dur * 24000), ))))
+                silence_samples = int(silence_dur * 24000)
+                if silence_samples > 0:
+                    chunks.append(np.zeros((silence_samples,), dtype=np.float32))
+                    full_samples += silence_samples
                 
-            new_start = len(full_wav) / 24000.0
+            new_start = full_samples / 24000.0
             line['start'] = new_start
             
             if i < len(transcript) - 1:
@@ -1390,7 +1406,9 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
                 wav_chunk = np.zeros(target_samples, dtype=np.float32)
                 actual_len = desired_len
             
-            full_wav = np.concatenate((full_wav, wav_chunk))
+            wav_chunk = wav_chunk.astype(np.float32, copy=False)
+            chunks.append(wav_chunk)
+            full_samples += int(wav_chunk.shape[0])
             line['end'] = new_start + actual_len
 
             # 段落完成日志：便于在终端观察“是否卡死/进度/耗时”
@@ -1418,12 +1436,32 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
             "为避免产出大量静音，已中止；如确实要用静音补齐请设置 TTS_ALLOW_SILENCE_FALLBACK=1。"
         )
 
+    check_cancelled()
+    if chunks:
+        full_wav = np.concatenate(chunks).astype(np.float32, copy=False)
+    else:
+        full_wav = np.zeros((0,), dtype=np.float32)
+    # 释放分块引用，降低峰值占用
+    del chunks
+
     vocal_wav_path = os.path.join(folder, 'audio_vocals.wav')
     if os.path.exists(vocal_wav_path):
         check_cancelled()
         vocal_wav, _ = librosa.load(vocal_wav_path, sr=24000)
-        if len(full_wav) > 0 and np.max(np.abs(full_wav)) > 0:
-            full_wav = full_wav / np.max(np.abs(full_wav)) * np.max(np.abs(vocal_wav))
+        if full_wav.size > 0:
+            # 避免 np.abs(full_wav) 产生同等大小的临时数组（长音频会非常吃内存）
+            max_val = float(np.max(full_wav))
+            min_val = float(np.min(full_wav))
+            full_peak = max(abs(max_val), abs(min_val))
+            if full_peak > 0.0:
+                v_max = float(np.max(vocal_wav))
+                v_min = float(np.min(vocal_wav))
+                vocal_peak = max(abs(v_max), abs(v_min))
+                if vocal_peak > 0.0:
+                    scale = np.float32(vocal_peak / full_peak)
+                    full_wav *= scale
+        # 释放大数组引用
+        del vocal_wav
             
     check_cancelled()
     save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'), sample_rate=24000)
@@ -1436,6 +1474,7 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
     if os.path.exists(instruments_path):
         check_cancelled()
         instruments_wav, _ = librosa.load(instruments_path, sr=24000)
+        instruments_wav = instruments_wav.astype(np.float32, copy=False)
         
         len_full = len(full_wav)
         len_inst = len(instruments_wav)
@@ -1445,9 +1484,11 @@ def generate_wavs(folder: str, tts_method: str = "bytedance", qwen_tts_batch_siz
         elif len_inst > len_full:
             full_wav = np.pad(full_wav, (0, len_inst - len_full), mode='constant')
             
-        combined_wav = full_wav + instruments_wav
+        # audio_tts.wav 已经写入，这里允许原地相加以避免额外分配
+        full_wav += instruments_wav
+        del instruments_wav
         check_cancelled()
-        save_wav_norm(combined_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
+        save_wav_norm(full_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
         logger.info(f'Generated {os.path.join(folder, "audio_combined.wav")}')
     else:
         logger.warning("No instruments audio found, saving TTS only as combined.")
