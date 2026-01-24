@@ -2,7 +2,7 @@
 
 `YouDub-webui` 是一个基于Gradio的开源项目，它集成了多种AI技术，提供一个可视化的操作界面，用于处理视频的翻译和配音任务。
 
-本项目 fork 并重构自 https://github.com/liuzhao1225/YouDub-webui/blob/master/README.md 。
+本项目 fork 并重构自 https://github.com/liuzhao1225/YouDub-webui/blob/master/README.md ，替换了缺少维护的组件（如 bili-toolman），解决在新版本 CUDA 环境的依赖冲突，并引入 Qwen3-TTS 作为本地 TTS 方案。
 
 ## 核心特性
 
@@ -13,24 +13,23 @@
 3.  **语音识别 (ASR) 与 说话人分离 (Diarization)**:
     *   采用 `faster-whisper` (Large-v3) + `ctranslate2` 进行高精度语音识别。
     *   集成 `pyannote.audio` (兼容 v3.1-v4) 进行说话人区分，支持多角色识别。
-4.  **文本翻译**: 支持 OpenAI 兼容 API，提供串行 (`history`) 和并发 (`guide_parallel`) 两种翻译策略。
+4.  **文本翻译**: 支持 OpenAI 兼容 API 和并发翻译。
 5.  **语音合成 (TTS)** (通过 `TTS_METHOD` 配置):
-    *   **ByteDance (火山引擎)**: 云端 TTS，支持声音克隆（需配置 API）。
-    *   **Qwen3-TTS**: 本地离线 TTS，通过 Worker 子进程运行。
-    *   **Google Gemini**: 实验性支持。
-6.  **视频合成**: 智能音频对齐、变速处理，自动混音背景音轨，生成带字幕的最终视频。
+    *   ByteDance (火山引擎豆包语音大模型)
+    *   Google Gemini TTS
+    *   Qwen3-TTS (本地模型，Qwen3 TTS 实测效果已足够好，推荐使用)
+6.  **视频合成**: 音频对齐、变速处理，自动混音背景音轨，生成带字幕的最终视频，（英语和中文的平均每分钟字/词数存在差别，本项目默认使用1.2倍加速以避免大范围无声片段）
 
 ## 系统要求
 
-*   **操作系统**: Linux (推荐 Ubuntu 22.04+) 或 WSL2。
-*   **Python**: 3.10 或 3.11。
-*   **GPU**: 推荐 NVIDIA GPU，显存 8GB+。
-*   **CUDA**: 可选（如需 GPU 加速，推荐 12.8；使用 `uv sync --extra gpu` 安装 PyTorch cu128 轮子）。
+*   **操作系统**: 本项目只在 Linux（含 WSL2）上进行适配和测试
+*   **Python**: >=3.10
+*   **CUDA**: 可选（由于 Qwen3-TTS 依赖，建议 CUDA 12.8）。
 *   **FFmpeg**: 必须安装并配置在系统 PATH 中。
 
 ## 安装指南
 
-本项目推荐使用 [uv](https://github.com/astral-sh/uv) 进行高效的依赖管理。
+推荐使用 [uv](https://github.com/astral-sh/uv) 进行高效的依赖管理。
 
 ### 1. 克隆仓库
 
@@ -41,11 +40,7 @@ cd YAYD
 
 ### 2. 环境配置与安装
 
-确保已安装 `uv`，然后同步依赖。
-
-#### 依赖 Extras 说明
-
-项目将依赖拆分为多个 extras，支持按需安装：
+项目将依赖拆分为多个 extras：
 
 | Extra | 说明 | 包含内容 |
 |-------|------|----------|
@@ -66,9 +61,6 @@ uv sync --extra gpu
 
 # GPU + 开发工具（开发/测试）
 uv sync --extra gpu --extra dev
-
-# 仅基础依赖（不含 onnxruntime，需手动管理）
-uv sync
 ```
 
 #### PyTorch GPU/CPU 自动选择
@@ -77,13 +69,6 @@ uv sync
 - `--extra gpu` → 从 `pytorch-cu128` index 安装 CUDA 12.8 版本
 - 无 `--extra gpu` → 从 `pytorch-cpu` index 安装 CPU 版本
 
-#### 传统 pip 安装（不推荐）
-
-```bash
-# 建议在虚拟环境中
-pip install -e .
-# GPU 支持需手动安装: pip install onnxruntime-gpu nvidia-cudnn-cu12
-```
 
 ### 3. 安装外部依赖
 
@@ -122,6 +107,18 @@ uv run python scripts/download_models.py
 *   `Systran/faster-whisper-large-v3` (CTranslate2 格式)
 *   `pyannote/speaker-diarization-3.1` + `segmentation-3.0`
 *   `demucs htdemucs_ft` (via torch.hub)
+
+**Qwen3-TTS 模型** (仅当 `TTS_METHOD=qwen` 时需要)：
+
+需手动从 Hugging Face 下载 [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 到 `models/TTS/` 目录：
+```bash
+# 使用 huggingface-cli（推荐）
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir models/TTS/Qwen3-TTS-12Hz-1.7B-Base
+
+# 或使用 git clone（需安装 git-lfs）
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base models/TTS/Qwen3-TTS-12Hz-1.7B-Base
+```
 
 ## 配置指南
 
@@ -168,6 +165,14 @@ QWEN_TTS_PYTHON=.venv/bin/python
 TRANSLATION_STRATEGY=history
 # guide_parallel 模式下的并发数
 TRANSLATION_MAX_CONCURRENCY=4
+
+# --- B站上传配置 (可选) ---
+# cookie 文件路径（由 biliup login 生成）
+BILI_COOKIE_PATH=bili_cookies.json
+# 上传代理（可选，如 socks5h://127.0.0.1:1080）
+BILI_PROXY=
+# 首选上传线路：bda / bda2 / tx / txa / bldsa（留空则自动选择）
+BILI_UPLOAD_CDN=
 ```
 
 ## 使用说明
@@ -190,13 +195,38 @@ uv run youdub
 3.  **分步模式**:
     *   可在各标签页单独执行特定步骤（如仅下载、仅翻译、仅 TTS），便于调试或人工修正中间结果（如修正 `translation.json`）。
 
-### Qwen3-TTS 本地模式配置
+### B 站上传
 
-若使用 `TTS_METHOD=qwen`，需要：
+本项目使用 [biliup](https://github.com/biliup/biliup) 进行 B 站视频上传。
 
-1.  从 Hugging Face 下载 [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 到 `models/TTS/` 目录。
-2.  主工程 `.venv` 已包含 `qwen-tts` 依赖，可直接使用。
-3.  程序运行时会自动拉起 `scripts/qwen_tts_worker.py` 子进程进行推理。
+#### 1. 登录获取 Cookie
+
+首次使用前需要登录 B 站账号生成 `cookies.json`：
+
+```bash
+# 扫码登录（推荐）
+uv run biliup login
+
+# 登录成功后会在当前目录生成 cookies.json
+```
+
+#### 2. 配置 Cookie 路径
+
+将生成的 `cookies.json` 放到项目根目录，或在 `.env` 中指定路径：
+
+```ini
+BILI_COOKIE_PATH=cookies.json
+```
+
+#### 3. 上传视频
+
+在 Web UI 的"上传B站"标签页，输入包含已处理视频的文件夹路径，点击提交即可批量上传。
+
+**注意事项**：
+- 每个视频文件夹需包含 `video.mp4`、`summary.json`、`download.info.json`
+- 上传成功后会生成 `bilibili.json` 标记，避免重复上传
+- 如遇 Cookie 过期，重新运行 `uv run biliup login` 刷新
+- 如需代理，设置 `BILI_PROXY=socks5h://127.0.0.1:1080`
 
 ## 许可证
 
