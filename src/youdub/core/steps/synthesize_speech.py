@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -10,10 +11,8 @@ from typing import Any
 import librosa
 import numpy as np
 import requests
-import torch
 from audiostretchy.stretch import stretch_audio
 from loguru import logger
-from pyannote.audio import Inference, Model
 from scipy.spatial.distance import cosine
 
 from ...config import Settings
@@ -22,7 +21,6 @@ from ..cn_tx import TextNorm
 from ..utils import save_wav, save_wav_norm
 
 # --- Global Caches ---
-_XTTS_MODEL = None
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
 _EMBEDDING_MODEL_LOAD_FAILED = False
@@ -122,6 +120,14 @@ def load_embedding_model() -> None:
         return
 
     try:
+        try:
+            from pyannote.audio import Inference, Model  # type: ignore
+        except Exception as exc:  # pylint: disable=broad-except
+            raise RuntimeError(
+                "缺少依赖 pyannote.audio，无法进行说话人 embedding/音色匹配。"
+                "如不需要该功能，可忽略；否则请安装 pyannote.audio 并准备离线模型缓存。"
+            ) from exc
+
         logger.info("Loading pyannote/embedding model...")
         token = _DEFAULT_SETTINGS.hf_token
         _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
@@ -502,7 +508,11 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
             logger.error(f"Voice cloning upload response is not JSON: status={resp.status_code} text={resp.text[:200]}")
             return False
             
-        if resp_json.get("base_resp", {}).get("status_code") == 0:
+        # Check response status (API can return PascalCase or snake_case)
+        base_resp = resp_json.get("BaseResp") or resp_json.get("base_resp", {})
+        status_code = base_resp.get("StatusCode") if "StatusCode" in base_resp else base_resp.get("status_code")
+        
+        if status_code == 0:
             logger.info(f"Successfully uploaded audio for cloning: {speaker_id}")
             return True
         else:
@@ -622,10 +632,8 @@ def bytedance_tts(
     for _ in range(3):
         try:
             # Use V3 API for cloned voices (ICL 2.0), V1 API for preset voices
-            if is_cloned:
-                audio_data = bytedance_tts_v3_api(text, speaker=voice_type, use_cloned_voice=True)
-            else:
-                audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=False)
+            # Use V1 API for both, as V3 gives 55000000 error for ICL currently 
+            audio_data = bytedance_tts_api(text, voice_type=voice_type, use_cloned_voice=is_cloned)
             if audio_data:
                 with open(output_path, "wb") as f:
                     f.write(audio_data)
@@ -648,104 +656,104 @@ def bytedance_tts(
             time.sleep(0.5)
 
 
-# --- XTTS Logic ---
+# --- Qwen3-TTS (Worker) Logic ---
 
-def init_xtts(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
-    load_xtts_model(settings=settings, model_manager=model_manager)
-
-
-def load_xtts_model(
-    model_path: str | None = None,
-    device: str = 'auto',
-    settings: Settings | None = None,
-    model_manager: ModelManager | None = None,
-) -> None:
-    global _XTTS_MODEL
-    if _XTTS_MODEL is not None:
-        return
-        
-    settings = settings or _DEFAULT_SETTINGS
-    model_manager = model_manager or _DEFAULT_MODEL_MANAGER
-
-    try:
-        from TTS.api import TTS
-    except ImportError:
-        logger.error("TTS module not found. Please install 'TTS' or use ByteDance TTS.")
-        raise
-
-    model_manager.enforce_offline()
-
-    if model_path is None:
-        resolved = settings.resolve_path(settings.xtts_model_path)
-        model_path = str(resolved) if resolved else ""
-
-    model_path_obj = Path(model_path)
-    if not model_path_obj.exists():
-        raise ModelCheckError(
-            f"XTTS 模型目录不存在：{model_path_obj}。请提前下载 XTTS v2 到本地并设置 XTTS_MODEL_PATH。"
-        )
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-    logger.info(f'Loading XTTS model from {model_path}')
-    t_start = time.time()
-
-    # Explicitly verify local files to prevent auto-download/hashing behavior
-    checkpoint = os.path.join(model_path, "model.pth")
-    config = os.path.join(model_path, "config.json")
-    vocab = os.path.join(model_path, "vocab.json")
-
-    if os.path.exists(checkpoint) and os.path.exists(config):
-        # Pass empty model_name to avoid lookup. 
-        # For XTTS, it seems passing the directory as model_path is preferred or it handles finding model.pth inside.
-        _XTTS_MODEL = TTS(model_name="", model_path=model_path, config_path=config, progress_bar=False).to(device)
-    else:
-        # Fallback to default behavior if specific files aren't found
-        _XTTS_MODEL = TTS(model_path).to(device)
-    t_end = time.time()
-    logger.info(f'XTTS model loaded in {t_end - t_start:.2f}s')
+_QWEN_WORKER_READY = "__READY__"
+_QWEN_WORKER_STUB_ENV = "YOUDUB_QWEN_WORKER_STUB"
 
 
-def xtts_tts(
-    text: str,
-    output_path: str,
-    speaker_wav: str,
-    model_name: str | None = None,
-    device: str = 'auto',
-    language: str = 'zh-cn',
-    settings: Settings | None = None,
-    model_manager: ModelManager | None = None,
-) -> None:
-    global _XTTS_MODEL
-    
-    if os.path.exists(output_path) and is_valid_wav(output_path):
-        logger.info(f'XTTS {text[:20]}... exists (verified)')
-        return
-    elif os.path.exists(output_path):
-        logger.warning(f"Removing invalid cached file: {output_path}")
-        os.remove(output_path)
-    
-    if _XTTS_MODEL is None:
-        load_xtts_model(model_name, device, settings=settings, model_manager=model_manager)
-    
-    for _ in range(3):
+def _get_qwen_worker_script_path() -> Path:
+    # Repository layout:
+    #   repo/scripts/qwen_tts_worker.py
+    #   repo/src/youdub/core/steps/synthesize_speech.py  (this file)
+    repo_root = Path(__file__).resolve().parents[4]
+    return repo_root / "scripts" / "qwen_tts_worker.py"
+
+
+class _QwenTtsWorker:
+    def __init__(self, python_exe: str, model_path: str, stub: bool = False):
+        script = _get_qwen_worker_script_path()
+        if not script.exists():
+            raise ModelCheckError(f"找不到 Qwen3-TTS worker 脚本：{script}")
+
+        cmd = [python_exe, "-u", str(script), "--model-path", model_path]
+        if stub:
+            cmd.append("--stub")
+
         try:
-            wav = _XTTS_MODEL.tts(text, speaker_wav=speaker_wav, language=language) # type: ignore
-            wav = np.array(wav)
-            save_wav(wav, output_path)
-            
-            if is_valid_wav(output_path):
-                logger.info(f'XTTS Generated: {text[:20]}...')
-                break
-            else:
-                logger.warning("XTTS generated invalid wav file.")
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-        except Exception as e:
-            logger.warning(f'XTTS failed: {e}')
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            self._proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as exc:
+            raise ModelCheckError(f"无法启动 Qwen3-TTS worker：{exc}") from exc
+
+        assert self._proc.stdout is not None
+        ready = self._proc.stdout.readline().strip()
+        if ready != _QWEN_WORKER_READY:
+            self.close()
+            raise ModelCheckError(f"Qwen3-TTS worker 启动失败：{ready}")
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "_QwenTtsWorker":
+        py = settings.resolve_path(settings.qwen_tts_python_path)
+        if not py or not py.exists():
+            raise ModelCheckError(
+                f"Qwen3-TTS Python 不存在：{py}。请创建独立环境安装 qwen-tts，并设置 QWEN_TTS_PYTHON。"
+            )
+
+        model_dir = settings.resolve_path(settings.qwen_tts_model_path)
+        if not model_dir or not model_dir.exists():
+            raise ModelCheckError(
+                f"Qwen3-TTS 模型目录不存在：{model_dir}。请先下载模型权重到本地并设置 QWEN_TTS_MODEL_PATH。"
+            )
+
+        stub = os.getenv(_QWEN_WORKER_STUB_ENV, "").strip() in {"1", "true", "TRUE", "yes", "YES"}
+        return cls(python_exe=str(py), model_path=str(model_dir), stub=stub)
+
+    def synthesize(self, text: str, speaker_wav: str, output_path: str, language: str = "Auto") -> None:
+        if self._proc.poll() is not None:
+            raise RuntimeError("Qwen3-TTS worker 已退出")
+
+        req = {
+            "cmd": "synthesize",
+            "text": text,
+            "language": language,
+            "speaker_wav": speaker_wav,
+            "output_path": output_path,
+        }
+
+        assert self._proc.stdin is not None
+        assert self._proc.stdout is not None
+        self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+
+        line = self._proc.stdout.readline()
+        if not line:
+            raise RuntimeError("Qwen3-TTS worker 无输出")
+
+        resp = json.loads(line)
+        if not resp.get("ok"):
+            raise RuntimeError(str(resp.get("error", "unknown error")))
+
+    def close(self) -> None:
+        proc = getattr(self, "_proc", None)
+        if not proc:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 # --- Gemini TTS Logic ---
@@ -868,7 +876,9 @@ def gemini_tts(
 
 def init_TTS(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
     """Pre-initialize models if needed (mainly for warming up)."""
-    pass
+    # Qwen3-TTS runs in an external worker process (separate venv) to avoid dependency conflicts.
+    # Warm-up is intentionally skipped here to avoid heavy model load at pipeline startup.
+    return
 
 
 # --- Main Generation Logic ---
@@ -891,53 +901,64 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
     logger.info(f'Found {num_speakers} speakers')
     
     full_wav = np.zeros((0, ))
-    
-    for i, line in enumerate(transcript):
-        speaker = line['speaker']
-        text = preprocess_text(line['translation'])
-        output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
-        speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
-        if tts_method == 'xtts':
-             xtts_tts(text, output_path, speaker_wav)
-        elif tts_method == 'gemini':
-             gemini_tts(text, output_path)
-        else:
-             bytedance_tts(text, output_path, speaker_wav)
+
+    qwen_worker: _QwenTtsWorker | None = None
+    if tts_method == "qwen":
+        qwen_worker = _QwenTtsWorker.from_settings(_DEFAULT_SETTINGS)
+
+    try:
+        for i, line in enumerate(transcript):
+            speaker = line['speaker']
+            text = preprocess_text(line['translation'])
+            output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
+            speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
+            if tts_method == 'qwen' and qwen_worker is not None:
+                try:
+                    qwen_worker.synthesize(text, speaker_wav, output_path, language="Auto")
+                except Exception as exc:
+                    logger.warning(f"Qwen3-TTS worker failed for segment {i}: {exc}")
+            elif tts_method == 'gemini':
+                gemini_tts(text, output_path)
+            else:
+                bytedance_tts(text, output_path, speaker_wav)
             
-        # Audio stitching and timing adjustment
-        start = line['start']
-        original_length = line['end'] - start
-        
-        current_full_end = len(full_wav) / 24000.0
-        
-        # If there is a gap between current end and next start, fill with silence
-        if start > current_full_end:
-            silence_dur = start - current_full_end
-            full_wav = np.concatenate((full_wav, np.zeros((int(silence_dur * 24000), ))))
+            # Audio stitching and timing adjustment
+            start = line['start']
+            original_length = line['end'] - start
             
-        new_start = len(full_wav) / 24000.0
-        line['start'] = new_start
-        
-        if i < len(transcript) - 1:
-            next_line = transcript[i+1]
-            target_end = min(new_start + original_length, next_line['end'])
-        else:
-            target_end = new_start + original_length
+            current_full_end = len(full_wav) / 24000.0
             
-        desired_len = target_end - new_start
-        
-        # Adjust generated wav to fit desired length
-        if os.path.exists(output_path) and is_valid_wav(output_path):
-            wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
-        else:
-            logger.warning(f"TTS generation failed via {tts_method} for segment {i}, using silence fallback.")
-            # Fallback to silence
-            target_samples = int(desired_len * 24000)
-            wav_chunk = np.zeros(target_samples, dtype=np.float32)
-            actual_len = desired_len
-        
-        full_wav = np.concatenate((full_wav, wav_chunk))
-        line['end'] = new_start + actual_len
+            # If there is a gap between current end and next start, fill with silence
+            if start > current_full_end:
+                silence_dur = start - current_full_end
+                full_wav = np.concatenate((full_wav, np.zeros((int(silence_dur * 24000), ))))
+                
+            new_start = len(full_wav) / 24000.0
+            line['start'] = new_start
+            
+            if i < len(transcript) - 1:
+                next_line = transcript[i+1]
+                target_end = min(new_start + original_length, next_line['end'])
+            else:
+                target_end = new_start + original_length
+                
+            desired_len = target_end - new_start
+            
+            # Adjust generated wav to fit desired length
+            if os.path.exists(output_path) and is_valid_wav(output_path):
+                wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
+            else:
+                logger.warning(f"TTS generation failed via {tts_method} for segment {i}, using silence fallback.")
+                # Fallback to silence
+                target_samples = int(desired_len * 24000)
+                wav_chunk = np.zeros(target_samples, dtype=np.float32)
+                actual_len = desired_len
+            
+            full_wav = np.concatenate((full_wav, wav_chunk))
+            line['end'] = new_start + actual_len
+    finally:
+        if qwen_worker is not None:
+            qwen_worker.close()
 
     # Mixing with background music
     vocal_wav_path = os.path.join(folder, 'audio_vocals.wav')

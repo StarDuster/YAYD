@@ -38,7 +38,6 @@ def run_pipeline(
     device,
     shifts,
     whisper_model,
-    whisper_download_root,
     whisper_batch_size,
     whisper_diarization,
     whisper_min_speakers,
@@ -63,7 +62,6 @@ def run_pipeline(
             device=device,
             shifts=shifts,
             whisper_model=whisper_model,
-            whisper_download_root=whisper_download_root,
             whisper_batch_size=whisper_batch_size,
             whisper_diarization=whisper_diarization,
             whisper_min_speakers=whisper_min_speakers,
@@ -109,7 +107,6 @@ do_everything_interface = gr.Interface(
         gr.Radio(["auto", "cuda", "cpu"], label="Demucs Device", value=settings.demucs_device),
         gr.Slider(minimum=0, maximum=10, step=1, label="Number of shifts", value=settings.demucs_shifts),
         gr.Textbox(label="Whisper Model", value=str(settings.whisper_model_path)),
-        gr.Textbox(label="Whisper Download Root", value=str(settings.whisper_download_root), visible=False),
         gr.Slider(minimum=1, maximum=128, step=1, label="Whisper Batch Size", value=settings.whisper_batch_size),
         gr.Checkbox(label="Whisper Diarization", value=True),
         gr.Radio([None, 1, 2, 3, 4, 5, 6, 7, 8, 9], label="Whisper Min Speakers", value=None),
@@ -120,7 +117,7 @@ do_everything_interface = gr.Interface(
             value=settings.translation_target_language,
         ),
         gr.Dropdown(
-            ["bytedance", "xtts", "gemini"],
+            ["bytedance", "qwen", "gemini"],
             label="TTS Method",
             value=settings.tts_method
         ),
@@ -185,10 +182,9 @@ demucs_interface = gr.Interface(
 )
 
 whisper_inference = gr.Interface(
-    fn=lambda folder, model, download_root, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
+    fn=lambda folder, model, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
         [
             model_manager._whisper_requirement().name,  # type: ignore[attr-defined]
-            model_manager._whisper_align_requirement().name,  # type: ignore[attr-defined]
             *(  # include diarization requirement only when enabled
                 [model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
                 if diarization
@@ -198,7 +194,6 @@ whisper_inference = gr.Interface(
         transcribe_all_audio_under_folder,
         folder,
         model_name=model,
-        download_root=download_root,
         device=device,
         batch_size=batch_size,
         diarization=diarization,
@@ -210,7 +205,6 @@ whisper_inference = gr.Interface(
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Textbox(label="Model", value=str(settings.whisper_model_path)),
-        gr.Textbox(label="Download Root", value=str(settings.whisper_download_root), visible=False),
         gr.Radio(["auto", "cuda", "cpu"], label="Device", value=settings.demucs_device),
         gr.Slider(minimum=1, maximum=128, step=1, label="Batch Size", value=settings.whisper_batch_size),
         gr.Checkbox(label="Diarization", value=True),
@@ -221,7 +215,9 @@ whisper_inference = gr.Interface(
 )
 
 translation_interface = gr.Interface(
-    fn=translate_all_transcript_under_folder,
+    fn=lambda folder, target_language: translate_all_transcript_under_folder(
+        folder, target_language, settings=settings
+    ),
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Dropdown(
@@ -240,7 +236,12 @@ def _tts_wrapper(folder, tts_method):
         if tts_method == "bytedance"
         else [model_manager._gemini_tts_requirement().name]  # type: ignore[attr-defined]
         if tts_method == "gemini"
-        else [model_manager._xtts_requirement().name]  # type: ignore[attr-defined]
+        else [
+            model_manager._qwen_tts_runtime_requirement().name,  # type: ignore[attr-defined]
+            model_manager._qwen_tts_weights_requirement().name,  # type: ignore[attr-defined]
+        ]
+        if tts_method == "qwen"
+        else []
     )
     return _safe_run(
         names,
@@ -255,7 +256,7 @@ tts_interface = gr.Interface(
     inputs=[
         gr.Textbox(label="Folder", value=str(settings.root_folder)),
         gr.Dropdown(
-            ["bytedance", "xtts", "gemini"],
+            ["bytedance", "qwen", "gemini"],
             label="TTS Method",
             value=settings.tts_method
         ),

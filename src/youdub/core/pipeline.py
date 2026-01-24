@@ -50,7 +50,6 @@ class VideoPipeline:
         device: str,
         shifts: int,
         whisper_model: str,
-        whisper_download_root: str,
         whisper_batch_size: int,
         whisper_diarization: bool,
         whisper_min_speakers: int | None,
@@ -96,7 +95,6 @@ class VideoPipeline:
                 transcribe.transcribe_all_audio_under_folder(
                     folder,
                     model_name=whisper_model,
-                    download_root=whisper_download_root,
                     device=device,
                     batch_size=whisper_batch_size,
                     diarization=whisper_diarization,
@@ -107,7 +105,9 @@ class VideoPipeline:
                 )
                 transcribe.unload_all_models()
 
-                translate.translate_all_transcript_under_folder(folder, target_language=translation_target_language)
+                translate.translate_all_transcript_under_folder(
+                    folder, target_language=translation_target_language, settings=self.settings
+                )
                 synthesize_speech.generate_all_wavs_under_folder(
                     folder, 
                     tts_method=tts_method,
@@ -135,7 +135,6 @@ class VideoPipeline:
         device: str | None = None,
         shifts: int | None = None,
         whisper_model: str | None = None,
-        whisper_download_root: str | None = None,
         whisper_batch_size: int | None = None,
         whisper_diarization: bool = True,
         whisper_min_speakers: int | None = None,
@@ -156,7 +155,6 @@ class VideoPipeline:
         device = device or self.settings.demucs_device
         shifts = self.settings.demucs_shifts if shifts is None else shifts
         whisper_model = whisper_model or str(self.settings.whisper_model_path)
-        whisper_download_root = whisper_download_root or str(self.settings.whisper_download_root)
         whisper_batch_size = whisper_batch_size or self.settings.whisper_batch_size
         translation_target_language = translation_target_language or self.settings.translation_target_language
         tts_method = tts_method or self.settings.tts_method
@@ -164,15 +162,17 @@ class VideoPipeline:
         required_models = [
             self.model_manager._demucs_requirement().name,  # type: ignore[attr-defined]
             self.model_manager._whisper_requirement().name,  # type: ignore[attr-defined]
-            self.model_manager._whisper_align_requirement().name,  # type: ignore[attr-defined]
         ]
         if whisper_diarization:
             required_models.append(self.model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
             
-        if tts_method == "xtts":
-             required_models.append(self.model_manager._xtts_requirement().name)  # type: ignore[attr-defined]
+        if tts_method == "gemini":
+            required_models.append(self.model_manager._gemini_tts_requirement().name)  # type: ignore[attr-defined]
+        elif tts_method == "qwen":
+            required_models.append(self.model_manager._qwen_tts_runtime_requirement().name)  # type: ignore[attr-defined]
+            required_models.append(self.model_manager._qwen_tts_weights_requirement().name)  # type: ignore[attr-defined]
         else:
-             required_models.append(self.model_manager._bytedance_requirement().name)  # type: ignore[attr-defined]
+            required_models.append(self.model_manager._bytedance_requirement().name)  # type: ignore[attr-defined]
         self._ensure_models(required_models)
 
         url = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
@@ -182,7 +182,7 @@ class VideoPipeline:
         with ThreadPoolExecutor() as executor:
             executor.submit(separate_vocals.init_demucs, self.settings, self.model_manager)
             executor.submit(synthesize_speech.init_TTS, self.settings, self.model_manager)
-            executor.submit(transcribe.init_whisperx, self.settings, self.model_manager)
+            executor.submit(transcribe.init_asr, self.settings, self.model_manager)
 
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
@@ -199,7 +199,6 @@ class VideoPipeline:
                     device,
                     shifts,
                     whisper_model,
-                    whisper_download_root,
                     whisper_batch_size,
                     whisper_diarization,
                     whisper_min_speakers,
@@ -230,7 +229,6 @@ class VideoPipeline:
                         device,
                         shifts,
                         whisper_model,
-                        whisper_download_root,
                         whisper_batch_size,
                         whisper_diarization,
                         whisper_min_speakers,

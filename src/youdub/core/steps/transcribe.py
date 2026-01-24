@@ -1,8 +1,7 @@
+from __future__ import annotations
+
 import json
 import os
-import shutil
-import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -11,326 +10,146 @@ import librosa
 import numpy as np
 import torch
 from loguru import logger
-from packaging import version
 
 from ...config import Settings
 from ...models import ModelCheckError, ModelManager
 from ..utils import save_wav
 
 
-def _import_whisperx():
+def _import_faster_whisper():
     try:
-        import whisperx  # type: ignore
+        from faster_whisper import BatchedInferencePipeline, WhisperModel  # type: ignore
     except Exception as exc:  # pylint: disable=broad-except
         raise RuntimeError(
-            "导入 WhisperX 失败，语音识别功能不可用。\n"
-            "常见原因：`numpy/transformers` 版本不兼容或安装不完整。\n"
-            "建议在当前虚拟环境中执行：\n"
-            "`pip install -U 'numpy<2'` 或按 `pyproject.toml` 重装依赖。\n"
+            "缺少依赖 faster-whisper，语音识别功能不可用。\n"
+            "请在当前虚拟环境中安装：`pip install -U faster-whisper`（或使用 `uv sync`）。\n"
             f"原始错误：{exc}"
         ) from exc
-    return whisperx
+    return WhisperModel, BatchedInferencePipeline
 
-# Global model instances for caching
-_WHISPER_MODEL = None
-_DIARIZE_MODEL = None
-_ALIGN_MODEL = None
-_LANGUAGE_CODE = None
-_ALIGN_METADATA = None
 
 _DEFAULT_SETTINGS = Settings()
 _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
 
+# --- Global caches ---
+_ASR_MODEL = None
+_ASR_PIPELINE = None
+_ASR_KEY: str | None = None
+
+_DIARIZATION_PIPELINE = None
+_DIARIZATION_KEY: str | None = None
+
 
 def unload_all_models() -> None:
-    global _WHISPER_MODEL, _DIARIZE_MODEL, _ALIGN_MODEL
-    
+    global _ASR_MODEL, _ASR_PIPELINE, _DIARIZATION_PIPELINE
+
     cleared = False
-    if _WHISPER_MODEL is not None:
-        del _WHISPER_MODEL
-        _WHISPER_MODEL = None
+    if _ASR_PIPELINE is not None:
+        del _ASR_PIPELINE
+        _ASR_PIPELINE = None
         cleared = True
-    if _DIARIZE_MODEL is not None:
-        del _DIARIZE_MODEL
-        _DIARIZE_MODEL = None
+    if _ASR_MODEL is not None:
+        del _ASR_MODEL
+        _ASR_MODEL = None
         cleared = True
-    if _ALIGN_MODEL is not None:
-        del _ALIGN_MODEL
-        _ALIGN_MODEL = None
+    if _DIARIZATION_PIPELINE is not None:
+        del _DIARIZATION_PIPELINE
+        _DIARIZATION_PIPELINE = None
         cleared = True
-        
+
     if cleared:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         import gc
-        gc.collect()
-        logger.info("WhisperX models unloaded")
 
+        gc.collect()
+        logger.info("ASR/diarization models unloaded")
 
 
 def _ensure_offline_mode() -> None:
-    """Prevent unexpected online downloads."""
+    """Prevent unexpected online downloads (Hugging Face)."""
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("WHISPERX_LOCAL_FILES_ONLY", "1")
 
 
-def _ensure_whisper_assets(
+def _ensure_assets(
     settings: Settings,
     model_manager: ModelManager,
-    require_diarization: bool = True,
+    require_diarization: bool,
 ) -> None:
     model_manager.enforce_offline()
-    # Only check ASR/align/diarization related assets
-    names = [
-        model_manager._whisper_requirement().name,
-        model_manager._whisper_align_requirement().name,
-    ]
+    names = [model_manager._whisper_requirement().name]  # type: ignore[attr-defined]
     if require_diarization:
-        names.append(model_manager._whisper_diarization_requirement().name)
+        names.append(model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
     model_manager.ensure_ready(names=names)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 def _default_compute_type(device: str) -> str:
-    # CTranslate2 default float16 can be unsupported/slow on CPU; int8 is a safer default.
     return "float16" if device == "cuda" else "int8"
 
 
-def _looks_like_transformers_model_dir(path: str) -> bool:
-    if not path or not os.path.isdir(path):
-        return False
-    has_config = os.path.isfile(os.path.join(path, "config.json"))
-    has_weights = any(
-        os.path.isfile(os.path.join(path, fname))
-        for fname in ("pytorch_model.bin", "model.safetensors")
-    )
-    return has_config and has_weights
+def load_asr_model(
+    model_dir: str,
+    device: str = "auto",
+    compute_type: str | None = None,
+    use_batched: bool = True,
+    settings: Settings | None = None,
+    model_manager: ModelManager | None = None,
+) -> None:
+    global _ASR_MODEL, _ASR_PIPELINE, _ASR_KEY
 
-
-def _ensure_ct2_model(transformers_model_dir: str, output_dir: str, quantization: str) -> str:
-    model_bin = os.path.join(output_dir, "model.bin")
-    if os.path.isfile(model_bin):
-        return output_dir
-
-    os.makedirs(output_dir, exist_ok=True)
-    converter = shutil.which("ct2-transformers-converter")
-    if not converter:
-        # Check in the same dir as the python executable
-        candidate = os.path.join(os.path.dirname(sys.executable), "ct2-transformers-converter")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            converter = candidate
-            
-    if not converter:
-        raise RuntimeError(
-            "ct2-transformers-converter not found in PATH; please install ctranslate2."
-        )
-
-    logger.info(
-        f"Converting Transformers Whisper model to CTranslate2 (quantization={quantization})..."
-    )
-    subprocess.run(
-        [
-            converter,
-            "--model",
-            transformers_model_dir,
-            "--output_dir",
-            output_dir,
-            "--quantization",
-            quantization,
-            "--force",
-        ],
-        check=True,
-    )
-    if not os.path.isfile(model_bin):
-        raise RuntimeError(f"CTranslate2 conversion finished but missing {model_bin}")
-    return output_dir
-
-
-def init_whisperx(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
-    
-    _ensure_whisper_assets(settings, model_manager)
-    load_whisper_model(
-        model_name=str(settings.whisper_model_path),
-        download_root=str(settings.whisper_download_root),
+
+    _ensure_assets(settings, model_manager, require_diarization=False)
+    _ensure_offline_mode()
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if compute_type is None:
+        compute_type = os.getenv("WHISPER_COMPUTE_TYPE") or _default_compute_type(device)
+
+    model_path = Path(model_dir)
+    if not model_path.exists():
+        raise ModelCheckError(
+            f"Whisper 模型目录不存在：{model_path}。请先下载 faster-whisper CTranslate2 模型并设置 WHISPER_MODEL_PATH。"
+        )
+    if model_path.is_dir() and not (model_path / "model.bin").exists():
+        raise ModelCheckError(f"Whisper CTranslate2 模型缺少 model.bin：{model_path}")
+
+    key = f"{model_path.absolute()}|device={device}|compute={compute_type}|batched={int(use_batched)}"
+    if _ASR_KEY == key and _ASR_MODEL is not None:
+        return
+
+    WhisperModel, BatchedInferencePipeline = _import_faster_whisper()
+
+    logger.info(f"Loading Whisper model from {model_path} (device={device}, compute_type={compute_type})")
+    t0 = time.time()
+    _ASR_MODEL = WhisperModel(str(model_path), device=device, compute_type=compute_type)
+    _ASR_PIPELINE = BatchedInferencePipeline(model=_ASR_MODEL) if use_batched else None
+    _ASR_KEY = key
+    logger.info(f"Loaded Whisper model in {time.time() - t0:.2f}s")
+
+
+def init_asr(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
+    settings = settings or _DEFAULT_SETTINGS
+    model_manager = model_manager or _DEFAULT_MODEL_MANAGER
+    load_asr_model(
+        model_dir=str(settings.whisper_model_path),
         device="auto",
         settings=settings,
         model_manager=model_manager,
     )
-    load_align_model(settings=settings, model_manager=model_manager)
-    load_diarize_model(settings=settings, model_manager=model_manager)
 
 
-def load_whisper_model(
-    model_name: str = "large-v3",
-    download_root: str = "models/ASR/whisper",
-    device: str = "auto",
-    compute_type: str | None = None,
-    local_files_only: bool | None = None,
-    settings: Settings | None = None,
-    model_manager: ModelManager | None = None,
-    require_diarization: bool = True,
-) -> None:
-    global _WHISPER_MODEL
-    
-    settings = settings or _DEFAULT_SETTINGS
-    model_manager = model_manager or _DEFAULT_MODEL_MANAGER
-    
-    _ensure_whisper_assets(settings, model_manager, require_diarization=require_diarization)
-    _ensure_offline_mode()
-
-    if model_name == "large":
-        model_name = "large-v3"
-        
-    if _WHISPER_MODEL is not None:
-        return
-
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-    # --- EARLY ENVIRONMENT SETUP ---
-    # We must set HF_HOME/TORCH_HOME before ANY call to whisperx (which might import pyannote)
-    # to ensure the library picks up the correct cache paths.
-    if require_diarization and settings.whisper_diarization_model_dir:
-        diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
-        if diar_dir and diar_dir.exists():
-            logger.info(f"Using Diarization dir as unified HF_HOME: {diar_dir}")
-            os.environ["TRANSFORMERS_CACHE"] = str(diar_dir)
-            os.environ["HF_HOME"] = str(diar_dir)
-            os.environ["TORCH_HOME"] = str(Path.home() / ".cache" / "torch")
-        else:
-             logger.warning(f"Diarization is required but path {diar_dir} is invalid.")
-             
-    elif settings.whisper_align_model_dir:
-        # Fallback to align dir if no diarization
-        align_dir = settings.resolve_path(settings.whisper_align_model_dir)
-        if align_dir and align_dir.exists():
-             logger.info(f"Using Align dir as unified HF_HOME: {align_dir}")
-             os.environ["TRANSFORMERS_CACHE"] = str(align_dir)
-             os.environ["HF_HOME"] = str(align_dir)
-             
-    if compute_type is None:
-        compute_type = os.getenv("WHISPERX_COMPUTE_TYPE") or _default_compute_type(device)
-        
-    if local_files_only is None:
-        local_files_only = True
-
-    model_path = Path(model_name)
-    if not model_path.exists():
-        raise ModelCheckError(
-            f"WhisperX 模型未找到：{model_path}。请先手动下载/转换为 CTranslate2 模型并设置 WHISPERX_MODEL_PATH。"
-        )
-        
-    download_root_path = Path(download_root)
-    if not download_root_path.exists():
-        raise ModelCheckError(
-            f"WhisperX 模型根目录不存在：{download_root_path}。请检查 WHISPERX_DOWNLOAD_ROOT。"
-        )
-
-    logger.info(f"Loading WhisperX model from {model_path}")
-    t_start = time.time()
-
-    enable_ct2_convert = _env_bool("WHISPERX_ENABLE_CT2_CONVERT", default=False)
-    # Basic torch version check for safety with .bin files
-    try:
-        torch_ver = version.parse(torch.__version__.split("+", 1)[0])
-        torch_ok_for_pt = torch_ver >= version.parse("2.6")
-    except Exception:
-        torch_ok_for_pt = False
-
-    def maybe_convert(transformers_model_dir: str) -> str | None:
-        if not _looks_like_transformers_model_dir(transformers_model_dir):
-            return None
-            
-        if not enable_ct2_convert:
-            logger.warning(
-                f"Found Transformers Whisper weights at {transformers_model_dir}, but WhisperX expects a CTranslate2 "
-                "model (model.bin). Set WHISPERX_ENABLE_CT2_CONVERT=1 (and torch>=2.6) to convert offline, or set "
-                "WHISPERX_MODEL_PATH to an existing CTranslate2 model directory."
-            )
-            if local_files_only:
-                raise ModelCheckError(
-                    "WHISPERX_LOCAL_FILES_ONLY 已开启，但提供的是 Transformers 权重且未启用转换。"
-                    "请先本地转换或关闭本步骤。"
-                )
-            return None
-            
-        if not torch_ok_for_pt:
-            raise RuntimeError(
-                "Transformers .bin weights require torch>=2.6 to load (Transformers safety restriction). "
-                "Either upgrade torch, re-download weights in safetensors format, or use the pre-converted "
-                "faster-whisper model (CTranslate2 model.bin)."
-            )
-            
-        quantization = os.getenv("WHISPERX_QUANTIZATION") or compute_type
-        ct2_out_dir = os.getenv("WHISPERX_CT2_MODEL_PATH") or os.path.join(
-            transformers_model_dir, f"ctranslate2-{quantization}"
-        )
-        return _ensure_ct2_model(transformers_model_dir, ct2_out_dir, quantization)
-
-    converted = maybe_convert(str(model_path))
-    if converted:
-        model_name = converted
-    else:
-        model_name = str(model_path)
-
-    whisperx = _import_whisperx()
-    _WHISPER_MODEL = whisperx.load_model(
-        model_name,
-        download_root=str(download_root_path),
-        device=device,
-        compute_type=compute_type,
-    )
-    t_end = time.time()
-    logger.info(f"Loaded WhisperX model: {model_name} in {t_end - t_start:.2f}s")
-
-
-def load_align_model(
-    language: str = "en",
-    device: str = "auto",
-    settings: Settings | None = None,
-    model_manager: ModelManager | None = None,
-) -> None:
-    global _ALIGN_MODEL, _LANGUAGE_CODE, _ALIGN_METADATA
-    
-    if _ALIGN_MODEL is not None and _LANGUAGE_CODE == language:
-        return
-        
-    settings = settings or _DEFAULT_SETTINGS
-    model_manager = model_manager or _DEFAULT_MODEL_MANAGER
-    
-    _ensure_whisper_assets(settings, model_manager, require_diarization=False)
-    _ensure_offline_mode()
-    
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-    _LANGUAGE_CODE = language
-    align_dir = settings.resolve_path(settings.whisper_align_model_dir)
-    
-    if align_dir and not align_dir.exists():
-        raise ModelCheckError(f"WhisperX 对齐模型目录不存在：{align_dir}")
-        
-    if settings.whisper_align_model_dir:
-        # We assume align models are linked into diarization dir if diarization is enabled,
-        # or we set HF_HOME to align dir if diarization is disabled?
-        # To be safe, if we are in this function, we probably want a single consistent cache.
-        # But if we use diarization dir as main cache, we are good.
-        pass
-
-    t_start = time.time()
-    whisperx = _import_whisperx()
-    _ALIGN_MODEL, _ALIGN_METADATA = whisperx.load_align_model(language_code=_LANGUAGE_CODE, device=device)
-    t_end = time.time()
-    logger.info(f"Loaded alignment model: {_LANGUAGE_CODE} in {t_end - t_start:.2f}s")
+def _find_pyannote_config(root_dir: Path) -> Path | None:
+    if not root_dir.exists():
+        return None
+    for path in root_dir.rglob("config.yaml"):
+        if "snapshots" in path.parts:
+            return path
+    return None
 
 
 def load_diarize_model(
@@ -338,150 +157,156 @@ def load_diarize_model(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> None:
-    global _DIARIZE_MODEL
-    
-    if _DIARIZE_MODEL is not None:
-        return
-        
+    global _DIARIZATION_PIPELINE, _DIARIZATION_KEY
+
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
-    
-    _ensure_whisper_assets(settings, model_manager)
-    
+
+    _ensure_assets(settings, model_manager, require_diarization=True)
+    _ensure_offline_mode()
+
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
-    if diar_dir and not diar_dir.exists():
-        raise ModelCheckError(f"WhisperX 说话人分离模型目录不存在：{diar_dir}")
-    
-    # Environment variables should have been set in load_whisper_model or globally
-    logger.info(f"Loading diarization model with HF_HOME={os.environ.get('HF_HOME')}, TORCH_HOME={os.environ.get('TORCH_HOME')}")
-    
-    # Helper to find config.yaml
-    def find_pipeline_config(root_dir: Path) -> Path | None:
-        # Search for any config.yaml under snapshots
-        # Structure: models--pyannote... / snapshots / <hash> / config.yaml
-        if not root_dir.exists():
-            return None
-        for path in root_dir.rglob("config.yaml"):
-            # Check if it looks like a snapshot config
-            if "snapshots" in path.parts:
-                return path
-        return None
+    diar_dir_str = str(diar_dir) if diar_dir else ""
+    key = f"{device}|{diar_dir_str}"
+    if _DIARIZATION_PIPELINE is not None and _DIARIZATION_KEY == key:
+        return
 
-    pipeline_config = find_pipeline_config(diar_dir) if diar_dir else None
-    
-    t_start = time.time()
-    
     try:
-        from pyannote.audio import Pipeline
-        import torch
-        
-        pipeline = None
-        
-        # Strategy 1: Load from local config.yaml directly if found
-        if pipeline_config and pipeline_config.exists():
-            logger.info(f"Found local pipeline config: {pipeline_config}")
-            try:
-                # pyannote.audio.Pipeline.from_pretrained can take a path to config.yaml
-                pipeline = Pipeline.from_pretrained(str(pipeline_config))
-                logger.info("Successfully loaded pipeline from local config.")
-            except Exception as e:
-                logger.warning(f"Failed to load from local config {pipeline_config}: {e}")
-        
-        # Strategy 2: Fallback to WhisperX / HF Hub ID loading
-        if pipeline is None:
-            logger.info("Falling back to WhisperX/HF Hub ID loading...")
-            whisperx = _import_whisperx()
-            # whisperx.DiarizationPipeline is just a wrapper around Pipeline.from_pretrained
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=settings.hf_token
-            )
+        from pyannote.audio import Pipeline  # type: ignore
+    except Exception as exc:  # pylint: disable=broad-except
+        raise RuntimeError(
+            "缺少依赖 pyannote.audio，说话人分离不可用。\n"
+            "请安装 `pyannote.audio` 并准备好离线模型缓存（或关闭 diarization）。\n"
+            f"原始错误：{exc}"
+        ) from exc
 
-        if pipeline is None:
-             raise RuntimeError("Pipeline.from_pretrained returned None")
+    if diar_dir:
+        # Force HF cache into the provided directory for offline execution.
+        os.environ["HF_HOME"] = diar_dir_str
+        os.environ["TRANSFORMERS_CACHE"] = diar_dir_str
 
-        pipeline.to(torch.device(device))
-        _DIARIZE_MODEL = pipeline
-        
-    except Exception as e:
-        logger.error(f"Failed to load DiarizationPipeline: {e}")
-        _DIARIZE_MODEL = None
-        
-    if _DIARIZE_MODEL is None:
-        logger.error("DiarizationPipeline returned None. Check if models are correctly downloaded and cached in HF_HOME.")
-        raise RuntimeError("WhisperX Diarization 模型加载失败。请检查日志中的路径配置和模型完整性。")
+    cfg = _find_pyannote_config(diar_dir) if diar_dir else None
 
-    t_end = time.time()
-    logger.info(f"Loaded diarization model in {t_end - t_start:.2f}s")
+    logger.info(f"Loading diarization pipeline (device={device})")
+    t0 = time.time()
+    if cfg and cfg.exists():
+        pipeline = Pipeline.from_pretrained(str(cfg))
+    else:
+        token = settings.hf_token
+        if not token:
+            raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+
+    pipeline.to(torch.device(device))
+    _DIARIZATION_PIPELINE = pipeline
+    _DIARIZATION_KEY = key
+    logger.info(f"Loaded diarization pipeline in {time.time() - t0:.2f}s")
 
 
 def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~') -> list[dict[str, Any]]:
-    merged_transcription = []
-    buffer_segment = None
+    merged: list[dict[str, Any]] = []
+    buffer: dict[str, Any] | None = None
 
     for segment in transcript:
-        if buffer_segment is None:
-            buffer_segment = segment
-        else:
-            # Check if the last character of the 'text' field is a punctuation mark
-            if buffer_segment['text'] and buffer_segment['text'][-1] in ending:
-                # If it is, add the buffered segment to the merged transcription
-                merged_transcription.append(buffer_segment)
-                buffer_segment = segment
-            else:
-                # If it's not, merge this segment with the buffered segment
-                buffer_segment['text'] += ' ' + segment['text']
-                buffer_segment['end'] = segment['end']
+        if buffer is None:
+            buffer = segment
+            continue
 
-    # Don't forget to add the last buffered segment
-    if buffer_segment is not None:
-        merged_transcription.append(buffer_segment)
+        # Never merge across speaker boundaries.
+        if buffer.get("speaker") != segment.get("speaker"):
+            merged.append(buffer)
+            buffer = segment
+            continue
 
-    return merged_transcription
+        if buffer.get("text") and str(buffer["text"])[-1] in ending:
+            merged.append(buffer)
+            buffer = segment
+            continue
+
+        buffer["text"] = (str(buffer.get("text", "")).strip() + " " + str(segment.get("text", "")).strip()).strip()
+        buffer["end"] = segment.get("end", buffer.get("end"))
+
+    if buffer is not None:
+        merged.append(buffer)
+    return merged
 
 
 def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> None:
-    wav_path = os.path.join(folder, 'audio_vocals.wav')
+    wav_path = os.path.join(folder, "audio_vocals.wav")
     if not os.path.exists(wav_path):
         logger.warning(f"Audio file not found: {wav_path}")
         return
 
-    # Load with 24000 sr (TTS usually expects this)
     audio_data, samplerate = librosa.load(wav_path, sr=24000)
-    speaker_dict = dict()
+    speaker_dict: dict[str, np.ndarray] = {}
     length = len(audio_data)
     delay = 0.05
-    
+
     for segment in transcript:
-        start = max(0, int((segment['start'] - delay) * samplerate))
-        end = min(int((segment['end'] + delay) * samplerate), length)
-        
+        start_s = float(segment.get("start", 0.0))
+        end_s = float(segment.get("end", 0.0))
+        start = max(0, int((start_s - delay) * samplerate))
+        end = min(int((end_s + delay) * samplerate), length)
         if start >= end:
             continue
-            
-        speaker_segment_audio = audio_data[start:end]
-        speaker = segment.get('speaker', 'SPEAKER_00')
-        
-        if speaker not in speaker_dict:
-            speaker_dict[speaker] = np.zeros((0, ))
-            
-        speaker_dict[speaker] = np.concatenate((speaker_dict[speaker], speaker_segment_audio))
 
-    speaker_folder = os.path.join(folder, 'SPEAKER')
+        speaker = str(segment.get("speaker") or "SPEAKER_00")
+        chunk = audio_data[start:end]
+        if speaker not in speaker_dict:
+            speaker_dict[speaker] = np.zeros((0,), dtype=np.float32)
+        speaker_dict[speaker] = np.concatenate((speaker_dict[speaker], chunk.astype(np.float32)))
+
+    speaker_folder = os.path.join(folder, "SPEAKER")
     os.makedirs(speaker_folder, exist_ok=True)
-    
+
     for speaker, audio in speaker_dict.items():
         speaker_file_path = os.path.join(speaker_folder, f"{speaker}.wav")
         save_wav(audio, speaker_file_path, sample_rate=24000)
 
 
+def _assign_speakers_by_overlap(
+    segments: list[dict[str, Any]],
+    turns: list[dict[str, Any]],
+    default_speaker: str = "SPEAKER_00",
+) -> None:
+    if not segments or not turns:
+        for seg in segments:
+            seg["speaker"] = default_speaker
+        return
+
+    turns_sorted = sorted(turns, key=lambda x: float(x["start"]))
+    idx = 0
+
+    for seg in segments:
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", 0.0))
+        if seg_end <= seg_start:
+            seg["speaker"] = default_speaker
+            continue
+
+        while idx < len(turns_sorted) and float(turns_sorted[idx]["end"]) <= seg_start:
+            idx += 1
+
+        best_speaker = None
+        best_overlap = 0.0
+        j = idx
+        while j < len(turns_sorted) and float(turns_sorted[j]["start"]) < seg_end:
+            t = turns_sorted[j]
+            ov = max(0.0, min(seg_end, float(t["end"])) - max(seg_start, float(t["start"])))
+            if ov > best_overlap:
+                best_overlap = ov
+                best_speaker = str(t.get("speaker") or default_speaker)
+            j += 1
+
+        seg["speaker"] = best_speaker if best_speaker is not None else default_speaker
+
+
 def transcribe_audio(
     folder: str,
-    model_name: str = "large-v3",
-    download_root: str | None = "models/ASR/whisper",
+    model_name: str | None = None,
     device: str = "auto",
     batch_size: int = 32,
     diarization: bool = True,
@@ -490,102 +315,99 @@ def transcribe_audio(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> bool:
-    if os.path.exists(os.path.join(folder, 'transcript.json')):
-        logger.info(f'Transcript already exists in {folder}')
+    transcript_path = os.path.join(folder, "transcript.json")
+    if os.path.exists(transcript_path):
+        logger.info(f"Transcript already exists in {folder}")
         return True
-    
-    wav_path = os.path.join(folder, 'audio_vocals.wav')
+
+    wav_path = os.path.join(folder, "audio_vocals.wav")
     if not os.path.exists(wav_path):
         return False
-    
-    logger.info(f'Transcribing {wav_path}')
-    
+
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
-    
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-    load_whisper_model(
-        model_name,
-        download_root,
-        device,
+
+    if model_name is None:
+        model_name = str(settings.whisper_model_path)
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    load_asr_model(
+        model_dir=model_name,
+        device=device,
         settings=settings,
         model_manager=model_manager,
-        require_diarization=diarization,
+        use_batched=True,
     )
-    
-    # _WHISPER_MODEL is set by load_whisper_model
-    rec_result = _WHISPER_MODEL.transcribe(wav_path, batch_size=batch_size)
-    
-    if rec_result['language'] == 'nn':
-        logger.warning(f'No language detected in {wav_path}')
-        return False
-    
-    load_align_model(rec_result['language'], settings=settings, model_manager=model_manager)
-    whisperx = _import_whisperx()
-    rec_result = whisperx.align(
-        rec_result['segments'], 
-        _ALIGN_MODEL, 
-        _ALIGN_METADATA,
-        wav_path, 
-        device, 
-        return_char_alignments=False
-    )
-    
-    if diarization:
-        load_diarize_model(device, settings=settings, model_manager=model_manager)
-        logger.info(f"Starting diarization for {wav_path} (this may take a while)...")
-        
-        # Preload audio into memory to avoid repeated disk I/O during diarization
-        import torchaudio
-        waveform, sample_rate = torchaudio.load(wav_path)
-        audio_dict = {
-            "audio": wav_path,          # Required: original audio path
-            "waveform": waveform,       # Optional: preloaded waveform
-            "sample_rate": sample_rate, # Required when waveform is provided
-            "uri": wav_path             # Optional: for annotation labeling
-        }
-        logger.info(f"Audio preloaded into memory ({waveform.shape[1] / sample_rate:.1f}s, {sample_rate}Hz)")
-        
-        
-        diarize_annotation = _DIARIZE_MODEL(audio_dict, min_speakers=min_speakers, max_speakers=max_speakers)
-        logger.info(f"Diarization completed, converting to DataFrame format...")
-        
-        # Convert Annotation to DataFrame format expected by WhisperX
-        import pandas as pd
-        diarize_df = pd.DataFrame(
-            diarize_annotation.itertracks(yield_label=True),
-            columns=['segment', 'label', 'speaker']
+
+    assert _ASR_MODEL is not None
+
+    logger.info(f"Transcribing {wav_path}")
+    t0 = time.time()
+
+    # Prefer batched pipeline if available (much higher throughput on GPU).
+    if _ASR_PIPELINE is not None:
+        segments_iter, info = _ASR_PIPELINE.transcribe(
+            wav_path,
+            batch_size=batch_size,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
         )
-        diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
-        diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
-        
-        rec_result = whisperx.assign_word_speakers(diarize_df, rec_result)
-        
-    transcript = [
-        {
-            'start': segment['start'], 
-            'end': segment['end'], 
-            'text': segment['text'].strip(), 
-            'speaker': segment.get('speaker', 'SPEAKER_00')
-        } 
-        for segment in rec_result['segments']
-    ]
+    else:
+        segments_iter, info = _ASR_MODEL.transcribe(
+            wav_path,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+
+    segments_list = list(segments_iter)
+    logger.info(f"ASR done in {time.time() - t0:.2f}s (segments={len(segments_list)}, language={getattr(info, 'language', None)})")
+
+    transcript: list[dict[str, Any]] = []
+    for seg in segments_list:
+        text = (getattr(seg, "text", "") or "").strip()
+        if not text:
+            continue
+        transcript.append(
+            {
+                "start": float(getattr(seg, "start", 0.0)),
+                "end": float(getattr(seg, "end", 0.0)),
+                "text": text,
+                "speaker": "SPEAKER_00",
+            }
+        )
+
+    if diarization:
+        try:
+            load_diarize_model(device=device, settings=settings, model_manager=model_manager)
+            assert _DIARIZATION_PIPELINE is not None
+            logger.info("Starting diarization (pyannote)...")
+            ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+            turns: list[dict[str, Any]] = []
+            for seg, _, speaker in ann.itertracks(yield_label=True):
+                turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
+            _assign_speakers_by_overlap(transcript, turns)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Diarization failed, falling back to single speaker: {exc}")
+            for item in transcript:
+                item["speaker"] = "SPEAKER_00"
+
     transcript = merge_segments(transcript)
-    
-    with open(os.path.join(folder, 'transcript.json'), 'w', encoding='utf-8') as f:
-        json.dump(transcript, f, indent=4, ensure_ascii=False)
-        
-    logger.info(f'Transcribed {wav_path} successfully, and saved to {os.path.join(folder, "transcript.json")}')
+
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        json.dump(transcript, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved transcript: {transcript_path}")
+
     generate_speaker_audio(folder, transcript)
     return True
 
 
 def transcribe_all_audio_under_folder(
     folder: str,
-    model_name: str = "large-v3",
-    download_root: str | None = "models/ASR/whisper",
+    model_name: str | None = None,
     device: str = "auto",
     batch_size: int = 32,
     diarization: bool = True,
@@ -595,23 +417,21 @@ def transcribe_all_audio_under_folder(
     model_manager: ModelManager | None = None,
 ) -> str:
     count = 0
-    for root, dirs, files in os.walk(folder):
-        if 'audio_vocals.wav' in files and 'transcript.json' not in files:
-            success = transcribe_audio(
-                root, 
-                model_name,
-                download_root, 
-                device, 
-                batch_size, 
-                diarization, 
-                min_speakers, 
-                max_speakers, 
-                settings=settings, 
-                model_manager=model_manager
+    for root, _, files in os.walk(folder):
+        if "audio_vocals.wav" in files and "transcript.json" not in files:
+            ok = transcribe_audio(
+                root,
+                model_name=model_name,
+                device=device,
+                batch_size=batch_size,
+                diarization=diarization,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                settings=settings,
+                model_manager=model_manager,
             )
-            if success:
+            if ok:
                 count += 1
-                
-    msg = f'Transcribed all audio under {folder} (processed {count} files)'
+    msg = f"Transcribed all audio under {folder} (processed {count} files)"
     logger.info(msg)
     return msg

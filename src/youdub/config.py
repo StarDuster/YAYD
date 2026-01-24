@@ -27,45 +27,41 @@ class Settings(BaseSettings):
     demucs_device: str = Field(default="auto", description="cuda/cpu/auto for Demucs")
     demucs_shifts: int = Field(default=5, description="Number of shifts for Demucs separator")
 
-    # WhisperX / ASR
+    # ASR (Whisper via faster-whisper / CTranslate2)
     whisper_model_path: Path = Field(
         default=Path("models/ASR/whisper"),
-        description="Path to the locally downloaded WhisperX CTranslate2 model",
-        alias="WHISPERX_MODEL_PATH",
-    )
-    whisper_download_root: Path = Field(
-        default=Path("models/ASR/whisper"),
-        description="Root path where WhisperX assets are stored",
-        alias="WHISPERX_DOWNLOAD_ROOT",
-    )
-    whisper_align_model_dir: Optional[Path] = Field(
-        default=Path("models/ASR/whisper/align"),
-        description="Path to alignment model cache (offline, no auto-download)",
-        alias="WHISPERX_ALIGN_MODEL_DIR",
+        description="Path to the locally downloaded faster-whisper CTranslate2 model directory (expects model.bin)",
+        alias="WHISPER_MODEL_PATH",
     )
     whisper_diarization_model_dir: Optional[Path] = Field(
         default=Path("models/ASR/whisper/diarization"),
         description="Path to diarization model cache (offline, no auto-download)",
-        alias="WHISPERX_DIARIZATION_MODEL_DIR",
+        alias="WHISPER_DIARIZATION_MODEL_DIR",
     )
-    whisper_model_name: str = Field(default="large-v3", description="WhisperX model name", alias="WHISPERX_MODEL_NAME")
-    whisper_batch_size: int = Field(default=32, description="Batch size for WhisperX")
-    whisper_local_files_only: bool = Field(
-        default=True, description="Force WhisperX to run in offline/local-only mode"
+    whisper_model_name: str = Field(
+        default="large-v3",
+        description="Whisper model name (informational; the actual ASR model is loaded from WHISPER_MODEL_PATH)",
+        alias="WHISPER_MODEL_NAME",
     )
+    whisper_batch_size: int = Field(default=32, description="Batch size for faster-whisper")
 
     # Translation
     translation_target_language: str = Field(default="简体中文", description="Default translation target language")
 
     # TTS
-    xtts_model_path: Optional[Path] = Field(
-        default=Path("models/TTS/xtts_v2"),
-        description="Local path to XTTS v2 model directory (no auto-download)",
-        alias="XTTS_MODEL_PATH",
+    qwen_tts_model_path: Optional[Path] = Field(
+        default=Path("models/TTS/Qwen3-TTS-12Hz-1.7B-Base"),
+        description="Local path to Qwen3-TTS Base model directory (no auto-download)",
+        alias="QWEN_TTS_MODEL_PATH",
+    )
+    qwen_tts_python_path: Optional[Path] = Field(
+        default=Path(".venv_qwen/bin/python"),
+        description="Python executable for Qwen3-TTS runtime (separate venv to avoid dependency conflicts)",
+        alias="QWEN_TTS_PYTHON",
     )
     tts_method: str = Field(
         default="bytedance",
-        description="TTS Engine to use (bytedance or xtts)",
+        description="TTS Engine to use (bytedance / gemini / qwen)",
         alias="TTS_METHOD"
     )
 
@@ -108,4 +104,7 @@ class Settings(BaseSettings):
     def resolve_path(self, path: Optional[Path]) -> Optional[Path]:
         if path is None:
             return None
-        return Path(path).expanduser().resolve()
+        # NOTE: Do NOT call `.resolve()` here.
+        # Virtualenv python executables are often symlinks to the system interpreter;
+        # resolving them would lose the venv context (and break subprocess calls).
+        return Path(path).expanduser().absolute()

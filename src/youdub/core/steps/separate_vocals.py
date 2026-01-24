@@ -1,8 +1,8 @@
+import gc
 import os
 import time
-import shutil
-import importlib
-from typing import Any, TYPE_CHECKING
+from typing import Any
+
 import torch
 from loguru import logger
 
@@ -10,43 +10,28 @@ from ...config import Settings
 from ...models import ModelManager
 from ..utils import save_wav
 
-if TYPE_CHECKING:  # pragma: no cover
-    from demucs.api import Separator  # type: ignore[import-not-found]
-
 
 class DemucsDependencyError(RuntimeError):
     pass
 
 
-def _get_demucs_separator_class() -> type[Any]:
+_DEMUCS_MODEL: Any | None = None
+_DEMUCS_MODEL_NAME: str | None = None
+_DEMUCS_DEVICE: str | None = None
+
+_AUTO_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _import_demucs_infer() -> tuple[Any, Any]:
     try:
-        api = importlib.import_module("demucs.api")
+        from demucs_infer.apply import apply_model
+        from demucs_infer.pretrained import get_model
     except ModuleNotFoundError as exc:
-        if exc.name == "demucs":
-            raise DemucsDependencyError(
-                "缺少可选依赖 `demucs`：请先安装后再使用“人声分离(Demucs)”功能。\n"
-                "建议：`pip install git+https://github.com/facebookresearch/demucs`"
-            ) from exc
-        if exc.name == "demucs.api":
-            raise DemucsDependencyError(
-                "已安装 `demucs` 但缺少 `demucs.api`（版本不兼容）。\n"
-                "请升级/重装 Demucs 后再使用“人声分离(Demucs)”功能，例如：\n"
-                "`pip install -U --force-reinstall git+https://github.com/facebookresearch/demucs`"
-            ) from exc
-        raise
-
-    separator = getattr(api, "Separator", None)
-    if separator is None:
         raise DemucsDependencyError(
-            "`demucs.api` 中未找到 `Separator`（版本不兼容）。\n"
-            "请升级/重装 Demucs 后再使用“人声分离(Demucs)”功能，例如：\n"
-            "`pip install -U --force-reinstall git+https://github.com/facebookresearch/demucs`"
-        )
-    return separator
-
-# Global separator instance for caching
-_SEPARATOR: Any | None = None
-_AUTO_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+            "缺少依赖 `demucs-infer`：请先安装后再使用“人声分离(Demucs)”功能。\n"
+            "建议：`uv sync`（或 `pip install demucs-infer`）"
+        ) from exc
+    return get_model, apply_model
 
 
 def _ensure_demucs_ready(settings: Settings, model_manager: ModelManager) -> None:
@@ -54,78 +39,80 @@ def _ensure_demucs_ready(settings: Settings, model_manager: ModelManager) -> Non
     model_manager.ensure_ready(names=[model_manager._demucs_requirement().name])
 
 
+def _set_torch_hub_dir(settings: Settings) -> None:
+    demucs_dir = settings.resolve_path(settings.demucs_model_dir)
+    if not demucs_dir:
+        return
+    try:
+        os.makedirs(demucs_dir, exist_ok=True)
+        torch.hub.set_dir(str(demucs_dir))
+        logger.info(f"Set torch hub dir to {demucs_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to set torch hub dir: {e}")
+
+
 def init_demucs(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
     """Pre-load the Demucs model."""
-    global _SEPARATOR
-    if settings is None:
-        settings = Settings()
-    if model_manager is None:
-        model_manager = ModelManager(settings)
-        
+    settings = settings or Settings()
+    model_manager = model_manager or ModelManager(settings)
     _ensure_demucs_ready(settings, model_manager)
     load_model(settings.demucs_model_name, settings.demucs_device, settings=settings, model_manager=model_manager)
 
 
 def load_model(
     model_name: str = "htdemucs_ft",
-    device: str = 'auto',
-    progress: bool = True,
-    shifts: int = 5,
+    device: str = "auto",
+    progress: bool = True,  # kept for API compatibility
+    shifts: int = 5,  # kept for API compatibility
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> Any:
-    global _SEPARATOR
-    if _SEPARATOR is not None:
-        # Check if we need to reload due to changed parameters if needed, 
-        # but for now we assume global reuse is fine if model_name matches.
-        # But `demucs.api.Separator` doesn't expose model name easily maybe.
-        # Let's just return if cached for simplicity as in original code.
-        return _SEPARATOR
+    global _DEMUCS_MODEL, _DEMUCS_MODEL_NAME, _DEMUCS_DEVICE
 
     if settings and model_manager:
         _ensure_demucs_ready(settings, model_manager)
+        _set_torch_hub_dir(settings)
 
-    logger.info(f'Loading Demucs model: {model_name}')
+    target_device = _AUTO_DEVICE if device == "auto" else device
+
+    if _DEMUCS_MODEL is not None and _DEMUCS_MODEL_NAME == model_name and _DEMUCS_DEVICE == target_device:
+        return _DEMUCS_MODEL
+
+    unload_model()
+
+    get_model, _apply_model = _import_demucs_infer()
+
+    logger.info(f"Loading Demucs model: {model_name}")
     t_start = time.time()
-    
-    target_device = _AUTO_DEVICE if device == 'auto' else device
-    
-    # Configure torch hub to use our custom demucs directory
-    if settings:
-        try:
-            import torch
-            demucs_dir = settings.resolve_path(settings.demucs_model_dir)
-            if demucs_dir:
-                torch.hub.set_dir(str(demucs_dir))
-                logger.info(f"Set torch hub dir to {demucs_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to set torch hub dir: {e}")
-
-    separator_cls = _get_demucs_separator_class()
-    _SEPARATOR = separator_cls(model_name, device=target_device, progress=progress, shifts=shifts)
-    
-    t_end = time.time()
-    logger.info(f'Demucs model loaded in {t_end - t_start:.2f} seconds')
-    return _SEPARATOR
+    model = get_model(model_name)
+    _DEMUCS_MODEL = model
+    _DEMUCS_MODEL_NAME = model_name
+    _DEMUCS_DEVICE = target_device
+    logger.info(f"Demucs model loaded in {time.time() - t_start:.2f} seconds")
+    return model
 
 
 def unload_model() -> None:
-    global _SEPARATOR
-    if _SEPARATOR is not None:
-        del _SEPARATOR
-        _SEPARATOR = None
+    global _DEMUCS_MODEL, _DEMUCS_MODEL_NAME, _DEMUCS_DEVICE
+    if _DEMUCS_MODEL is None:
+        return
+
+    try:
+        del _DEMUCS_MODEL
+    finally:
+        _DEMUCS_MODEL = None
+        _DEMUCS_MODEL_NAME = None
+        _DEMUCS_DEVICE = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        import gc
         gc.collect()
         logger.info("Demucs model unloaded")
-
 
 
 def separate_audio(
     folder: str,
     model_name: str = "htdemucs_ft",
-    device: str = 'auto',
+    device: str = "auto",
     progress: bool = True,
     shifts: int = 5,
     settings: Settings | None = None,
@@ -142,17 +129,24 @@ def separate_audio(
         logger.info(f'Audio already separated in {folder}')
         return
     
-    logger.info(f'Separating audio from {folder}')
-    
-    separator = load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
-    
+    settings = settings or Settings()
+    model_manager = model_manager or ModelManager(settings)
+    _ensure_demucs_ready(settings, model_manager)
+
+    logger.info(f"Separating audio from {folder}")
+
+    model = load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
+    _get_model, apply_model = _import_demucs_infer()
+
     import torchaudio
-    
+
     # Try setting soundfile backend which is more stable than sox_io for large files
     try:
         torchaudio.set_audio_backend("soundfile")
     except Exception:
         pass
+
+    target_device = _AUTO_DEVICE if device == "auto" else device
 
     t_start = time.time()
     try:
@@ -160,77 +154,51 @@ def separate_audio(
         wav, sr = torchaudio.load(audio_path)
         logger.info(f"Audio loaded. Shape: {wav.shape}, SR: {sr}")
 
-        if sr != separator.samplerate:
-             logger.info(f"Resampling from {sr} to {separator.samplerate}...")
-             resampler = torchaudio.transforms.Resample(sr, separator.samplerate)
-             wav = resampler(wav)
-             sr = separator.samplerate
-             
-        if wav.shape[0] > 2:
-            wav = wav[:2, :] 
-        if wav.shape[0] == 1:
-            wav = wav.repeat(2, 1) 
+        target_sr = int(getattr(model, "samplerate", sr))
+        target_channels = int(getattr(model, "audio_channels", 2))
 
+        if sr != target_sr:
+            logger.info(f"Resampling from {sr} to {target_sr}...")
+            resampler = torchaudio.transforms.Resample(sr, target_sr)
+            wav = resampler(wav)
+            sr = target_sr
 
-        chunk_duration = 300 
-        chunk_samples = chunk_duration * sr
-        total_samples = wav.shape[-1]
-        
-        all_vocals = []
-        all_instruments = []
-        
-        num_chunks = (total_samples + chunk_samples - 1) // chunk_samples
-        logger.info(f"Processing in {num_chunks} chunks of {chunk_duration}s.")
+        if wav.shape[0] > target_channels:
+            wav = wav[:target_channels, :]
+        elif wav.shape[0] < target_channels:
+            wav = wav.repeat(target_channels, 1)
 
-        for i in range(num_chunks):
-            start = i * chunk_samples
-            end = min((i + 1) * chunk_samples, total_samples)
-            chunk_wav = wav[:, start:end]
-            
-            # (origin, separated_dict)
-            _, separated = separator.separate_tensor(chunk_wav)
-            
-            # Extract and move to CPU immediately
-            vocals_chunk = separated['vocals'].cpu()
-            
-            instruments_chunk = None
-            for k, v in separated.items():
-                if k == 'vocals':
-                    continue
-                if instruments_chunk is None:
-                    instruments_chunk = v.cpu()
-                else:
-                    instruments_chunk += v.cpu()
-            
-            all_vocals.append(vocals_chunk)
-            all_instruments.append(instruments_chunk)
-            
-            if progress:
-                logger.info(f"Processed chunk {i+1}/{num_chunks}")
-            
-            # Force cleanup
-            del separated, _
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        mix = wav.unsqueeze(0)  # [1, C, T]
 
-        logger.info("Concatenating chunks...")
-        vocals = torch.cat(all_vocals, dim=-1).numpy().T
-        instruments = torch.cat(all_instruments, dim=-1).numpy().T
-        logger.info("Concatenation complete.")
+        logger.info(f"Running Demucs ({model_name}) on {target_device} (shifts={shifts})...")
+        # apply_model handles its own chunking/overlap; no need for our 300s chunk loop.
+        sources = apply_model(model, mix, shifts=shifts, split=True, progress=progress, device=target_device)
+        sources = sources[0]  # [S, C, T]
 
+        source_names = list(getattr(model, "sources", []))
+        if "vocals" in source_names:
+            vocals_idx = source_names.index("vocals")
+        else:
+            # Fallback: assume last stem is vocals.
+            vocals_idx = sources.shape[0] - 1
+
+        vocals_tensor = sources[vocals_idx]
+        instruments_tensor = sources.sum(dim=0) - vocals_tensor
+
+        vocals = vocals_tensor.cpu().numpy().T
+        instruments = instruments_tensor.cpu().numpy().T
     except Exception as e:
-        logger.error(f'Error separating audio from {folder}: {e}')
-        raise e
+        logger.error(f"Error separating audio from {folder}: {e}")
+        raise
 
-    t_end = time.time()
-    logger.info(f'Audio separated in {t_end - t_start:.2f} seconds')
-    
+    logger.info(f"Audio separated in {time.time() - t_start:.2f} seconds")
+
     logger.info(f"Saving vocals to {vocal_output_path}...")
     save_wav(vocals, vocal_output_path, sample_rate=sr)
-    
+
     logger.info(f"Saving instruments to {instruments_output_path}...")
     save_wav(instruments, instruments_output_path, sample_rate=sr)
-    
+
     logger.info("Separation task finished completely.")
 
 
@@ -281,7 +249,7 @@ def separate_all_audio_under_folder(
     load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
 
     count = 0
-    for subdir, dirs, files in os.walk(root_folder):
+    for subdir, _dirs, files in os.walk(root_folder):
         if 'download.mp4' not in files:
             continue
             

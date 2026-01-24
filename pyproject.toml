@@ -11,6 +11,7 @@ keywords = ["youtube", "translation", "dubbing", "ai", "tts", "whisper"]
 dependencies = [
     # Web UI
     "gradio",
+    "typer>=0.12,<1.0.0",
 
     # Logging
     "loguru>=0.7.0,<1.0.0",
@@ -31,10 +32,15 @@ dependencies = [
     "scipy>=1.11.0,<1.14.0",
     "librosa>=0.10.0,<0.11.0",
     "audiostretchy>=1.3.5",
+    "soundfile",
     "numpy<2.0.0",
 
-    # Speech recognition - WhisperX from PyPI
-    "whisperx>=3.1.0",
+    # Vocal separation (offline / GPU-friendly)
+    # Use demucs-infer (actively maintained inference-only Demucs fork).
+    "demucs-infer>=4.1.2",
+
+    # Speech recognition (offline / GPU-friendly)
+    "faster-whisper>=1.2.1",
 
     # Speaker diarization (required by bytedance TTS for speaker matching)
     # Note: Keep <4.0.0 for Torchaudio 2.1.x compatibility
@@ -43,7 +49,7 @@ dependencies = [
     # Translation API
     "openai>=1.0.0,<2.0.0",
     "python-dotenv>=1.0.0,<2.0.0",
-    "transformers>=4.38.0,<4.40.0",
+    "huggingface-hub",
 
     # Image processing
     "Pillow>=10.0.0,<11.0.0",
@@ -61,18 +67,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Demucs for audio source separation (vocals/instruments)
-# Note: Demucs has strict torchaudio<2.1 requirement that conflicts with whisperx
-# To install demucs manually (it works fine with newer torchaudio in practice):
-#   uv pip install --no-deps git+https://github.com/facebookresearch/demucs
-#   uv pip install dora-search einops "julius>=0.2.3" "lameenc>=1.2" openunmix
-demucs = ["dora-search", "einops", "julius>=0.2.3", "lameenc>=1.2", "openunmix"]
-
-# XTTS for voice cloning TTS
-# Note: Resolving TTS dependency automatically fails due to strict numpy==1.22.0 requirement.
-# Install manually: uv pip install --no-deps "TTS>=0.22.0"
-xtts = []
-
 # Development dependencies
 dev = ["pytest>=7.0.0", "black>=23.0.0", "ruff>=0.1.0"]
 

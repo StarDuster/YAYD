@@ -1,21 +1,38 @@
+from __future__ import annotations
+
 import json
 import os
 import re
 import time
-from typing import Any
+from dataclasses import dataclass
+from json import JSONDecodeError
+from typing import Any, cast
 
 from loguru import logger
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    APIStatusError,
+    AuthenticationError,
+    BadRequestError,
+    OpenAI,
+    RateLimitError,
+)
 
 from ...config import Settings
 
-# TODO: Move these to Settings/Config if possible
-settings = Settings()
-_MODEL_NAME = settings.model_name
-print(f'Using model {_MODEL_NAME}')
+@dataclass(frozen=True)
+class _ChatBackend:
+    client: OpenAI
+    model: str
+    timeout_s: float
 
 
+class _TranslationValidationError(ValueError):
+    pass
 
+
+_DEFAULT_SETTINGS = Settings()
 
 def get_necessary_info(info: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -39,130 +56,177 @@ def ensure_transcript_length(transcript: str, max_length: int = 4000) -> str:
     return before[:length] + after[-length:]
 
 
-def summarize(info: dict[str, Any], transcript: list[dict[str, Any]], target_language: str = '简体中文') -> dict[str, Any] | None:
-    client = OpenAI(
-        base_url=settings.openai_api_base or 'https://api.openai.com/v1',
-        api_key=settings.openai_api_key
+def _build_chat_backend(settings: Settings) -> _ChatBackend:
+    timeout_s = 240.0
+    api_key = settings.openai_api_key
+    if not api_key:
+        raise RuntimeError("缺少 OPENAI_API_KEY：请在 .env 中配置 OpenAI 兼容 API Key。")
+    base_url = settings.openai_api_base or "https://api.openai.com/v1"
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    return _ChatBackend(client=client, model=settings.model_name, timeout_s=timeout_s)
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+        except JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return cast(dict[str, Any], obj)
+    raise ValueError("No JSON object found in model response.")
+
+
+def _chat_completion_text(backend: _ChatBackend, messages: list[dict[str, str]]) -> str:
+    response = backend.client.chat.completions.create(
+        model=backend.model,
+        messages=messages,
+        timeout=backend.timeout_s,
     )
-    
-    transcript_text = ' '.join(line['text'] for line in transcript)
+    content = response.choices[0].message.content
+    return (content or "").strip()
+
+
+def _handle_sdk_exception(exc: Exception, attempt: int) -> float | None:
+    """Return sleep seconds for retry, or None to stop retrying."""
+    # --- OpenAI compatible SDK exceptions ---
+    if isinstance(exc, (AuthenticationError,)):
+        logger.error(f"LLM 鉴权失败：{exc}")
+        return None
+    if isinstance(exc, (BadRequestError,)):
+        logger.error(f"LLM 请求参数错误：{exc}")
+        return None
+    if isinstance(exc, (RateLimitError,)):
+        delay = min(2 ** attempt, 30)
+        logger.warning(f"LLM 限流，{delay}s 后重试：{exc}")
+        return float(delay)
+    if isinstance(exc, (APITimeoutError, APIConnectionError)):
+        delay = min(2 ** attempt, 20)
+        logger.warning(f"LLM 连接/超时，{delay}s 后重试：{exc}")
+        return float(delay)
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        if status in {500, 502, 503, 504}:
+            delay = min(2 ** attempt, 20)
+            logger.warning(f"LLM 服务端错误({status})，{delay}s 后重试：{exc}")
+            return float(delay)
+        logger.error(f"LLM 请求失败({status})：{exc}")
+        return None
+
+    return None
+
+
+def summarize(
+    info: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    target_language: str = "简体中文",
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    cfg = settings or _DEFAULT_SETTINGS
+    backend = _build_chat_backend(cfg)
+
+    transcript_text = " ".join(cast(str, line.get("text", "")) for line in transcript)
     transcript_text = ensure_transcript_length(transcript_text, max_length=2000)
-    info_message = f'Title: "{info["title"]}" Author: "{info["uploader"]}". '
-    
+    info_message = f'Title: "{info.get("title", "")}" Author: "{info.get("uploader", "")}". '
+
     full_description = (
-        f'The following is the full content of the video:\n{info_message}\n{transcript_text}\n{info_message}\n'
-        'According to the above content, detailedly Summarize the video in JSON format:\n'
-        '```json\n{"title": "", "summary": ""}\n```'
+        f"The following is the full content of the video:\n{info_message}\n{transcript_text}\n{info_message}\n"
+        "Summarize the video content as JSON only.\n"
+        'Return JSON in the format: {"title": "...", "summary": "..."}'
     )
-    
-    retry_message = ''
-    success = False
-    summary_data = None
-    
-    for _ in range(5):
+
+    summary_data: dict[str, str] | None = None
+    for attempt in range(5):
         try:
             messages = [
                 {
-                    'role': 'system',
-                    'content': 'You are a expert in the field of this video. Please summarize the video in JSON format.\n```json\n{"title": "the title of the video", "summary", "the summary of the video"}\n```'
+                    "role": "system",
+                    "content": 'You are an expert video analyst. Respond with JSON only: {"title": "...", "summary": "..."}',
                 },
-                {'role': 'user', 'content': full_description + retry_message},
+                {"role": "user", "content": full_description},
             ]
-            response = client.chat.completions.create(
-                model=_MODEL_NAME,
-                messages=messages,
-                timeout=240,
-
-            )
-            content = response.choices[0].message.content.replace('\n', '')
-            
-            # Sanity check
-            if '视频标题' in content:
-                raise Exception("包含“视频标题”")
-            
+            content = _chat_completion_text(backend, messages).replace("\n", " ")
             logger.info(content)
-            
-            match = re.search(r'\{.*?\}', content)
-            if not match:
-                raise Exception("No JSON found in response")
-                
-            summary_json = json.loads(match.group(0))
-            summary_data = {
-                'title': summary_json['title'].replace('title:', '').strip(),
-                'summary': summary_json['summary'].replace('summary:', '').strip()
-            }
-            
-            if 'title' in summary_data['title']:
-                 raise Exception('Invalid summary')
-                 
-            success = True
-            break
-        except Exception as e:
-            retry_message += '\nSummarize the video in JSON format:\n```json\n{"title": "", "summary": ""}\n```'
-            logger.warning(f'总结失败\n{e}')
-            time.sleep(1)
-            
-    if not success or not summary_data:
-        raise Exception('总结失败')
 
-    title = summary_data['title']
-    summary_text = summary_data['summary']
-    tags = info.get('tags', [])
-    
-    messages = [
+            summary_json = _extract_first_json_object(content)
+            title = str(summary_json.get("title", "")).replace("title:", "").strip()
+            summary_text = str(summary_json.get("summary", "")).replace("summary:", "").strip()
+            if not title or not summary_text:
+                raise ValueError("Missing title/summary fields in JSON.")
+            if "title" in title.lower():
+                raise ValueError("Invalid title field.")
+            summary_data = {"title": title, "summary": summary_text}
+            break
+        except (ValueError, JSONDecodeError) as exc:
+            logger.warning(f"总结解析失败（attempt={attempt + 1}/5）：{exc}")
+            time.sleep(1)
+        except Exception as exc:  # SDK/network errors handled explicitly below
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+    if not summary_data:
+        raise RuntimeError("总结失败：无法从模型输出解析 JSON。")
+
+    title = summary_data["title"]
+    summary_text = summary_data["summary"]
+    tags = info.get("tags", [])
+
+    translate_messages = [
         {
-            'role': 'system',
-            'content': f'You are a native speaker of {target_language}. Please translate the title and summary into {target_language} in JSON format. ```json\n{{"title": "the {target_language} title of the video", "summary", "the {target_language} summary of the video", "tags": [list of tags in {target_language}]}}\n```.'
+            "role": "system",
+            "content": (
+                f'You are a native speaker of {target_language}. Translate title/summary/tags into {target_language}. '
+                'Respond with JSON only: {"title": "...", "summary": "...", "tags": ["..."]}'
+            ),
         },
         {
-            'role': 'user',
-            'content': f'The title of the video is "{title}". The summary of the video is "{summary_text}". Tags: {tags}.\nPlease translate the above title and summary and tags into {target_language} in JSON format. ```json\n{{"title": "", "summary", ""， "tags": []}}\n```. Remember to tranlate the title and the summary and tags into {target_language} in JSON.'
+            "role": "user",
+            "content": (
+                f'Title: "{title}"\nSummary: "{summary_text}"\nTags: {tags}\n'
+                f"Translate into {target_language} and return JSON only."
+            ),
         },
     ]
-    
-    # Translation retry loop
-    # Ideally should limit retries here too
-    for _ in range(5):
-        try:
-            response = client.chat.completions.create(
-                model=_MODEL_NAME,
-                messages=messages,
-                timeout=240,
 
-            )
-            content = response.choices[0].message.content.replace('\n', '')
+    for attempt in range(5):
+        try:
+            content = _chat_completion_text(backend, translate_messages).replace("\n", " ")
             logger.info(content)
-            
-            match = re.search(r'\{.*?\}', content)
-            if not match:
-                 raise Exception("No JSON found")
-                 
-            summary_json = json.loads(match.group(0))
-            
-            if target_language in summary_json['title'] or target_language in summary_json['summary']:
-                raise Exception('Invalid translation')
-                
-            title = summary_json['title'].strip()
-            
-            # Remove quotes if present
-            for quote in ['"', '“', '‘', "'", '《']:
-                if title.startswith(quote):
-                     # Simplified quote stripping
-                     title = title.strip(quote + '”’》')
-            
-            result = {
-                'title': title,
-                'author': info.get('uploader', ''),
-                'summary': summary_json['summary'],
-                'tags': summary_json.get('tags', []),
-                'language': target_language
+            translated_json = _extract_first_json_object(content)
+            translated_title = str(translated_json.get("title", "")).strip()
+            translated_summary = str(translated_json.get("summary", "")).strip()
+            translated_tags = translated_json.get("tags", [])
+            if not translated_title or not translated_summary:
+                raise ValueError("Missing title/summary fields in translated JSON.")
+            if target_language in translated_title or target_language in translated_summary:
+                raise ValueError("Model echoed language name instead of translation.")
+
+            for quote in ['"', "“", "‘", "'", "《"]:
+                if translated_title.startswith(quote):
+                    translated_title = translated_title.strip(quote + "”’》")
+
+            return {
+                "title": translated_title,
+                "author": info.get("uploader", ""),
+                "summary": translated_summary,
+                "tags": translated_tags if isinstance(translated_tags, list) else [],
+                "language": target_language,
             }
-            return result
-        except Exception as e:
-            logger.warning(f'总结翻译失败\n{e}')
+        except (ValueError, JSONDecodeError) as exc:
+            logger.warning(f"总结翻译解析失败（attempt={attempt + 1}/5）：{exc}")
             time.sleep(1)
-            
-    return None
+        except Exception as exc:
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+    raise RuntimeError("总结翻译失败：无法从模型输出解析 JSON。")
 
 
 def translation_postprocess(result: str) -> str:
@@ -263,13 +327,16 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output_data
 
 
-def _translate_content(summary: dict[str, Any], transcript: list[dict[str, Any]], target_language: str = '简体中文') -> list[str]:
-    client = OpenAI(
-        base_url=settings.openai_api_base or 'https://api.openai.com/v1',
-        api_key=settings.openai_api_key
-    )
-    
-    info = f'This is a video called "{summary["title"]}". {summary["summary"]}.'
+def _translate_content(
+    summary: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    target_language: str = "简体中文",
+    settings: Settings | None = None,
+) -> list[str]:
+    cfg = settings or _DEFAULT_SETTINGS
+    backend = _build_chat_backend(cfg)
+
+    info = f'This is a video called "{summary.get("title", "")}". {summary.get("summary", "")}.'
     full_translation = []
     
     fixed_message = [
@@ -280,13 +347,12 @@ def _translate_content(summary: dict[str, Any], transcript: list[dict[str, Any]]
         {'role': 'assistant', 'content': '翻译：“生存还是毁灭，这是一个值得考虑的问题。”'},
     ]
     
-    history = []
+    history: list[dict[str, str]] = []
     for line in transcript:
-        text = line['text']
-        retry_message = 'Only translate the quoted sentence and give me the final translation.'
+        text = cast(str, line.get("text", ""))
         translation = ""
         
-        for _ in range(30):
+        for attempt in range(30):
             # Keep history short to avoid token limit
             current_history = history[-30:]
             messages = fixed_message + current_history + [
@@ -294,33 +360,24 @@ def _translate_content(summary: dict[str, Any], transcript: list[dict[str, Any]]
             ]
             
             try:
-                response = client.chat.completions.create(
-                    model=_MODEL_NAME,
-                    messages=messages,
-                    timeout=240,
-
-                )
-                translation = response.choices[0].message.content.replace('\n', '')
+                translation = _chat_completion_text(backend, messages).replace("\n", "")
                 logger.info(f'原文：{text}')
                 logger.info(f'译文：{translation}')
                 
                 is_valid, processed = valid_translation(text, translation)
                 if not is_valid:
-                    retry_message += processed # processed contains error message in this case?
-                    # valid_translation returns (False, error_msg)
-                    raise Exception('Invalid translation')
+                    raise _TranslationValidationError(processed)
                 
                 translation = processed
                 break
-            except Exception as e:
-                logger.error(f"Translation error: {e}")
-                # Simple retry with new client if internal error (parity with original)
-                if str(e) == 'Internal Server Error':
-                    client = OpenAI(
-                        base_url=settings.openai_api_base or 'https://api.openai.com/v1',
-                        api_key=settings.openai_api_key
-                    )
-                time.sleep(1)
+            except _TranslationValidationError as exc:
+                logger.warning(f"译文校验失败（attempt={attempt + 1}/30）：{exc}")
+                time.sleep(0.5)
+            except Exception as exc:
+                delay = _handle_sdk_exception(exc, attempt)
+                if delay is None:
+                    raise
+                time.sleep(delay)
         
         full_translation.append(translation)
         
@@ -332,7 +389,7 @@ def _translate_content(summary: dict[str, Any], transcript: list[dict[str, Any]]
     return full_translation
 
 
-def translate_folder(folder: str, target_language: str = '简体中文') -> bool:
+def translate_folder(folder: str, target_language: str = '简体中文', settings: Settings | None = None) -> bool:
     if os.path.exists(os.path.join(folder, 'translation.json')):
         logger.info(f'Translation already exists in {folder}')
         return True
@@ -357,17 +414,14 @@ def translate_folder(folder: str, target_language: str = '简体中文') -> bool
         with open(summary_path, 'r', encoding='utf-8') as f:
             summary = json.load(f)
     else:
-        summary = summarize(info, transcript, target_language)
-        if summary is None:
-            logger.error(f'Failed to summarize {folder}')
-            return False
+        summary = summarize(info, transcript, target_language, settings=settings)
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
     translation_path = os.path.join(folder, 'translation.json')
     
     # Perform translation
-    translations = _translate_content(summary, transcript, target_language)
+    translations = _translate_content(summary, transcript, target_language, settings=settings)
     
     for i, line in enumerate(transcript):
         line['translation'] = translations[i] if i < len(translations) else ""
@@ -380,11 +434,11 @@ def translate_folder(folder: str, target_language: str = '简体中文') -> bool
     return True
 
 
-def translate_all_transcript_under_folder(folder: str, target_language: str) -> str:
+def translate_all_transcript_under_folder(folder: str, target_language: str, settings: Settings | None = None) -> str:
     count = 0
     for root, dirs, files in os.walk(folder):
         if 'transcript.json' in files and 'translation.json' not in files:
-            if translate_folder(root, target_language):
+            if translate_folder(root, target_language, settings=settings):
                 count += 1
     msg = f'Translated all videos under {folder} (processed {count} files)'
     logger.info(msg)

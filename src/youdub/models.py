@@ -61,23 +61,11 @@ class ModelManager:
     def _whisper_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_model_path)
         hint = (
-            "需要 WhisperX CTranslate2 离线模型（例如 large-v3 转换后的 model.bin）。"
-            f" 请下载后放在 {path} 或设置 WHISPERX_MODEL_PATH。"
+            "需要 Whisper CTranslate2 离线模型（faster-whisper 格式，目录内应包含 model.bin）。"
+            f" 请下载后放在 {path} 或设置 WHISPER_MODEL_PATH。"
         )
         return ModelRequirement(
-            name=f"WhisperX ASR ({self.settings.whisper_model_name})",
-            path=path,
-            hint=hint,
-        )
-
-    def _whisper_align_requirement(self) -> ModelRequirement:
-        path = self.settings.resolve_path(self.settings.whisper_align_model_dir)
-        hint = (
-            "需要 WhisperX 对齐模型缓存（wav2vec2 等）。"
-            " 参考 WhisperX 文档下载到本地并设置 WHISPERX_ALIGN_MODEL_DIR。"
-        )
-        return ModelRequirement(
-            name="WhisperX Alignment",
+            name=f"Whisper ASR ({self.settings.whisper_model_name})",
             path=path,
             hint=hint,
         )
@@ -85,23 +73,35 @@ class ModelManager:
     def _whisper_diarization_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_diarization_model_dir)
         hint = (
-            "需要 WhisperX 说话人分离模型缓存（pyannote）。"
-            " 参考 WhisperX 文档下载到本地并设置 WHISPERX_DIARIZATION_MODEL_DIR / HF_TOKEN。"
+            "需要说话人分离模型缓存（pyannote/speaker-diarization-3.1）。"
+            " 请先下载到本地并设置 WHISPER_DIARIZATION_MODEL_DIR / HF_TOKEN。"
         )
         return ModelRequirement(
-            name="WhisperX Diarization",
+            name="Speaker Diarization (pyannote)",
             path=path,
             hint=hint,
         )
 
-    def _xtts_requirement(self) -> ModelRequirement:
-        path = self.settings.resolve_path(self.settings.xtts_model_path)
+    def _qwen_tts_runtime_requirement(self) -> ModelRequirement:
+        path = self.settings.resolve_path(self.settings.qwen_tts_python_path)
         hint = (
-            "需要本地 XTTS v2 模型目录（包含 config.json / model.pth 等），"
-            "请提前下载并设置 XTTS_MODEL_PATH。若不用 XTTS，请将 TTS Method 设为 bytedance。"
+            "需要一个独立的 Qwen3-TTS 运行环境（避免与主工程依赖冲突/污染），"
+            "请创建单独 venv 并安装 qwen-tts，然后设置 QWEN_TTS_PYTHON 指向该环境的 python。"
         )
         return ModelRequirement(
-            name="XTTS v2",
+            name="Qwen3-TTS Runtime (python)",
+            path=path,
+            hint=hint,
+        )
+
+    def _qwen_tts_weights_requirement(self) -> ModelRequirement:
+        path = self.settings.resolve_path(self.settings.qwen_tts_model_path)
+        hint = (
+            "需要本地 Qwen3-TTS Base 模型目录（包含 config.json / model.safetensors 等），"
+            "请提前下载并设置 QWEN_TTS_MODEL_PATH。"
+        )
+        return ModelRequirement(
+            name="Qwen3-TTS Base Weights",
             path=path,
             hint=hint,
         )
@@ -137,9 +137,9 @@ class ModelManager:
         return [
             self._demucs_requirement(),
             self._whisper_requirement(),
-            self._whisper_align_requirement(),
             self._whisper_diarization_requirement(),
-            self._xtts_requirement(),
+            self._qwen_tts_runtime_requirement(),
+            self._qwen_tts_weights_requirement(),
             self._gemini_tts_requirement(),
             self._bytedance_requirement(),
         ]
@@ -200,6 +200,4 @@ class ModelManager:
             os.environ["HF_HUB_OFFLINE"] = "1"
         if os.getenv("TRANSFORMERS_OFFLINE") is None:
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        if os.getenv("WHISPERX_LOCAL_FILES_ONLY") is None:
-            os.environ["WHISPERX_LOCAL_FILES_ONLY"] = "1"
-        logger.debug("Offline mode enforced for Hugging Face/WhisperX downloads.")
+        logger.debug("Offline mode enforced for Hugging Face downloads.")
