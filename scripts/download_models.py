@@ -1,10 +1,8 @@
 
 import os
 import sys
-import shutil
 from pathlib import Path
 from loguru import logger
-import torch
 
 # Add src to path to import settings
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -22,9 +20,9 @@ except ImportError:
 # Pin model revisions (commit hashes) to strict versions to ensure environment reproducibility.
 # If revision is None, it uses the latest 'main' branch (not reproducible over time).
 MODELS_TO_DOWNLOAD = {
-    # WhisperX CTranslate2 Model
+    # Whisper (faster-whisper) CTranslate2 Model
     # Repo: https://huggingface.co/Systran/faster-whisper-large-v3
-    "whisperx": {
+    "whisper": {
         "repo_id": "Systran/faster-whisper-large-v3",
         "revision": "edc79942a0352e00c3b03657b4943f293cf0f1d0", # Pinned to a known good state
         "type": "direct_download"
@@ -43,26 +41,19 @@ MODELS_TO_DOWNLOAD = {
         "revision": "4ca4d5a8d2ab82ddfbea8aa3b29c15431671239c", # Latest stable compatible with 3.1
         "type": "hf_cache"
     },
-    # XTTS v2
-    # Repo: https://huggingface.co/coqui/XTTS-v2
-    "xtts": {
-        "repo_id": "coqui/XTTS-v2",
-        "revision": "67035ce6d42e2b9c3f76da893116896200257c7e", # v2.0.3 (latest stable)
-        "type": "direct_download"
-    }
 }
 
 def verify_offline_readiness():
     """Ensure that enforced offline mode variables will work with what we downloaded."""
     logger.info("--- Verifying Offline Readiness ---")
     
-    # 1. Check WhisperX
+    # 1. Check Whisper model
     settings = Settings()
     whisper_path = settings.resolve_path(settings.whisper_model_path)
     if not (whisper_path / "model.bin").exists():
-        logger.warning(f" [FAIL] WhisperX model.bin not found in {whisper_path}")
+        logger.warning(f" [FAIL] Whisper model.bin not found in {whisper_path}")
     else:
-        logger.info(f" [OK] WhisperX found at {whisper_path}")
+        logger.info(f" [OK] Whisper model found at {whisper_path}")
 
     # 2. Check Diarization Cache
     # We can't easily check HF cache structure without library, but we can check if directory is not empty
@@ -85,7 +76,7 @@ def download_models():
     # We want to use the network now to prepare for later offline usage
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     
-    env_vars_to_clear = ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "WHISPERX_LOCAL_FILES_ONLY"]
+    env_vars_to_clear = ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
     for var in env_vars_to_clear:
         if var in os.environ:
             logger.info(f"Temporarily clearing {var} for download script")
@@ -97,10 +88,19 @@ def download_models():
     # 1. Demucs
     logger.info("\n=== 1. Demucs Model (htdemucs_ft) ===")
     try:
-        from demucs.pretrained import get_model
+        import torch
+        from demucs_infer.pretrained import get_model
+
+        # Ensure demucs weights go to our configured offline directory.
+        demucs_dir = settings.resolve_path(settings.demucs_model_dir)
+        if demucs_dir:
+            demucs_dir.mkdir(parents=True, exist_ok=True)
+            torch.hub.set_dir(str(demucs_dir))
+            logger.info(f"Set torch hub dir to {demucs_dir}")
+
         model_name = settings.demucs_model_name
         logger.info(f"Downloading Demucs model: {model_name}...")
-        # Demucs usage of torch.hub is reasonably reproducible if the library version is locked in uv.lock
+        # demucs-infer downloads the same official weights via torch.hub cache.
         get_model(model_name)
         logger.info("Demucs model downloaded.")
     except Exception as e:
@@ -113,10 +113,10 @@ def download_models():
     if not token:
         logger.warning("HF_TOKEN missing. Pyannote downloads may fail 401 Unauthorized.")
 
-    # A. WhisperX (Direct Download)
-    wx_conf = MODELS_TO_DOWNLOAD["whisperx"]
+    # A. Whisper model (Direct Download)
+    wx_conf = MODELS_TO_DOWNLOAD["whisper"]
     wx_path = settings.resolve_path(settings.whisper_model_path)
-    logger.info(f"Downloading WhisperX ({wx_conf['revision'][:7]}) to {wx_path}...")
+    logger.info(f"Downloading Whisper model ({wx_conf['revision'][:7]}) to {wx_path}...")
     try:
         snapshot_download(
             repo_id=wx_conf["repo_id"],
@@ -126,31 +126,10 @@ def download_models():
             resume_download=True
         )
     except Exception as e:
-        logger.error(f"WhisperX download failed: {e}")
+        logger.error(f"Whisper model download failed: {e}")
 
-    # B. WhisperX Alignment (Special handling via library)
-    logger.info("\n=== 3. WhisperX Alignment Models ===")
-    align_dir = settings.resolve_path(settings.whisper_align_model_dir)
-    original_hf_home = os.environ.get("HF_HOME")
-    os.environ["HF_HOME"] = str(align_dir)
-    try:
-        import whisperx
-        # Note: whisperx load_align_model doesn't easily accept revision=... 
-        # But wav2vec2 models are very stable. We rely on whisperx library version pinning in uv.lock.
-        keywords = ["en", "zh"] # Covers default and simplified chinese
-        for lang in keywords:
-            logger.info(f"Downloading alignment model for '{lang}'...")
-            whisperx.load_align_model(language_code=lang, device="cpu")
-    except Exception as e:
-        logger.error(f"Alignment download failed: {e}")
-    finally:
-        if original_hf_home:
-            os.environ["HF_HOME"] = original_hf_home
-        else:
-            del os.environ["HF_HOME"]
-
-    # C. Diarization (HF Cache Style)
-    logger.info("\n=== 4. Pyannote Diarization (HF Cache) ===")
+    # B. Diarization (HF Cache Style)
+    logger.info("\n=== 3. Pyannote Diarization (HF Cache) ===")
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     
     # Set HF_HOME to the target diarization directory to build the cache there
@@ -169,22 +148,6 @@ def download_models():
             )
         except Exception as e:
              logger.error(f"Failed to download {conf['repo_id']}: {e}")
-
-    # D. XTTS v2 (Direct Download)
-    logger.info("\n=== 5. XTTS v2 ===")
-    xtts_conf = MODELS_TO_DOWNLOAD["xtts"]
-    xtts_path = settings.resolve_path(settings.xtts_model_path)
-    logger.info(f"Downloading XTTS ({xtts_conf['revision'][:7]}) to {xtts_path}...")
-    try:
-        snapshot_download(
-            repo_id=xtts_conf["repo_id"],
-            revision=xtts_conf["revision"],
-            local_dir=xtts_path,
-            local_dir_use_symlinks=False,
-            resume_download=True
-        )
-    except Exception as e:
-        logger.error(f"XTTS download failed: {e}")
 
     logger.info("\nAll requests completed.")
     verify_offline_readiness()
