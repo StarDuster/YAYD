@@ -62,7 +62,7 @@ def _build_chat_backend(settings: Settings) -> _ChatBackend:
     timeout_s = 240.0
     api_key = settings.openai_api_key
     if not api_key:
-        raise RuntimeError("缺少 OPENAI_API_KEY：请在 .env 中配置 OpenAI 兼容 API Key。")
+        raise RuntimeError("Missing OPENAI_API_KEY: Please configure OpenAI-compatible API Key in .env file.")
     base_url = settings.openai_api_base or "https://api.openai.com/v1"
     client = OpenAI(base_url=base_url, api_key=api_key)
     return _ChatBackend(client=client, model=settings.model_name, timeout_s=timeout_s)
@@ -109,26 +109,26 @@ def _handle_sdk_exception(exc: Exception, attempt: int) -> float | None:
     """Return sleep seconds for retry, or None to stop retrying."""
     # --- OpenAI compatible SDK exceptions ---
     if isinstance(exc, (AuthenticationError,)):
-        logger.error(f"LLM 鉴权失败：{exc}")
+        logger.error(f"LLM authentication failed: {exc}")
         return None
     if isinstance(exc, (BadRequestError,)):
-        logger.error(f"LLM 请求参数错误：{exc}")
+        logger.error(f"LLM request parameter error: {exc}")
         return None
     if isinstance(exc, (RateLimitError,)):
         delay = min(2 ** attempt, 30)
-        logger.warning(f"LLM 限流，{delay}s 后重试：{exc}")
+        logger.warning(f"LLM rate limited, retrying after {delay}s: {exc}")
         return float(delay)
     if isinstance(exc, (APITimeoutError, APIConnectionError)):
         delay = min(2 ** attempt, 20)
-        logger.warning(f"LLM 连接/超时，{delay}s 后重试：{exc}")
+        logger.warning(f"LLM connection/timeout, retrying after {delay}s: {exc}")
         return float(delay)
     if isinstance(exc, APIStatusError):
         status = getattr(exc, "status_code", None)
         if status in {500, 502, 503, 504}:
             delay = min(2 ** attempt, 20)
-            logger.warning(f"LLM 服务端错误({status})，{delay}s 后重试：{exc}")
+            logger.warning(f"LLM server error ({status}), retrying after {delay}s: {exc}")
             return float(delay)
-        logger.error(f"LLM 请求失败({status})：{exc}")
+        logger.error(f"LLM request failed ({status}): {exc}")
         return None
 
     return None
@@ -176,7 +176,7 @@ def summarize(
             summary_data = {"title": title, "summary": summary_text}
             break
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"总结解析失败（attempt={attempt + 1}/5）：{exc}")
+            logger.warning(f"Summary parsing failed (attempt={attempt + 1}/5): {exc}")
             time.sleep(1)
         except Exception as exc:  # SDK/network errors handled explicitly below
             delay = _handle_sdk_exception(exc, attempt)
@@ -185,7 +185,7 @@ def summarize(
             time.sleep(delay)
 
     if not summary_data:
-        raise RuntimeError("总结失败：无法从模型输出解析 JSON。")
+        raise RuntimeError("Summary generation failed: Unable to parse JSON from model output.")
 
     title = summary_data["title"]
     summary_text = summary_data["summary"]
@@ -233,7 +233,7 @@ def summarize(
                 "language": target_language,
             }
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"总结翻译解析失败（attempt={attempt + 1}/5）：{exc}")
+            logger.warning(f"Summary translation parsing failed (attempt={attempt + 1}/5): {exc}")
             time.sleep(1)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -241,7 +241,7 @@ def summarize(
                 raise
             time.sleep(delay)
 
-    raise RuntimeError("总结翻译失败：无法从模型输出解析 JSON。")
+    raise RuntimeError("Summary translation failed: Unable to parse JSON from model output.")
 
 
 def translation_postprocess(result: str) -> str:
@@ -442,7 +442,7 @@ def _build_translation_guide(
                 "notes": notes,
             }
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"翻译指南解析失败（attempt={attempt + 1}/5）：{exc}")
+            logger.warning(f"Translation guide parsing failed (attempt={attempt + 1}/5): {exc}")
             time.sleep(1)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -450,7 +450,7 @@ def _build_translation_guide(
                 raise
             time.sleep(delay)
 
-    logger.warning("翻译指南生成失败，降级为空指南")
+    logger.warning("Translation guide generation failed, falling back to empty guide")
     return {"style": [], "glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
 
 
@@ -469,7 +469,7 @@ def _translate_single_with_guide(
     system = (
         f"你是专业字幕翻译，目标语言：{target_language}。\n"
         f"{info}\n"
-        f"翻译指南（JSON）：{guide_json}\n"
+        f"指南（JSON）：{guide_json}\n"
         "请只输出译文本身：\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
@@ -490,7 +490,7 @@ def _translate_single_with_guide(
                 raise _TranslationValidationError(processed)
             return processed
         except _TranslationValidationError as exc:
-            logger.warning(f"译文校验失败（attempt={attempt + 1}/30）：{exc}")
+            logger.warning(f"Translation validation failed (attempt={attempt + 1}/30): {exc}")
             time.sleep(0.5)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -498,7 +498,7 @@ def _translate_single_with_guide(
                 raise
             time.sleep(delay)
 
-    raise RuntimeError("翻译失败：重试耗尽")
+    raise RuntimeError("Translation failed: retries exhausted")
 
 
 def _translate_chunk_with_guide(
@@ -521,7 +521,7 @@ def _translate_chunk_with_guide(
     system = (
         f"你是专业字幕翻译，目标语言：{target_language}。\n"
         f"{info}\n"
-        f"翻译指南（JSON）：{guide_json}\n"
+        f"指南（JSON）：{guide_json}\n"
         "你会收到一个 JSON 对象：key 是句子编号（字符串），value 是原文。\n"
         "请只返回 JSON 对象，保持相同 key，value 只包含译文本身：\n"
         "- 不要包含“翻译”二字\n"
@@ -562,10 +562,10 @@ def _translate_chunk_with_guide(
                 raise ValueError(f"missing translations: {missing[:10]}")
             return out
         except _TranslationValidationError as exc:
-            logger.warning(f"分块译文校验失败（attempt={attempt + 1}/10）：{exc}")
+            logger.warning(f"Chunk translation validation failed (attempt={attempt + 1}/10): {exc}")
             time.sleep(0.8)
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"分块翻译解析失败（attempt={attempt + 1}/10）：{exc}")
+            logger.warning(f"Chunk translation parsing failed (attempt={attempt + 1}/10): {exc}")
             time.sleep(0.8)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -574,7 +574,7 @@ def _translate_chunk_with_guide(
             time.sleep(delay)
 
     # Fallback: translate each line in this chunk sequentially (still no cross-chunk history).
-    logger.warning(f"分块翻译失败，降级逐句翻译：indexes={indexes[:5]}.. (len={len(indexes)})")
+    logger.warning(f"Chunk translation failed, falling back to sentence-by-sentence: indexes={indexes[:5]}.. (len={len(indexes)})")
     out: dict[int, str] = {}
     for i in indexes:
         src = payload.get(str(i), "")
@@ -648,8 +648,8 @@ def _translate_content(
             
             try:
                 translation = _chat_completion_text(backend, messages).replace("\n", "")
-                logger.info(f'原文：{text}')
-                logger.info(f'译文：{translation}')
+                logger.info(f'Original: {text}')
+                logger.info(f'Translation: {translation}')
                 
                 is_valid, processed = valid_translation(text, translation)
                 if not is_valid:
@@ -658,7 +658,7 @@ def _translate_content(
                 translation = processed
                 break
             except _TranslationValidationError as exc:
-                logger.warning(f"译文校验失败（attempt={attempt + 1}/30）：{exc}")
+                logger.warning(f"Translation validation failed (attempt={attempt + 1}/30): {exc}")
                 time.sleep(0.5)
             except Exception as exc:
                 delay = _handle_sdk_exception(exc, attempt)

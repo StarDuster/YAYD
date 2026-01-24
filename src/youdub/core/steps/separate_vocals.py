@@ -29,7 +29,7 @@ def _import_demucs_infer() -> tuple[Any, Any]:
     except ModuleNotFoundError as exc:
         raise DemucsDependencyError(
             "缺少依赖 `demucs-infer`：请先安装后再使用“人声分离(Demucs)”功能。\n"
-            "建议：`uv sync`（或 `pip install demucs-infer`）"
+            "Suggestion: `uv sync` (or `pip install demucs-infer`)"
         ) from exc
     return get_model, apply_model
 
@@ -219,7 +219,7 @@ def separate_audio(
         if duration_sec >= long_audio_threshold_sec:
             if sr_info != target_sr:
                 raise RuntimeError(
-                    f"音频过长（{duration_sec:.1f}s），采样率为 {sr_info}Hz，但 Demucs 期望 {target_sr}Hz。"
+                    f"Audio too long ({duration_sec:.1f}s), sample rate is {sr_info}Hz, but Demucs expects {target_sr}Hz. "
                     "为避免 OOM，本项目不会对长音频走“整段加载+重采样”。请先用 ffmpeg 重新抽取成 44100Hz/2ch 的 wav。"
                 )
 
@@ -424,7 +424,23 @@ def separate_all_audio_under_folder(
         if 'audio.wav' not in files:
             extract_audio_from_video(subdir)
             
-        if 'audio_vocals.wav' not in files:
+        vocal_output_path = os.path.join(subdir, 'audio_vocals.wav')
+        instruments_output_path = os.path.join(subdir, 'audio_instruments.wav')
+
+        def _valid_audio_file(p: str) -> bool:
+            try:
+                return os.path.exists(p) and os.path.getsize(p) >= 44
+            except Exception:
+                return False
+
+        # Re-run separation if outputs are missing or look truncated/corrupted (common after interruptions).
+        if not _valid_audio_file(vocal_output_path) or not _valid_audio_file(instruments_output_path):
+            for p in (vocal_output_path, instruments_output_path):
+                if os.path.exists(p) and not _valid_audio_file(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
             separate_audio(subdir, model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
             count += 1
 

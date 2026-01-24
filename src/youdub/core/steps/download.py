@@ -33,9 +33,17 @@ def download_single_video(info: dict[str, Any], folder_path: str, resolution: st
     if output_folder is None:
         return None
     
-    if os.path.exists(os.path.join(output_folder, 'download.mp4')):
-        logger.info(f'Video already downloaded in {output_folder}')
-        return output_folder
+    download_mp4 = os.path.join(output_folder, 'download.mp4')
+    if os.path.exists(download_mp4):
+        try:
+            if os.path.getsize(download_mp4) >= 1024:
+                logger.info(f'Video already downloaded in {output_folder}')
+                return output_folder
+            logger.warning(f"Existing download.mp4 looks invalid (too small), will re-download: {download_mp4}")
+            os.remove(download_mp4)
+        except Exception:
+            # Best-effort: proceed to re-download
+            pass
     
     sanitized_title = sanitize_title(info.get('title', 'Unknown'))
     sanitized_uploader = sanitize_title(info.get('uploader', 'Unknown'))
@@ -51,10 +59,15 @@ def download_single_video(info: dict[str, Any], folder_path: str, resolution: st
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([info['webpage_url']])
+        rc = ydl.download([info['webpage_url']])
+        if rc not in (0, None):
+            logger.warning(f"yt-dlp returned non-zero code: {rc} ({info.get('webpage_url')})")
     
-    logger.info(f'Video downloaded in {output_folder}')
-    return output_folder
+    if os.path.exists(download_mp4):
+        logger.info(f'Video downloaded in {output_folder}')
+        return output_folder
+    logger.error(f"Download failed, missing file: {download_mp4}")
+    return None
 
 
 def get_info_list_from_url(url: str | list[str], num_videos: int) -> Generator[dict[str, Any], None, None]:

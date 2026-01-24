@@ -26,7 +26,7 @@ def _import_faster_whisper():
         raise RuntimeError(
             "缺少依赖 faster-whisper，语音识别功能不可用。\n"
             "请在当前虚拟环境中安装：`pip install -U faster-whisper`（或使用 `uv sync`）。\n"
-            f"原始错误：{exc}"
+            f"Original error: {exc}"
         ) from exc
     return WhisperModel, BatchedInferencePipeline
 
@@ -43,6 +43,28 @@ _DIARIZATION_KEY: str | None = None
 
 
 _CUDNN_PRELOADED = False
+
+
+def _read_speaker_ref_seconds(default: float = 15.0) -> float:
+    """
+    Speaker reference audio duration (seconds) for downstream TTS voice cloning.
+
+    Official recommendation is usually 10-20s; we default to 15s.
+    Clamp to [3, 60] seconds to avoid pathological inputs.
+    """
+    raw = os.getenv("TTS_SPEAKER_REF_SECONDS")
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if not (v > 0):
+        return default
+    return float(max(3.0, min(v, 60.0)))
 
 
 def _preload_cudnn_for_onnxruntime_gpu() -> None:
@@ -164,10 +186,10 @@ def load_asr_model(
     model_path = Path(model_dir)
     if not model_path.exists():
         raise ModelCheckError(
-            f"Whisper 模型目录不存在：{model_path}。请先下载 faster-whisper CTranslate2 模型并设置 WHISPER_MODEL_PATH。"
+            f"Whisper model directory not found: {model_path}. Please download faster-whisper CTranslate2 model and set WHISPER_MODEL_PATH."
         )
     if model_path.is_dir() and not (model_path / "model.bin").exists():
-        raise ModelCheckError(f"Whisper CTranslate2 模型缺少 model.bin：{model_path}")
+        raise ModelCheckError(f"Whisper CTranslate2 model missing model.bin: {model_path}")
 
     key = f"{model_path.absolute()}|device={device}|compute={compute_type}|batched={int(use_batched)}"
     if _ASR_KEY == key and _ASR_MODEL is not None:
@@ -231,7 +253,7 @@ def load_diarize_model(
         raise RuntimeError(
             "缺少依赖 pyannote.audio，说话人分离不可用。\n"
             "请安装 `pyannote.audio` 并准备好离线模型缓存（或关闭 diarization）。\n"
-            f"原始错误：{exc}"
+            f"Original error: {exc}"
         ) from exc
 
     if diar_dir:
@@ -248,7 +270,7 @@ def load_diarize_model(
     else:
         token = settings.hf_token
         if not token:
-            raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
+            raise ModelCheckError("Missing HF_TOKEN, cannot load pyannote/speaker-diarization-3.1.")
         # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
         try:
             pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
@@ -295,31 +317,66 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
         logger.warning(f"Audio file not found: {wav_path}")
         return
 
-    audio_data, samplerate = librosa.load(wav_path, sr=24000)
-    speaker_dict: dict[str, np.ndarray] = {}
-    length = len(audio_data)
+    target_sr = 24000
+    max_ref_seconds = _read_speaker_ref_seconds()
+    max_ref_samples = int(max_ref_seconds * float(target_sr))
     delay = 0.05
+    speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
+    speaker_dict: dict[str, np.ndarray] = {}
+    for spk in speakers:
+        speaker_dict[spk] = np.zeros((0,), dtype=np.float32)
 
     for segment in transcript:
         start_s = float(segment.get("start", 0.0))
         end_s = float(segment.get("end", 0.0))
-        start = max(0, int((start_s - delay) * samplerate))
-        end = min(int((end_s + delay) * samplerate), length)
-        if start >= end:
+        speaker = str(segment.get("speaker") or "SPEAKER_00")
+        if max_ref_samples > 0 and speaker_dict.get(speaker, np.zeros((0,), dtype=np.float32)).shape[0] >= max_ref_samples:
             continue
 
-        speaker = str(segment.get("speaker") or "SPEAKER_00")
-        chunk = audio_data[start:end]
-        if speaker not in speaker_dict:
-            speaker_dict[speaker] = np.zeros((0,), dtype=np.float32)
+        offset = max(0.0, start_s - delay)
+        duration = max(0.0, (end_s - start_s) + 2.0 * delay)
+        if duration <= 0:
+            continue
+        try:
+            chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=offset, duration=duration)
+        except Exception as exc:
+            logger.warning(f"Failed to load speaker audio chunk (speaker={speaker}, offset={offset:.2f}s): {exc}")
+            continue
+        if chunk.size <= 0:
+            continue
+
+        remaining = max_ref_samples - int(speaker_dict[speaker].shape[0]) if max_ref_samples > 0 else chunk.shape[0]
+        if remaining <= 0:
+            continue
+        if chunk.shape[0] > remaining:
+            chunk = chunk[:remaining]
         speaker_dict[speaker] = np.concatenate((speaker_dict[speaker], chunk.astype(np.float32)))
+
+        if max_ref_samples > 0 and all(v.shape[0] >= max_ref_samples for v in speaker_dict.values()):
+            break
 
     speaker_folder = os.path.join(folder, "SPEAKER")
     os.makedirs(speaker_folder, exist_ok=True)
 
+    # Fallback: if a speaker has 0 samples, take the first N seconds from the file.
+    for speaker in speakers:
+        if speaker_dict[speaker].size > 0:
+            continue
+        try:
+            chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=0.0, duration=max_ref_seconds)
+            if chunk.size > 0:
+                speaker_dict[speaker] = chunk.astype(np.float32)
+        except Exception:
+            # Best-effort: keep empty
+            continue
+
     for speaker, audio in speaker_dict.items():
+        if audio.size <= 0:
+            continue
         speaker_file_path = os.path.join(speaker_folder, f"{speaker}.wav")
-        save_wav(audio, speaker_file_path, sample_rate=24000)
+        save_wav(audio, speaker_file_path, sample_rate=target_sr)
+        if max_ref_samples > 0 and audio.shape[0] >= max_ref_samples:
+            logger.info(f"Saved speaker reference ({max_ref_seconds:.1f}s): {speaker_file_path}")
 
 
 def _assign_speakers_by_overlap(
@@ -372,8 +429,35 @@ def transcribe_audio(
 ) -> bool:
     transcript_path = os.path.join(folder, "transcript.json")
     if os.path.exists(transcript_path):
-        logger.info(f"Transcript already exists in {folder}")
-        return True
+        transcript: Any | None = None
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                transcript = json.load(f)
+            if not isinstance(transcript, list):
+                raise ValueError("transcript.json is not a list")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"Invalid transcript file, will regenerate: {transcript_path} ({exc})")
+            try:
+                os.remove(transcript_path)
+            except Exception:
+                pass
+        else:
+            logger.info(f"Transcript already exists in {folder}")
+            # Ensure speaker reference files exist even when transcript step is skipped.
+            try:
+                speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
+                speaker_dir = os.path.join(folder, "SPEAKER")
+                need = False
+                for spk in speakers:
+                    p = os.path.join(speaker_dir, f"{spk}.wav")
+                    if not os.path.exists(p) or os.path.getsize(p) < 44:
+                        need = True
+                        break
+                if need:
+                    generate_speaker_audio(folder, transcript)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(f"Failed to ensure speaker reference wavs: {exc}")
+            return True
 
     wav_path = os.path.join(folder, "audio_vocals.wav")
     if not os.path.exists(wav_path):
@@ -475,20 +559,21 @@ def transcribe_all_audio_under_folder(
 ) -> str:
     count = 0
     for root, _, files in os.walk(folder):
-        if "audio_vocals.wav" in files and "transcript.json" not in files:
-            ok = transcribe_audio(
-                root,
-                model_name=model_name,
-                device=device,
-                batch_size=batch_size,
-                diarization=diarization,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-                settings=settings,
-                model_manager=model_manager,
-            )
-            if ok:
-                count += 1
+        if "audio_vocals.wav" not in files:
+            continue
+        ok = transcribe_audio(
+            root,
+            model_name=model_name,
+            device=device,
+            batch_size=batch_size,
+            diarization=diarization,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            settings=settings,
+            model_manager=model_manager,
+        )
+        if ok:
+            count += 1
     msg = f"Transcribed all audio under {folder} (processed {count} files)"
     logger.info(msg)
     return msg

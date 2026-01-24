@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import uuid
+import wave
 from collections import deque
 from pathlib import Path
 
@@ -62,6 +63,62 @@ def is_valid_wav(path: str) -> bool:
             return True
     except Exception:
         return False
+
+
+def _read_speaker_ref_seconds(default: float = 15.0) -> float:
+    """
+    Speaker reference audio duration (seconds) for voice cloning.
+
+    Official recommendation is usually 10-20s; we default to 15s.
+    Clamp to [3, 60] seconds to avoid pathological inputs.
+    """
+    raw = os.getenv("TTS_SPEAKER_REF_SECONDS")
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if not (v > 0):
+        return default
+    return float(max(3.0, min(v, 60.0)))
+
+
+def _wav_duration_seconds(path: str) -> float | None:
+    try:
+        with wave.open(path, "rb") as wf:
+            rate = int(wf.getframerate() or 0)
+            if rate <= 0:
+                return None
+            frames = int(wf.getnframes() or 0)
+            if frames <= 0:
+                return 0.0
+            return frames / float(rate)
+    except Exception:
+        return None
+
+
+def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 24000) -> None:
+    if not path or not os.path.exists(path):
+        return
+    if max_seconds <= 0:
+        return
+
+    dur = _wav_duration_seconds(path)
+    if dur is not None and dur <= max_seconds + 0.02:
+        return
+
+    try:
+        wav, _sr = librosa.load(path, sr=sample_rate, duration=max_seconds)
+        if wav.size <= 0:
+            return
+        save_wav(wav.astype(np.float32), path, sample_rate=sample_rate)
+        logger.info(f"Trimmed speaker reference to {max_seconds:.1f}s: {path}")
+    except Exception as exc:
+        logger.warning(f"Failed to trim speaker wav {path}: {exc}")
 
 
 def preprocess_text(text: str) -> str:
@@ -639,7 +696,7 @@ class _QwenTtsWorker:
     def __init__(self, python_exe: str, model_path: str, stub: bool = False):
         script = _get_qwen_worker_script_path()
         if not script.exists():
-            raise ModelCheckError(f"找不到 Qwen3-TTS worker 脚本：{script}")
+            raise ModelCheckError(f"Qwen3-TTS worker script not found: {script}")
 
         cmd = [python_exe, "-u", str(script), "--model-path", model_path]
         if stub:
@@ -658,7 +715,7 @@ class _QwenTtsWorker:
                 bufsize=1,
             )
         except Exception as exc:
-            raise ModelCheckError(f"无法启动 Qwen3-TTS worker：{exc}") from exc
+            raise ModelCheckError(f"Failed to start Qwen3-TTS worker: {exc}") from exc
 
         logger.info(f"Qwen3-TTS worker pid={self._proc.pid}, waiting for ready...")
 
@@ -753,28 +810,30 @@ class _QwenTtsWorker:
                 details.append("stderr:\n" + stderr_tail)
 
             extra = ("\n" + "\n".join(details)) if details else ""
-            raise ModelCheckError(f"Qwen3-TTS worker 启动失败。{extra}")
+            raise ModelCheckError(f"Qwen3-TTS worker startup failed.{extra}")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "_QwenTtsWorker":
         py = settings.resolve_path(settings.qwen_tts_python_path)
         if not py or not py.exists():
             raise ModelCheckError(
-                f"Qwen3-TTS Python 不存在：{py}。请将 QWEN_TTS_PYTHON 指向一个可用的 python（该环境需安装 qwen-tts）。"
+                f"Qwen3-TTS Python not found: {py}. Please set QWEN_TTS_PYTHON to a valid python executable (the environment needs qwen-tts installed)."
             )
 
         model_dir = settings.resolve_path(settings.qwen_tts_model_path)
         if not model_dir or not model_dir.exists():
             raise ModelCheckError(
-                f"Qwen3-TTS 模型目录不存在：{model_dir}。请先下载模型权重到本地并设置 QWEN_TTS_MODEL_PATH。"
+                f"Qwen3-TTS model directory not found: {model_dir}. Please download model weights locally and set QWEN_TTS_MODEL_PATH."
             )
 
         stub = os.getenv(_QWEN_WORKER_STUB_ENV, "").strip() in {"1", "true", "TRUE", "yes", "YES"}
         return cls(python_exe=str(py), model_path=str(model_dir), stub=stub)
 
-    def synthesize(self, text: str, speaker_wav: str, output_path: str, language: str = "Auto") -> None:
+    def synthesize(
+        self, text: str, speaker_wav: str, output_path: str, language: str = "Auto"
+    ) -> dict:
         if self._proc.poll() is not None:
-            raise RuntimeError("Qwen3-TTS worker 已退出")
+            raise RuntimeError("Qwen3-TTS worker has exited")
 
         req = {
             "cmd": "synthesize",
@@ -808,7 +867,7 @@ class _QwenTtsWorker:
                 if not line:
                     stderr_tail = "\n".join(list(self._stderr_tail)).strip()
                     extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
-                    raise RuntimeError("Qwen3-TTS worker 无输出" + extra)
+                    raise RuntimeError("Qwen3-TTS worker produced no output" + extra)
 
                 s = line.strip()
                 if not s:
@@ -837,6 +896,7 @@ class _QwenTtsWorker:
             if trace:
                 raise RuntimeError(err + "\n" + str(trace))
             raise RuntimeError(err)
+        return resp
 
     def close(self) -> None:
         proc = getattr(self, "_proc", None)
@@ -979,7 +1039,32 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
     speakers = set(line["speaker"] for line in transcript)
     num_speakers = len(speakers)
     total_segments = len(transcript)
-    logger.info(f"TTS({tts_method}) 开始：segments={total_segments}, speakers={num_speakers}, folder={folder}")
+    logger.info(f"TTS({tts_method}) started: segments={total_segments}, speakers={num_speakers}, folder={folder}")
+
+    # 防止历史数据/旧逻辑生成超长 SPEAKER/*.wav 导致 voice cloning 显存/时间爆炸
+    max_ref_seconds = _read_speaker_ref_seconds()
+    allow_silence_fallback = (os.getenv("TTS_ALLOW_SILENCE_FALLBACK", "").strip().lower() in {"1", "true", "yes", "y"})
+    failed_segments: list[int] = []
+    speaker_dir = os.path.join(folder, "SPEAKER")
+    os.makedirs(speaker_dir, exist_ok=True)
+
+    # 如果 SPEAKER/*.wav 丢失（常见于旧任务目录或中途清理），从 audio_vocals.wav 兜底生成
+    vocals_path = os.path.join(folder, "audio_vocals.wav")
+    if os.path.exists(vocals_path):
+        for spk in speakers:
+            spk_path = os.path.join(speaker_dir, f"{spk}.wav")
+            if os.path.exists(spk_path):
+                continue
+            try:
+                wav, _sr = librosa.load(vocals_path, sr=24000, mono=True, duration=max_ref_seconds)
+                if wav.size > 0:
+                    save_wav(wav.astype(np.float32), spk_path, sample_rate=24000)
+                    logger.info(f"Generated missing speaker reference ({max_ref_seconds:.1f}s): {spk_path}")
+            except Exception as exc:
+                logger.warning(f"Failed to generate speaker ref wav for {spk}: {exc}")
+
+    for spk in speakers:
+        _ensure_wav_max_duration(os.path.join(speaker_dir, f"{spk}.wav"), max_ref_seconds, sample_rate=24000)
     
     full_wav = np.zeros((0, ))
 
@@ -996,20 +1081,29 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
             seg_no = i + 1
             cached_before = os.path.exists(output_path) and is_valid_wav(output_path)
             cache_tag = " [cached]" if cached_before else ""
-            logger.info(f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}")
-            if tts_method == 'qwen' and qwen_worker is not None:
+            logger.info(
+                f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}"
+            )
+
+            start = line["start"]
+            original_length = line["end"] - start
+
+            tts_elapsed = 0.0
+            qwen_resp: dict | None = None
+            if not cached_before:
+                tts_begin = time.monotonic()
                 try:
-                    if not cached_before:
-                        qwen_worker.synthesize(text, speaker_wav, output_path, language="Auto")
+                    if tts_method == "qwen" and qwen_worker is not None:
+                        qwen_resp = qwen_worker.synthesize(
+                            text, speaker_wav, output_path, language="Auto"
+                        )
+                    elif tts_method == "gemini":
+                        gemini_tts(text, output_path)
+                    else:
+                        bytedance_tts(text, output_path, speaker_wav)
                 except Exception as exc:
-                    logger.warning(f"Qwen3-TTS worker failed for segment {i}: {exc}")
-            elif tts_method == 'gemini':
-                gemini_tts(text, output_path)
-            else:
-                bytedance_tts(text, output_path, speaker_wav)
-            
-            start = line['start']
-            original_length = line['end'] - start
+                    logger.warning(f"TTS({tts_method}) failed for segment {i}: {exc}")
+                tts_elapsed = time.monotonic() - tts_begin
             
             current_full_end = len(full_wav) / 24000.0
             
@@ -1028,19 +1122,46 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
                 
             desired_len = target_end - new_start
             
-            if os.path.exists(output_path) and is_valid_wav(output_path):
+            adjust_elapsed = 0.0
+            valid_wav = os.path.exists(output_path) and is_valid_wav(output_path)
+            if valid_wav:
+                adjust_begin = time.monotonic()
                 wav_chunk, actual_len = adjust_audio_length(output_path, desired_len)
+                adjust_elapsed = time.monotonic() - adjust_begin
             else:
                 logger.warning(f"TTS generation failed via {tts_method} for segment {i}, using silence fallback.")
+                failed_segments.append(i)
                 target_samples = int(desired_len * 24000)
                 wav_chunk = np.zeros(target_samples, dtype=np.float32)
                 actual_len = desired_len
             
             full_wav = np.concatenate((full_wav, wav_chunk))
             line['end'] = new_start + actual_len
+
+            # 段落完成日志：便于在终端观察“是否卡死/进度/耗时”
+            qwen_extra = ""
+            if qwen_resp:
+                sr = qwen_resp.get("sr")
+                n_samples = qwen_resp.get("n_samples")
+                if sr is not None and n_samples is not None:
+                    qwen_extra = f", sr={sr}, n_samples={n_samples}"
+            source = "cached" if cached_before else ("tts" if valid_wav else "silence")
+            logger.info(
+                f"TTS({tts_method}) {seg_no}/{total_segments} done: source={source}, "
+                f"tts={tts_elapsed:.2f}s, adjust={adjust_elapsed:.2f}s, desired={desired_len:.2f}s, actual={actual_len:.2f}s"
+                f"{qwen_extra}"
+            )
     finally:
         if qwen_worker is not None:
             qwen_worker.close()
+
+    if failed_segments and not allow_silence_fallback:
+        head = ", ".join(str(i) for i in failed_segments[:10])
+        more = "..." if len(failed_segments) > 10 else ""
+        raise RuntimeError(
+            f"TTS({tts_method}) 失败 {len(failed_segments)}/{total_segments} 段（indexes: {head}{more}）。"
+            "为避免产出大量静音，已中止；如确实要用静音补齐请设置 TTS_ALLOW_SILENCE_FALLBACK=1。"
+        )
 
     vocal_wav_path = os.path.join(folder, 'audio_vocals.wav')
     if os.path.exists(vocal_wav_path):
@@ -1073,13 +1194,43 @@ def generate_wavs(folder: str, tts_method: str = 'bytedance') -> None:
         logger.warning("No instruments audio found, saving TTS only as combined.")
         save_wav_norm(full_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
 
+    # Write a small marker so we can distinguish "valid result" from stale/partial artifacts.
+    try:
+        state_path = os.path.join(folder, ".tts_done.json")
+        state = {
+            "tts_method": tts_method,
+            "speaker_ref_seconds": max_ref_seconds,
+            "created_at": time.time(),
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        # Best-effort marker only.
+        pass
+
 
 def generate_all_wavs_under_folder(root_folder: str, tts_method: str = 'bytedance') -> str:
     count = 0
-    for root, dirs, files in os.walk(root_folder):
-        if 'translation.json' in files and 'audio_combined.wav' not in files:
-            generate_wavs(root, tts_method)
-            count += 1
+    for root, _dirs, files in os.walk(root_folder):
+        if 'translation.json' not in files:
+            continue
+        combined_path = os.path.join(root, 'audio_combined.wav')
+        done_path = os.path.join(root, ".tts_done.json")
+        if os.path.exists(combined_path) and is_valid_wav(combined_path) and os.path.exists(done_path):
+            try:
+                with open(done_path, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                if st.get("tts_method") == tts_method:
+                    # If translation.json is newer than marker, re-run to reflect changes.
+                    tr_mtime = os.path.getmtime(os.path.join(root, "translation.json"))
+                    done_mtime = os.path.getmtime(done_path)
+                    if done_mtime >= tr_mtime:
+                        continue
+            except Exception:
+                # Treat as not done and re-generate.
+                pass
+        generate_wavs(root, tts_method)
+        count += 1
     msg = f'Generated all wavs under {root_folder} (processed {count} files)'
     logger.info(msg)
     return msg

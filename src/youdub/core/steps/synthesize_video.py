@@ -128,22 +128,30 @@ def synthesize_video(
     fps: int = 30, 
     resolution: str = '1080p'
 ) -> None:
-    if os.path.exists(os.path.join(folder, 'video.mp4')):
-        logger.info(f'Video already synthesized in {folder}')
-        return
+    output_video = os.path.join(folder, 'video.mp4')
+    if os.path.exists(output_video):
+        try:
+            if os.path.getsize(output_video) >= 1024:
+                logger.info(f'Video already synthesized in {folder}')
+                return
+            logger.warning(f"Existing video.mp4 looks invalid (too small), will re-generate: {output_video}")
+            os.remove(output_video)
+        except Exception:
+            # Best-effort: proceed to re-generate
+            pass
     
     translation_path = os.path.join(folder, 'translation.json')
     input_audio = os.path.join(folder, 'audio_combined.wav')
     input_video = os.path.join(folder, 'download.mp4')
     
-    if not os.path.exists(translation_path) or not os.path.exists(input_audio):
-        return
+    missing = [p for p in (translation_path, input_audio, input_video) if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(f"缺少合成视频所需文件：{missing}")
     
     with open(translation_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
         
     srt_path = os.path.join(folder, 'subtitles.srt')
-    output_video = os.path.join(folder, 'video.mp4')
     
     generate_srt(translation, srt_path, speed_up)
 
@@ -195,6 +203,7 @@ def synthesize_video(
         logger.info(f"Synthesized video: {output_video}")
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg failed: {e}")
+        raise
 
 
 def synthesize_all_video_under_folder(
@@ -205,10 +214,18 @@ def synthesize_all_video_under_folder(
     resolution: str = '1080p'
 ) -> str:
     count = 0
-    for root, dirs, files in os.walk(folder):
-        if 'download.mp4' in files and 'video.mp4' not in files:
-            synthesize_video(root, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=resolution)
-            count += 1
+    for root, _dirs, files in os.walk(folder):
+        if 'download.mp4' not in files:
+            continue
+        video_path = os.path.join(root, 'video.mp4')
+        try:
+            if os.path.exists(video_path) and os.path.getsize(video_path) >= 1024:
+                continue
+        except Exception:
+            # Treat as not present/invalid and re-synthesize.
+            pass
+        synthesize_video(root, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=resolution)
+        count += 1
     msg = f'Synthesized all videos under {folder} (processed {count} files)'
     logger.info(msg)
     return msg

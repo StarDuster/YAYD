@@ -9,23 +9,23 @@
 本项目实现了一条模块化、端到端的处理流水线：
 
 1.  **视频获取**: 集成 `yt-dlp`，支持从 YouTube 及其他主流平台下载视频，自动提取元数据。
-2.  **人声分离**: 使用 **Demucs (htdemucs_ft)** 模型，高质量分离人声与背景音乐/音效，确保配音后保留原视频的背景氛围。
+2.  **人声分离**: 使用 `demucs-infer` (htdemucs_ft)，支持流式处理长音频避免显存溢出。
 3.  **语音识别 (ASR) 与 说话人分离 (Diarization)**:
-    *   采用 **faster-whisper** (Large-v3) 进行高精度、快速的语音识别。
-    *   集成 **pyannote.audio**（使用 `pyannote/speaker-diarization-3.1` pipeline）进行说话人区分，支持多角色识别。
-4.  **文本翻译**: 支持 OpenAI 兼容格式的 API (如 OpenAI GPT-4o, DeepSeek, Claude 等)，实现上下文感知的精准翻译。
-5.  **语音合成 (TTS)** (通过 `TTS_METHOD` 配置选择):
-    *   **ByteDance (火山引擎)**: 高质量云端 TTS，支持 **ICL 2.0 声音克隆**（需配置 API）。
-    *   **Qwen3-TTS**: 本地离线 TTS，通过 Worker 子进程运行，无需网络。
-    *   **Google Gemini**: 实验性支持 Gemini TTS API。
+    *   采用 `faster-whisper` (Large-v3) + `ctranslate2` 进行高精度语音识别。
+    *   集成 `pyannote.audio` (兼容 v3.1-v4) 进行说话人区分，支持多角色识别。
+4.  **文本翻译**: 支持 OpenAI 兼容 API，提供串行 (`history`) 和并发 (`guide_parallel`) 两种翻译策略。
+5.  **语音合成 (TTS)** (通过 `TTS_METHOD` 配置):
+    *   **ByteDance (火山引擎)**: 云端 TTS，支持声音克隆（需配置 API）。
+    *   **Qwen3-TTS**: 本地离线 TTS，通过 Worker 子进程运行。
+    *   **Google Gemini**: 实验性支持。
 6.  **视频合成**: 智能音频对齐、变速处理，自动混音背景音轨，生成带字幕的最终视频。
 
 ## 系统要求
 
-*   **操作系统**: Linux (推荐 Ubuntu 22.04+) 或 WSL2 (Windows Subsystem for Linux)。
+*   **操作系统**: Linux (推荐 Ubuntu 22.04+) 或 WSL2。
 *   **Python**: 3.10 或 3.11。
-*   **GPU**: 推荐 NVIDIA GPU，显存 8GB+ (如需运行本地 LLM 或 TTS 可能需要更多)。
-*   **CUDA**: 推荐版本 12.8（主环境默认使用 PyTorch `cu128` 轮子）。
+*   **GPU**: 推荐 NVIDIA GPU，显存 8GB+。
+*   **CUDA**: 可选（如需 GPU 加速，推荐 12.8；使用 `uv sync --extra gpu` 安装 PyTorch cu128 轮子）。
 *   **FFmpeg**: 必须安装并配置在系统 PATH 中。
 
 ## 安装指南
@@ -44,8 +44,11 @@ cd YAYD
 确保已安装 `uv`，然后同步依赖：
 
 ```bash
-# 创建虚拟环境并安装依赖
+# 创建虚拟环境并安装依赖（默认 CPU 依赖）
 uv sync
+
+# 如需 GPU 加速（Linux，CUDA 12.8 / PyTorch cu128）
+uv sync --extra gpu
 ```
 
 或者使用传统的 pip 安装方式（建议在虚拟环境中）：
@@ -87,10 +90,10 @@ docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-pr
 ```bash
 uv run python scripts/download_models.py
 ```
-此脚本将下载并验证以下模型：
-*   `Systran/faster-whisper-large-v3`
-*   `pyannote/speaker-diarization-3.1`
-*   `demucs (htdemucs_ft)`
+此脚本将下载：
+*   `Systran/faster-whisper-large-v3` (CTranslate2 格式)
+*   `pyannote/speaker-diarization-3.1` + `segmentation-3.0`
+*   `demucs htdemucs_ft` (via torch.hub)
 
 ## 配置指南
 
@@ -131,6 +134,12 @@ GEMINI_TTS_VOICE=Kore
 QWEN_TTS_MODEL_PATH=models/TTS/Qwen3-TTS-12Hz-1.7B-Base
 # 默认使用主工程 .venv，也可指定独立环境
 QWEN_TTS_PYTHON=.venv/bin/python
+
+# --- 翻译配置 (可选) ---
+# 翻译策略: history (默认，串行带上下文) / guide_parallel (先生成翻译指南，再并发翻译)
+TRANSLATION_STRATEGY=history
+# guide_parallel 模式下的并发数
+TRANSLATION_MAX_CONCURRENCY=4
 ```
 
 ## 使用说明
@@ -153,19 +162,13 @@ uv run youdub
 3.  **分步模式**:
     *   可在各标签页单独执行特定步骤（如仅下载、仅翻译、仅 TTS），便于调试或人工修正中间结果（如修正 `translation.json`）。
 
-## 高级功能：Qwen3-TTS (本地离线 TTS)
+### Qwen3-TTS 本地模式配置
 
-若需使用本地 Qwen3-TTS 模型进行语音合成：
+若使用 `TTS_METHOD=qwen`，需要：
 
-1.  **环境准备**: 主工程 `.venv` 已包含 `qwen-tts` 依赖，可直接使用。如需隔离环境，可另建 venv 并安装 `qwen-tts`。
-2.  **下载模型**: 从 Hugging Face 下载 [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 到 `models/TTS/` 目录。
-3.  **配置 `.env`**:
-    ```ini
-    TTS_METHOD=qwen
-    QWEN_TTS_MODEL_PATH=models/TTS/Qwen3-TTS-12Hz-1.7B-Base
-    QWEN_TTS_PYTHON=.venv/bin/python
-    ```
-4.  程序运行时会自动拉起 `scripts/qwen_tts_worker.py` 子进程进行推理。
+1.  从 Hugging Face 下载 [Qwen/Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) 到 `models/TTS/` 目录。
+2.  主工程 `.venv` 已包含 `qwen-tts` 依赖，可直接使用。
+3.  程序运行时会自动拉起 `scripts/qwen_tts_worker.py` 子进程进行推理。
 
 ## 许可证
 

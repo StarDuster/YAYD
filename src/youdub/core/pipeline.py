@@ -65,6 +65,15 @@ class VideoPipeline:
     ) -> bool:
         for retry in range(max_retries):
             try:
+                def _require_file(path: str, desc: str, min_bytes: int = 1) -> None:
+                    if not os.path.exists(path):
+                        raise FileNotFoundError(f"Missing {desc}: {path}")
+                    try:
+                        if os.path.getsize(path) < min_bytes:
+                            raise FileNotFoundError(f"{desc} file too small or corrupted: {path}")
+                    except OSError:
+                        raise FileNotFoundError(f"Cannot read {desc}: {path}") from None
+
                 folder = download.get_target_folder(info, root_folder)
                 if folder is None:
                     logger.warning(f"Failed to get target folder for video {info.get('title')}")
@@ -77,9 +86,11 @@ class VideoPipeline:
                 folder = download.download_single_video(info, root_folder, resolution)
                 if folder is None:
                     logger.warning(f"Failed to download video {info.get('title')}")
-                    return True
+                    return False
 
                 logger.info(f"Process video in {folder}")
+
+                _require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
 
                 separate_vocals.separate_all_audio_under_folder(
                     folder,
@@ -91,6 +102,9 @@ class VideoPipeline:
                     model_manager=self.model_manager,
                 )
                 separate_vocals.unload_model()
+
+                _require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
+                _require_file(os.path.join(folder, "audio_instruments.wav"), "伴奏轨(audio_instruments.wav)", min_bytes=44)
 
                 transcribe.transcribe_all_audio_under_folder(
                     folder,
@@ -105,20 +119,33 @@ class VideoPipeline:
                 )
                 transcribe.unload_all_models()
 
+                _require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
+
                 translate.translate_all_transcript_under_folder(
                     folder, target_language=translation_target_language, settings=self.settings
                 )
+
+                _require_file(os.path.join(folder, "translation.json"), "翻译结果(translation.json)", min_bytes=2)
+
                 synthesize_speech.generate_all_wavs_under_folder(
                     folder, 
                     tts_method=tts_method,
                 )
+
+                _require_file(os.path.join(folder, "audio_combined.wav"), "配音合成(audio_combined.wav)", min_bytes=44)
+
                 synthesize_all_video_under_folder(
                     folder, subtitles=subtitles, speed_up=speed_up, fps=fps, resolution=target_resolution
                 )
+
+                _require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
+
                 generate_all_info_under_folder(folder)
                 if auto_upload_video:
                     time.sleep(1)
                     upload_all_videos_under_folder(folder)
+                    if not self._already_uploaded(folder):
+                        raise RuntimeError(f"Auto upload failed: {folder}")
                 return True
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception(f"Error processing video {info.get('title')}: {exc}")

@@ -46,8 +46,8 @@ class ModelManager:
     def _demucs_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.demucs_model_dir)
         hint = (
-            f"需要 Demucs 权重（{self.settings.demucs_model_name}）。"
-            f"请先把权重文件放到：{path}（或设置 DEMUCS_MODEL_DIR）。"
+            f"Demucs weights required ({self.settings.demucs_model_name})."
+            f"Please place weight files at: {path} (or set DEMUCS_MODEL_DIR)."
         )
         return ModelRequirement(
             name=f"Demucs ({self.settings.demucs_model_name})",
@@ -58,8 +58,8 @@ class ModelManager:
     def _whisper_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_model_path)
         hint = (
-            "需要 faster-whisper 的 CTranslate2 离线模型目录（目录内应包含 model.bin）。"
-            f"请下载后放到：{path}（或设置 WHISPER_MODEL_PATH）。"
+            "faster-whisper CTranslate2 offline model directory required (should contain model.bin)."
+            f"Please download and place at: {path} (or set WHISPER_MODEL_PATH)."
         )
         return ModelRequirement(
             name=f"Whisper ASR ({self.settings.whisper_model_name})",
@@ -70,8 +70,8 @@ class ModelManager:
     def _whisper_diarization_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_diarization_model_dir)
         hint = (
-            "需要 pyannote 的说话人分离缓存（speaker-diarization-3.1 + segmentation-3.0）。"
-            "请先离线下载到 WHISPER_DIARIZATION_MODEL_DIR，并配置 HF_TOKEN（用于首次下载/校验）。"
+            "pyannote speaker diarization cache required (speaker-diarization-3.1 + segmentation-3.0)."
+            "Please download offline to WHISPER_DIARIZATION_MODEL_DIR and configure HF_TOKEN (for first-time download/verification)."
         )
         return ModelRequirement(
             name="Speaker Diarization (pyannote)",
@@ -82,8 +82,8 @@ class ModelManager:
     def _qwen_tts_runtime_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.qwen_tts_python_path)
         hint = (
-            "需要一个能运行 Qwen3-TTS worker 的 Python 解释器。默认可直接用主工程 .venv；"
-            "如果你自己改了 QWEN_TTS_PYTHON，请确保该环境已安装 qwen-tts（能 import qwen_tts）。"
+            "A Python interpreter that can run Qwen3-TTS worker is required. Default can use main project .venv directly;"
+            "If you changed QWEN_TTS_PYTHON, ensure the environment has qwen-tts installed (can import qwen_tts)."
         )
         return ModelRequirement(
             name="Qwen3-TTS Runtime (python)",
@@ -94,8 +94,8 @@ class ModelManager:
     def _qwen_tts_weights_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.qwen_tts_model_path)
         hint = (
-            "需要本地 Qwen3-TTS Base 权重目录（例如包含 config.json / model.safetensors）。"
-            f"请下载后放到：{path}（或设置 QWEN_TTS_MODEL_PATH）。"
+            "Local Qwen3-TTS Base weights directory required (e.g., containing config.json / model.safetensors)."
+            f"Please download and place at: {path} (or set QWEN_TTS_MODEL_PATH)."
         )
         return ModelRequirement(
             name="Qwen3-TTS Base Weights",
@@ -107,13 +107,13 @@ class ModelManager:
         ok = bool(self.settings.bytedance_appid) and bool(self.settings.bytedance_access_token)
         # Use an always-existing marker when credentials are present. Avoid relying on os.environ (Settings reads .env).
         path = Path(__file__) if ok else None
-        hint = "需要火山引擎 TTS 凭据：BYTEDANCE_APPID / BYTEDANCE_ACCESS_TOKEN（可写在 .env）。"
+        hint = "ByteDance TTS credentials required: BYTEDANCE_APPID / BYTEDANCE_ACCESS_TOKEN (can be written in .env)."
         return ModelRequirement(name="ByteDance TTS Credentials", path=path, hint=hint)
 
     def _gemini_tts_requirement(self) -> ModelRequirement:
         ok = bool(self.settings.gemini_api_key)
         path = Path(__file__) if ok else None
-        hint = "需要 Gemini TTS 凭据：GEMINI_API_KEY（可写在 .env）。"
+        hint = "Gemini TTS credentials required: GEMINI_API_KEY (can be written in .env)."
         return ModelRequirement(name="Gemini TTS Credentials", path=path, hint=hint)
 
     def list_requirements(self) -> list[ModelRequirement]:
@@ -160,17 +160,17 @@ class ModelManager:
 
     def format_missing(self, missing: list[ModelRequirement]) -> str:
         if not missing:
-            return "模型已就绪。"
-        lines = ["模型未准备就绪，请先手动下载或配置："]
+            return "Models ready."
+        lines = ["Models not ready, please download or configure manually:"]
         for req in missing:
-            path_text = f"期望路径: {req.path}" if req.path else "缺少必需的凭据或路径"
+            path_text = f"Expected path: {req.path}" if req.path else "Missing required credentials or path"
             lines.append(f"- {req.name}: {path_text}。{req.hint}")
         return "\n".join(lines)
 
     def describe_status(self) -> str:
         statuses = []
         for req in self.list_requirements():
-            status = "✅ 已找到" if req.exists() else "❌ 未找到"
+            status = "✅ Found" if req.exists() else "❌ Not found"
             location = f"（{req.path}）" if req.path else ""
             statuses.append(f"{status} {req.name} {location}")
         return "\n".join(statuses)

@@ -34,7 +34,6 @@ from .synthesize_video import (
     generate_srt,
     split_text,
     synthesize_all_video_under_folder,
-    synthesize_video,
 )
 from .generate_info import (
     generate_all_info_under_folder,
@@ -70,7 +69,6 @@ __all__ = [
     "generate_srt",
     "split_text",
     "synthesize_all_video_under_folder",
-    "synthesize_video",
     "resize_thumbnail",
     "generate_summary_txt",
     "generate_info",
