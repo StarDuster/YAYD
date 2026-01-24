@@ -323,7 +323,6 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             duration_per_char = (item['end'] - item['start']) / len(translation_text)
              
-        sentence_start_idx = 0
         for sentence in sentences:
             sentence_len = len(sentence)
             sentence_end = start + duration_per_char * sentence_len
@@ -337,7 +336,6 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
             })
 
             start = sentence_end
-            sentence_start_idx += sentence_len
             
     return output_data
 
@@ -679,12 +677,36 @@ def _translate_content(
 
 
 def translate_folder(folder: str, target_language: str = '简体中文', settings: Settings | None = None) -> bool:
-    if os.path.exists(os.path.join(folder, 'translation.json')):
+    translation_path = os.path.join(folder, 'translation.json')
+    summary_path = os.path.join(folder, 'summary.json')
+
+    translation_ok = False
+    if os.path.exists(translation_path):
+        try:
+            with open(translation_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+            if not isinstance(existing, list) or not existing:
+                raise ValueError("translation.json is not a non-empty list")
+            for item in existing[:50]:
+                if not isinstance(item, dict) or "translation" not in item:
+                    raise ValueError("translation.json missing 'translation' field")
+            translation_ok = True
+        except Exception as exc:
+            logger.warning(f"Invalid translation file, will regenerate: {translation_path} ({exc})")
+            try:
+                os.remove(translation_path)
+            except Exception:
+                pass
+            translation_ok = False
+
+    # If both translation + summary exist, we consider this step ready.
+    if translation_ok and os.path.exists(summary_path):
         logger.info(f'Translation already exists in {folder}')
         return True
-    
+
     info_path = os.path.join(folder, 'download.info.json')
     if not os.path.exists(info_path):
+        logger.warning(f"Info file not found: {info_path}")
         return False
         
     with open(info_path, 'r', encoding='utf-8') as f:
@@ -693,21 +715,28 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
     
     transcript_path = os.path.join(folder, 'transcript.json')
     if not os.path.exists(transcript_path):
+        logger.warning(f"Transcript file not found: {transcript_path}")
         return False
         
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
     
-    summary_path = os.path.join(folder, 'summary.json')
     if os.path.exists(summary_path):
-        with open(summary_path, 'r', encoding='utf-8') as f:
-            summary = json.load(f)
+        try:
+            with open(summary_path, 'r', encoding='utf-8') as f:
+                summary = json.load(f)
+        except Exception:
+            summary = summarize(info, transcript, target_language, settings=settings)
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
     else:
         summary = summarize(info, transcript, target_language, settings=settings)
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    translation_path = os.path.join(folder, 'translation.json')
+    # If we only needed to backfill summary.json, stop here.
+    if translation_ok:
+        return True
     
     # Perform translation
     translations = _translate_content(summary, transcript, target_language, settings=settings)
@@ -726,8 +755,11 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
 def translate_all_transcript_under_folder(folder: str, target_language: str, settings: Settings | None = None) -> str:
     count = 0
     for root, dirs, files in os.walk(folder):
-        if 'transcript.json' in files and 'translation.json' not in files:
-            if translate_folder(root, target_language, settings=settings):
+        if 'transcript.json' not in files:
+            continue
+        need = ('translation.json' not in files) or ('summary.json' not in files)
+        if translate_folder(root, target_language, settings=settings):
+            if need:
                 count += 1
     msg = f'Translated all videos under {folder} (processed {count} files)'
     logger.info(msg)
