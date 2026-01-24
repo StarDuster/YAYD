@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, Optional
 
 from loguru import logger
 
@@ -11,23 +11,18 @@ from .config import Settings
 
 
 class ModelCheckError(RuntimeError):
-    """Raised when required models or credentials are missing."""
+    """模型/凭据缺失时抛出（用于 UI 友好提示）。"""
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelRequirement:
+    """一个“资源要求”（文件/目录/配置占位），用于模型检查与提示。"""
+
     name: str
     path: Optional[Path]
     hint: str
-    required: bool = True
-    env_keys: Optional[list[str]] = None
 
     def exists(self) -> bool:
-        if self.env_keys:
-            # All listed env keys must be present for this requirement to be considered satisfied.
-            if all(os.getenv(k) for k in self.env_keys):
-                return True
-        # Path-based requirement
         if self.path is None:
             return False
         path = Path(self.path).expanduser()
@@ -35,12 +30,15 @@ class ModelRequirement:
             return True
         if path.is_dir():
             # Consider non-empty directory as present
-            return any(path.iterdir())
+            try:
+                return any(path.iterdir())
+            except PermissionError:
+                return False
         return False
 
 
 class ModelManager:
-    """Central place to validate required models and surface user-friendly hints."""
+    """集中管理：依赖资源是否就绪 + 对用户的提示文案。"""
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()
@@ -48,21 +46,20 @@ class ModelManager:
     def _demucs_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.demucs_model_dir)
         hint = (
-            f"请提前下载 Demucs 权重（{self.settings.demucs_model_name}），"
-            f"放到 {path}，否则 Demucs 会尝试在线下载。"
+            f"需要 Demucs 权重（{self.settings.demucs_model_name}）。"
+            f"请先把权重文件放到：{path}（或设置 DEMUCS_MODEL_DIR）。"
         )
         return ModelRequirement(
             name=f"Demucs ({self.settings.demucs_model_name})",
             path=path,
             hint=hint,
-            required=True,
         )
 
     def _whisper_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_model_path)
         hint = (
-            "需要 Whisper CTranslate2 离线模型（faster-whisper 格式，目录内应包含 model.bin）。"
-            f" 请下载后放在 {path} 或设置 WHISPER_MODEL_PATH。"
+            "需要 faster-whisper 的 CTranslate2 离线模型目录（目录内应包含 model.bin）。"
+            f"请下载后放到：{path}（或设置 WHISPER_MODEL_PATH）。"
         )
         return ModelRequirement(
             name=f"Whisper ASR ({self.settings.whisper_model_name})",
@@ -73,8 +70,8 @@ class ModelManager:
     def _whisper_diarization_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_diarization_model_dir)
         hint = (
-            "需要说话人分离模型缓存（pyannote/speaker-diarization-3.1）。"
-            " 请先下载到本地并设置 WHISPER_DIARIZATION_MODEL_DIR / HF_TOKEN。"
+            "需要 pyannote 的说话人分离缓存（speaker-diarization-3.1 + segmentation-3.0）。"
+            "请先离线下载到 WHISPER_DIARIZATION_MODEL_DIR，并配置 HF_TOKEN（用于首次下载/校验）。"
         )
         return ModelRequirement(
             name="Speaker Diarization (pyannote)",
@@ -85,8 +82,8 @@ class ModelManager:
     def _qwen_tts_runtime_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.qwen_tts_python_path)
         hint = (
-            "需要一个独立的 Qwen3-TTS 运行环境（避免与主工程依赖冲突/污染），"
-            "请创建单独 venv 并安装 qwen-tts，然后设置 QWEN_TTS_PYTHON 指向该环境的 python。"
+            "需要一个能运行 Qwen3-TTS worker 的 Python 解释器。默认可直接用主工程 .venv；"
+            "如果你自己改了 QWEN_TTS_PYTHON，请确保该环境已安装 qwen-tts（能 import qwen_tts）。"
         )
         return ModelRequirement(
             name="Qwen3-TTS Runtime (python)",
@@ -97,8 +94,8 @@ class ModelManager:
     def _qwen_tts_weights_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.qwen_tts_model_path)
         hint = (
-            "需要本地 Qwen3-TTS Base 模型目录（包含 config.json / model.safetensors 等），"
-            "请提前下载并设置 QWEN_TTS_MODEL_PATH。"
+            "需要本地 Qwen3-TTS Base 权重目录（例如包含 config.json / model.safetensors）。"
+            f"请下载后放到：{path}（或设置 QWEN_TTS_MODEL_PATH）。"
         )
         return ModelRequirement(
             name="Qwen3-TTS Base Weights",
@@ -107,31 +104,17 @@ class ModelManager:
         )
 
     def _bytedance_requirement(self) -> ModelRequirement:
-        hint = "配置 BYTEDANCE_APPID 与 BYTEDANCE_ACCESS_TOKEN 用于火山 TTS。"
-        env_present = all(
-            [
-                bool(self.settings.bytedance_appid),
-                bool(self.settings.bytedance_access_token),
-            ]
-        )
-        path = Path(".bytedance_credentials_ok") if env_present else None
-        return ModelRequirement(
-            name="ByteDance TTS Credentials",
-            path=path,
-            hint=hint,
-            env_keys=["BYTEDANCE_APPID", "BYTEDANCE_ACCESS_TOKEN"],
-        )
+        ok = bool(self.settings.bytedance_appid) and bool(self.settings.bytedance_access_token)
+        # Use an always-existing marker when credentials are present. Avoid relying on os.environ (Settings reads .env).
+        path = Path(__file__) if ok else None
+        hint = "需要火山引擎 TTS 凭据：BYTEDANCE_APPID / BYTEDANCE_ACCESS_TOKEN（可写在 .env）。"
+        return ModelRequirement(name="ByteDance TTS Credentials", path=path, hint=hint)
 
     def _gemini_tts_requirement(self) -> ModelRequirement:
-        hint = "配置 GEMINI_API_KEY 用于 Gemini TTS。"
-        env_present = bool(self.settings.gemini_api_key)
-        path = Path(".gemini_credentials_ok") if env_present else None
-        return ModelRequirement(
-            name="Gemini TTS Credentials",
-            path=path,
-            hint=hint,
-            env_keys=["GEMINI_API_KEY"],
-        )
+        ok = bool(self.settings.gemini_api_key)
+        path = Path(__file__) if ok else None
+        hint = "需要 Gemini TTS 凭据：GEMINI_API_KEY（可写在 .env）。"
+        return ModelRequirement(name="Gemini TTS Credentials", path=path, hint=hint)
 
     def list_requirements(self) -> list[ModelRequirement]:
         return [
@@ -194,10 +177,6 @@ class ModelManager:
 
     def enforce_offline(self) -> None:
         """Set environment flags to avoid accidental online downloads."""
-        import os
-
-        if os.getenv("HF_HUB_OFFLINE") is None:
-            os.environ["HF_HUB_OFFLINE"] = "1"
-        if os.getenv("TRANSFORMERS_OFFLINE") is None:
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         logger.debug("Offline mode enforced for Hugging Face downloads.")
