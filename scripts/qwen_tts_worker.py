@@ -40,17 +40,36 @@ def main() -> int:
         import torch
         from qwen_tts import Qwen3TTSModel
 
-        device_map = "cuda:0" if torch.cuda.is_available() else "cpu"
-        if device_map.startswith("cuda") and torch.cuda.is_available():
+        if torch.cuda.is_available():
+            device_map = "cuda:0"
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            tts = Qwen3TTSModel.from_pretrained(
+                model_path,
+                device_map=device_map,
+                dtype=dtype,
+            )
         else:
-            dtype = torch.float32
-
-        tts = Qwen3TTSModel.from_pretrained(
-            model_path,
-            device_map=device_map,
-            dtype=dtype,
-        )
+            # CPU 上直接 float32 加载 1.7B 权重很容易 OOM 被系统杀掉（尤其在 WSL2 默认内存限制下）。
+            # 这里优先尝试更省内存的 dtype；如果仍失败，直接抛错让父进程拿到可读的 traceback。
+            device_map = "cpu"
+            last_exc: Exception | None = None
+            for dtype in (torch.bfloat16, torch.float16, torch.float32):
+                try:
+                    tts = Qwen3TTSModel.from_pretrained(
+                        model_path,
+                        device_map=device_map,
+                        dtype=dtype,
+                    )
+                    last_exc = None
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    last_exc = exc
+                    tts = None
+            if tts is None:
+                raise RuntimeError(
+                    "无法在 CPU 上加载 Qwen3-TTS 模型（已尝试 bf16/fp16/fp32）。"
+                    "建议启用 CUDA/GPU，或换更小/量化的模型权重。"
+                ) from last_exc
 
     # Signal parent that we're ready.
     print(READY_LINE, flush=True)
