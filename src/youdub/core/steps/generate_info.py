@@ -6,6 +6,8 @@ from typing import Iterator
 from loguru import logger
 from PIL import Image
 
+from ..interrupts import check_cancelled
+
 
 def resize_thumbnail(folder, size=(1280, 960)):
     image_suffix = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
@@ -63,9 +65,11 @@ def generate_info(folder):
     
 
 def generate_all_info_under_folder(root_folder):
+    check_cancelled()
     start = time.time()
     count = 0
     for root, dirs, files in os.walk(root_folder):
+        check_cancelled()
         if 'download.info.json' in files:
             generate_info(root)
             count += 1
@@ -77,6 +81,7 @@ def generate_all_info_under_folder(root_folder):
 def generate_all_info_under_folder_stream(root_folder: str) -> Iterator[str]:
     """Gradio-friendly streaming version with human-readable progress output."""
 
+    check_cancelled()
     start = time.time()
     root_folder = str(root_folder or "").strip()
 
@@ -106,6 +111,7 @@ def generate_all_info_under_folder_stream(root_folder: str) -> Iterator[str]:
     yield _emit(f"开始生成信息：{root_folder}")
 
     for root, _dirs, files in os.walk(root_folder):
+        check_cancelled()
         if "download.info.json" not in files:
             continue
 

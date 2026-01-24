@@ -16,6 +16,7 @@ from loguru import logger
 
 from ...config import Settings
 from ...models import ModelCheckError, ModelManager
+from ..interrupts import check_cancelled
 from ..utils import ensure_torchaudio_backend_compat, save_wav
 
 
@@ -172,6 +173,7 @@ def load_asr_model(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> None:
+    check_cancelled()
     global _ASR_MODEL, _ASR_PIPELINE, _ASR_KEY
 
     settings = settings or _DEFAULT_SETTINGS
@@ -245,6 +247,7 @@ def load_diarize_model(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> None:
+    check_cancelled()
     global _DIARIZATION_PIPELINE, _DIARIZATION_KEY
 
     settings = settings or _DEFAULT_SETTINGS
@@ -331,6 +334,7 @@ def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~
 
 
 def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> None:
+    check_cancelled()
     wav_path = os.path.join(folder, "audio_vocals.wav")
     if not os.path.exists(wav_path):
         logger.warning(f"Audio file not found: {wav_path}")
@@ -343,9 +347,11 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
     speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
     speaker_dict: dict[str, np.ndarray] = {}
     for spk in speakers:
+        check_cancelled()
         speaker_dict[spk] = np.zeros((0,), dtype=np.float32)
 
     for segment in transcript:
+        check_cancelled()
         start_s = float(segment.get("start", 0.0))
         end_s = float(segment.get("end", 0.0))
         speaker = str(segment.get("speaker") or "SPEAKER_00")
@@ -357,6 +363,7 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
         if duration <= 0:
             continue
         try:
+            check_cancelled()
             chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=offset, duration=duration)
         except Exception as exc:
             logger.warning(f"Failed to load speaker audio chunk (speaker={speaker}, offset={offset:.2f}s): {exc}")
@@ -379,9 +386,11 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
 
     # Fallback: if a speaker has 0 samples, take the first N seconds from the file.
     for speaker in speakers:
+        check_cancelled()
         if speaker_dict[speaker].size > 0:
             continue
         try:
+            check_cancelled()
             chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=0.0, duration=max_ref_seconds)
             if chunk.size > 0:
                 speaker_dict[speaker] = chunk.astype(np.float32)
@@ -390,6 +399,7 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
             continue
 
     for speaker, audio in speaker_dict.items():
+        check_cancelled()
         if audio.size <= 0:
             continue
         speaker_file_path = os.path.join(speaker_folder, f"{speaker}.wav")
@@ -405,6 +415,7 @@ def _assign_speakers_by_overlap(
 ) -> None:
     if not segments or not turns:
         for seg in segments:
+            check_cancelled()
             seg["speaker"] = default_speaker
         return
 
@@ -412,6 +423,7 @@ def _assign_speakers_by_overlap(
     idx = 0
 
     for seg in segments:
+        check_cancelled()
         seg_start = float(seg.get("start", 0.0))
         seg_end = float(seg.get("end", 0.0))
         if seg_end <= seg_start:
@@ -419,12 +431,14 @@ def _assign_speakers_by_overlap(
             continue
 
         while idx < len(turns_sorted) and float(turns_sorted[idx]["end"]) <= seg_start:
+            check_cancelled()
             idx += 1
 
         best_speaker = None
         best_overlap = 0.0
         j = idx
         while j < len(turns_sorted) and float(turns_sorted[j]["start"]) < seg_end:
+            check_cancelled()
             t = turns_sorted[j]
             ov = max(0.0, min(seg_end, float(t["end"])) - max(seg_start, float(t["start"])))
             if ov > best_overlap:
@@ -447,6 +461,7 @@ def transcribe_audio(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> bool:
+    check_cancelled()
     transcript_path = os.path.join(folder, "transcript.json")
     if os.path.exists(transcript_path):
         transcript: Any | None = None
@@ -469,6 +484,7 @@ def transcribe_audio(
                 speaker_dir = os.path.join(folder, "SPEAKER")
                 need = False
                 for spk in speakers:
+                    check_cancelled()
                     p = os.path.join(speaker_dir, f"{spk}.wav")
                     if not os.path.exists(p) or os.path.getsize(p) < 44:
                         need = True
@@ -501,6 +517,7 @@ def transcribe_audio(
         if cpu_candidate:
             model_name = cpu_candidate
 
+    check_cancelled()
     load_asr_model(
         model_dir=model_name,
         device=device,
@@ -518,6 +535,7 @@ def transcribe_audio(
 
     # Prefer batched pipeline if available (much higher throughput on GPU).
     if _ASR_PIPELINE is not None:
+        check_cancelled()
         segments_iter, info = _ASR_PIPELINE.transcribe(
             wav_path,
             batch_size=batch_size,
@@ -526,6 +544,7 @@ def transcribe_audio(
             condition_on_previous_text=False,
         )
     else:
+        check_cancelled()
         segments_iter, info = _ASR_MODEL.transcribe(
             wav_path,
             beam_size=5,
@@ -533,11 +552,15 @@ def transcribe_audio(
             condition_on_previous_text=False,
         )
 
-    segments_list = list(segments_iter)
+    segments_list = []
+    for seg in segments_iter:
+        check_cancelled()
+        segments_list.append(seg)
     logger.info(f"ASR done in {time.time() - t0:.2f}s (segments={len(segments_list)}, language={getattr(info, 'language', None)})")
 
     transcript: list[dict[str, Any]] = []
     for seg in segments_list:
+        check_cancelled()
         text = (getattr(seg, "text", "") or "").strip()
         if not text:
             continue
@@ -551,13 +574,16 @@ def transcribe_audio(
         )
 
     if diarization:
+        check_cancelled()
         try:
             load_diarize_model(device=device, settings=settings, model_manager=model_manager)
             assert _DIARIZATION_PIPELINE is not None
             logger.info("Starting diarization (pyannote)...")
+            check_cancelled()
             ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
             turns: list[dict[str, Any]] = []
             for seg, _, speaker in ann.itertracks(yield_label=True):
+                check_cancelled()
                 turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
             _assign_speakers_by_overlap(transcript, turns)
         except Exception as exc:  # pylint: disable=broad-except
@@ -565,12 +591,15 @@ def transcribe_audio(
             for item in transcript:
                 item["speaker"] = "SPEAKER_00"
 
+    check_cancelled()
     transcript = merge_segments(transcript)
 
+    check_cancelled()
     with open(transcript_path, "w", encoding="utf-8") as f:
         json.dump(transcript, f, indent=2, ensure_ascii=False)
     logger.info(f"Saved transcript: {transcript_path}")
 
+    check_cancelled()
     generate_speaker_audio(folder, transcript)
     return True
 
@@ -587,8 +616,10 @@ def transcribe_all_audio_under_folder(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> str:
+    check_cancelled()
     count = 0
     for root, _, files in os.walk(folder):
+        check_cancelled()
         if "audio_vocals.wav" not in files:
             continue
         ok = transcribe_audio(
