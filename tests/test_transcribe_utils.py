@@ -7,7 +7,7 @@ from youdub.models import ModelCheckError, ModelManager
 
 
 def test_merge_segments_respects_speaker_and_punctuation():
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     transcript = [
         {"start": 0.0, "end": 0.5, "text": "hello", "speaker": "S1"},
@@ -38,7 +38,7 @@ def test_merge_segments_respects_speaker_and_punctuation():
 
 
 def test_assign_speakers_by_overlap_picks_best_match():
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     segments = [
         {"start": 0.0, "end": 1.0, "text": "a"},
@@ -55,7 +55,7 @@ def test_assign_speakers_by_overlap_picks_best_match():
 
 
 def test_assign_speakers_by_overlap_defaults_when_no_turns_or_bad_segment():
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     segments = [
         {"start": 0.0, "end": 1.0, "text": "a"},
@@ -68,7 +68,7 @@ def test_assign_speakers_by_overlap_defaults_when_no_turns_or_bad_segment():
 
 
 def test_transcribe_audio_short_circuits_when_transcript_exists(tmp_path):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     folder = tmp_path / "job"
     folder.mkdir()
@@ -79,7 +79,7 @@ def test_transcribe_audio_short_circuits_when_transcript_exists(tmp_path):
 
 
 def test_load_asr_model_requires_model_bin_even_if_dir_nonempty(tmp_path):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     model_dir = tmp_path / "whisper_model"
     model_dir.mkdir(parents=True, exist_ok=True)

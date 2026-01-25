@@ -6,7 +6,7 @@ from typing import Any, Generator
 import yt_dlp
 from loguru import logger
 
-from ...config import Settings
+from ..config import Settings
 from ..interrupts import check_cancelled
 
 

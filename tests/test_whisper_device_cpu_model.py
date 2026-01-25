@@ -13,7 +13,7 @@ def _touch_model_bin(root: Path) -> None:
 
 
 def test_init_asr_auto_uses_cuda_when_available(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     gpu_dir = tmp_path / "gpu"
     cpu_dir = tmp_path / "cpu"
@@ -44,7 +44,7 @@ def test_init_asr_auto_uses_cuda_when_available(tmp_path: Path, monkeypatch):
 
 
 def test_init_asr_auto_uses_cpu_model_path_when_no_cuda(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     gpu_dir = tmp_path / "gpu"
     cpu_dir = tmp_path / "cpu"
@@ -75,7 +75,7 @@ def test_init_asr_auto_uses_cpu_model_path_when_no_cuda(tmp_path: Path, monkeypa
 
 
 def test_init_asr_cpu_falls_back_to_whisper_model_path_when_cpu_model_unset(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     gpu_dir = tmp_path / "gpu"
     _touch_model_bin(gpu_dir)
@@ -102,7 +102,7 @@ def test_init_asr_cpu_falls_back_to_whisper_model_path_when_cpu_model_unset(tmp_
 
 
 def test_transcribe_audio_prefers_cpu_model_when_device_cpu(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     folder = tmp_path / "job"
     folder.mkdir(parents=True, exist_ok=True)
@@ -145,7 +145,7 @@ def test_transcribe_audio_prefers_cpu_model_when_device_cpu(tmp_path: Path, monk
 
 
 def test_pipeline_warmup_loads_cpu_model_when_whisper_device_cpu(tmp_path: Path, monkeypatch):
-    import youdub.core.pipeline as pl
+    import youdub.pipeline as pl
 
     gpu_dir = tmp_path / "gpu"
     cpu_dir = tmp_path / "cpu"
@@ -187,7 +187,7 @@ def test_pipeline_warmup_loads_cpu_model_when_whisper_device_cpu(tmp_path: Path,
 
 
 def test_pipeline_warmup_loads_gpu_model_when_whisper_device_cuda(tmp_path: Path, monkeypatch):
-    import youdub.core.pipeline as pl
+    import youdub.pipeline as pl
 
     gpu_dir = tmp_path / "gpu"
     cpu_dir = tmp_path / "cpu"

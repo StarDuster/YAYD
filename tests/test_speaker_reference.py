@@ -14,7 +14,7 @@ def _wav_duration_seconds(path: Path) -> float:
 
 
 def _write_dummy_wav(path: Path, sr: int = 24000, seconds: float = 4.0) -> None:
-    from youdub.core.utils import save_wav
+    from youdub.utils import save_wav
 
     t = np.linspace(0, seconds, int(sr * seconds), endpoint=False, dtype=np.float32)
     wav = 0.1 * np.sin(2 * np.pi * 220.0 * t).astype(np.float32)
@@ -22,7 +22,7 @@ def _write_dummy_wav(path: Path, sr: int = 24000, seconds: float = 4.0) -> None:
 
 
 def test_transcribe_audio_existing_transcript_regenerates_speaker_wavs(tmp_path: Path):
-    import youdub.core.steps.transcribe as tr
+    import youdub.steps.transcribe as tr
 
     folder = tmp_path / "job"
     folder.mkdir(parents=True, exist_ok=True)
@@ -46,7 +46,7 @@ def test_generate_wavs_qwen_creates_missing_speaker_ref(tmp_path: Path, monkeypa
     - When translation.json exists but SPEAKER/<speaker>.wav is missing,
       qwen TTS path should generate a short reference wav and continue.
     """
-    import youdub.core.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_speech as ss
     from youdub.config import Settings
     from youdub.models import ModelManager
 

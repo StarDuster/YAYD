@@ -8,7 +8,7 @@ def test_qwen_worker_protocol_tolerates_stdout_noise(tmp_path, monkeypatch):
     - Worker may print non-protocol lines to stdout before __READY__ (or between request/response).
     - Parent must ignore noise and still complete handshake + JSON response parsing.
     """
-    import youdub.core.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_speech as ss
     from youdub.config import Settings
     from youdub.models import ModelManager
 

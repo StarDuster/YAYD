@@ -17,8 +17,8 @@ from audiostretchy.stretch import stretch_audio
 from loguru import logger
 from scipy.spatial.distance import cosine
 
-from ...config import Settings
-from ...models import ModelCheckError, ModelManager
+from ..config import Settings
+from ..models import ModelCheckError, ModelManager
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
 from ..utils import ensure_torchaudio_backend_compat, save_wav, save_wav_norm
@@ -736,8 +736,18 @@ def _env_flag(name: str) -> bool:
 
 
 def _get_qwen_worker_script_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[4]
-    return repo_root / "scripts" / "qwen_tts_worker.py"
+    # Project layout (repo checkout):
+    # - <repo>/scripts/qwen_tts_worker.py
+    # - <repo>/src/youdub/steps/synthesize_speech.py
+    #
+    # Resolve robustly by walking upwards so refactors won't break the path.
+    here = Path(__file__).resolve()
+    for p in here.parents:
+        cand = p / "scripts" / "qwen_tts_worker.py"
+        if cand.exists():
+            return cand
+    # Best-effort fallback: assume current working directory is repo root.
+    return Path.cwd() / "scripts" / "qwen_tts_worker.py"
 
 
 class _QwenTtsWorker:

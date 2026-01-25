@@ -14,8 +14,8 @@ import numpy as np
 import torch
 from loguru import logger
 
-from ...config import Settings
-from ...models import ModelCheckError, ModelManager
+from ..config import Settings
+from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
 from ..utils import ensure_torchaudio_backend_compat, save_wav
 

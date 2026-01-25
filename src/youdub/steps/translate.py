@@ -21,7 +21,7 @@ from openai import (
     RateLimitError,
 )
 
-from ...config import Settings
+from ..config import Settings
 from ..interrupts import check_cancelled, sleep_with_cancel
 
 @dataclass(frozen=True)
@@ -398,9 +398,10 @@ def _build_translation_guide(
         'JSON 格式：{"style": ["..."], "glossary": {"term": "translation"}, "dont_translate": ["..."], "notes": "..."}\n'
         "- style：5~12 条风格/语气/术语偏好（list of strings）\n"
         "- glossary：只收录重要专有名词/术语/人名/机构/产品名等（object mapping string->string）\n"
-        "- dont_translate：必须原样保留的 token（如代码/公式/缩写/产品名）\n"
+        "- dont_translate：必须原样保留的 token（如代码/公式/缩写/产品名/专业术语）\n"
         "- notes：额外注意事项\n"
         "硬性要求：\n"
+        "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 将人工智能的“agent”翻译为“智能体”\n"
         "- 强化学习中写作 `Q-Learning`（不要写 Queue Learning）\n"
@@ -488,6 +489,7 @@ def _translate_single_with_guide(
         f"{info}\n"
         f"指南（JSON）：{guide_json}\n"
         "请只输出译文本身：\n"
+        "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
@@ -543,6 +545,7 @@ def _translate_chunk_with_guide(
         f"指南（JSON）：{guide_json}\n"
         "你会收到一个 JSON 对象：key 是句子编号（字符串），value 是原文。\n"
         "请只返回 JSON 对象，保持相同 key，value 只包含译文本身：\n"
+        "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
@@ -652,7 +655,7 @@ def _translate_content(
     full_translation: list[str] = []
 
     fixed_message = [
-        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。只输出译文，不要包含“翻译”二字。'},
+        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。只输出译文，不要包含“翻译”二字。'},
         {'role': 'user', 'content': 'Translate:"Knowledge is power."'},
         {'role': 'assistant', 'content': '知识就是力量。'},
         {'role': 'user', 'content': 'Translate:"To be or not to be, that is the question."'},

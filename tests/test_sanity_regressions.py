@@ -7,7 +7,7 @@ import pytest
 
 
 def _write_dummy_wav(path: Path, sr: int = 24000, seconds: float = 1.0) -> None:
-    from youdub.core.utils import save_wav
+    from youdub.utils import save_wav
 
     t = np.linspace(0, seconds, int(sr * seconds), endpoint=False, dtype=np.float32)
     wav = 0.1 * np.sin(2 * np.pi * 220.0 * t).astype(np.float32)
@@ -19,8 +19,8 @@ def test_is_valid_wav_rejects_non_wav_content_even_if_soundfile_can_read(tmp_pat
     # but downstream `audiostretchy` uses stdlib `wave` and will crash. We should treat those as invalid.
     import soundfile as sf
 
-    from youdub.core.steps.synthesize_speech import is_valid_wav
-    from youdub.core.utils import save_wav
+    from youdub.steps.synthesize_speech import is_valid_wav
+    from youdub.utils import save_wav
 
     if "FLAC" not in sf.available_formats():
         pytest.skip("libsndfile without FLAC support")
@@ -39,7 +39,7 @@ def test_is_valid_wav_rejects_non_wav_content_even_if_soundfile_can_read(tmp_pat
 
 
 def test_download_single_video_returns_none_when_file_missing(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.download as dl
+    import youdub.steps.download as dl
 
     class _StubYdl:
         def __init__(self, _opts):
@@ -67,7 +67,7 @@ def test_download_single_video_returns_none_when_file_missing(tmp_path: Path, mo
 
 
 def test_separate_all_audio_under_folder_regenerates_when_outputs_missing(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.separate_vocals as sv
+    import youdub.steps.separate_vocals as sv
 
     # Avoid model checks / real Demucs.
     monkeypatch.setattr(sv, "_ensure_demucs_ready", lambda *_args, **_kwargs: None)
@@ -96,7 +96,7 @@ def test_separate_all_audio_under_folder_regenerates_when_outputs_missing(tmp_pa
 
 
 def test_translate_folder_backfills_summary_when_translation_exists(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.translate as tr
+    import youdub.steps.translate as tr
 
     folder = tmp_path / "job"
     folder.mkdir(parents=True, exist_ok=True)
@@ -119,7 +119,7 @@ def test_translate_folder_backfills_summary_when_translation_exists(tmp_path: Pa
 
 
 def test_synthesize_video_raises_when_missing_inputs(tmp_path: Path):
-    import youdub.core.steps.synthesize_video as sv
+    import youdub.steps.synthesize_video as sv
 
     folder = tmp_path / "job"
     folder.mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ def test_synthesize_video_raises_when_missing_inputs(tmp_path: Path):
 
 
 def test_generate_all_wavs_requires_marker_not_just_audio_file(tmp_path: Path, monkeypatch):
-    import youdub.core.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_speech as ss
 
     folder = tmp_path / "job"
     folder.mkdir(parents=True, exist_ok=True)

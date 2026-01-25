@@ -7,7 +7,7 @@ import numpy as np
 
 def _write_dummy_wav(path: Path, sr: int = 24000, seconds: float = 1.0) -> None:
     # Use project utility to keep format consistent (int16 PCM WAV).
-    from youdub.core.utils import save_wav
+    from youdub.utils import save_wav
 
     t = np.linspace(0, seconds, int(sr * seconds), endpoint=False, dtype=np.float32)
     wav = 0.1 * np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
@@ -21,7 +21,7 @@ def test_generate_wavs_qwen_path_smoke(tmp_path, monkeypatch):
     - We still exercise: worker IPC, per-segment wav writing, stitching, and output files.
     """
 
-    import youdub.core.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_speech as ss
     from youdub.config import Settings
     from youdub.models import ModelManager
 
@@ -87,7 +87,7 @@ def test_generate_wavs_qwen_icl_path_smoke(tmp_path, monkeypatch):
     - Provide audio_vocals.wav + per-segment `text` so the pipeline can build ICL refs.
     - Worker runs in stub mode (no qwen-tts import).
     """
-    import youdub.core.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_speech as ss
     from youdub.config import Settings
     from youdub.models import ModelManager
 

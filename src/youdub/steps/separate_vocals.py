@@ -7,8 +7,8 @@ from typing import Any
 import torch
 from loguru import logger
 
-from ...config import Settings
-from ...models import ModelManager
+from ..config import Settings
+from ..models import ModelManager
 from ..interrupts import check_cancelled, sleep_with_cancel
 from ..utils import save_wav
 

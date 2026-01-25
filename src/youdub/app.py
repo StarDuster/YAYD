@@ -13,9 +13,9 @@ import gradio as gr
 from loguru import logger
 
 from youdub.config import Settings
-from youdub.core.pipeline import VideoPipeline
-from youdub.core.interrupts import cancel_requested, ignore_signals_during_shutdown, install_signal_handlers, request_cancel
-from youdub.core.steps import (
+from youdub.pipeline import VideoPipeline
+from youdub.interrupts import cancel_requested, ignore_signals_during_shutdown, install_signal_handlers, request_cancel
+from youdub.steps import (
     download_from_url,
     generate_all_info_under_folder_stream,
     generate_all_wavs_under_folder,

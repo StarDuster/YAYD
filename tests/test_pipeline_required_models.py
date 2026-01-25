@@ -23,7 +23,7 @@ def test_pipeline_builds_required_model_list_for_method(
     expect_bytedance: bool,
     expect_diar: bool,
 ):
-    import youdub.core.pipeline as pl
+    import youdub.pipeline as pl
 
     # Pipeline now validates Whisper model.bin paths early (outside ModelManager.ensure_ready),
     # so provide a minimal dummy model directory.

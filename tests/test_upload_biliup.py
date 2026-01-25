@@ -58,7 +58,7 @@ def _make_minimal_upload_folder(folder: Path, *, with_cover: bool = True) -> Non
 
 
 def test_upload_video_returns_false_when_stream_gears_missing(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     monkeypatch.setattr(up, "stream_gears", None, raising=False)
     monkeypatch.setattr(up, "_STREAM_GEARS_IMPORT_ERROR", RuntimeError("no"), raising=False)
@@ -66,7 +66,7 @@ def test_upload_video_returns_false_when_stream_gears_missing(monkeypatch, tmp_p
 
 
 def test_upload_all_videos_returns_error_when_stream_gears_missing(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     monkeypatch.setattr(up, "stream_gears", None, raising=False)
     monkeypatch.setattr(up, "_STREAM_GEARS_IMPORT_ERROR", RuntimeError("no"), raising=False)
@@ -75,7 +75,7 @@ def test_upload_all_videos_returns_error_when_stream_gears_missing(monkeypatch, 
 
 
 def test_ensure_cookie_file_uses_existing_nonempty_cookie(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     cookie_path = tmp_path / "cookies" / "bili_cookies.json"
     cookie_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +88,7 @@ def test_ensure_cookie_file_uses_existing_nonempty_cookie(monkeypatch, tmp_path:
 
 
 def test_ensure_cookie_file_adopts_existing_cookies_json(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     cookie_dir = tmp_path / "cookies"
     cookie_dir.mkdir(parents=True, exist_ok=True)
@@ -102,7 +102,7 @@ def test_ensure_cookie_file_adopts_existing_cookies_json(monkeypatch, tmp_path: 
 
 
 def test_upload_video_with_biliup_writes_marker_and_calls_stream_gears_upload(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     fake = _FakeStreamGears()
     monkeypatch.setattr(up, "stream_gears", fake, raising=False)
@@ -146,7 +146,7 @@ def test_upload_video_with_biliup_writes_marker_and_calls_stream_gears_upload(mo
 
 
 def test_upload_video_with_biliup_skips_when_already_uploaded(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     fake = _FakeStreamGears()
     monkeypatch.setattr(up, "stream_gears", fake, raising=False)
@@ -173,7 +173,7 @@ def test_upload_video_with_biliup_skips_when_already_uploaded(monkeypatch, tmp_p
 
 
 def test_upload_video_cookie_missing_returns_false(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
     monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "missing.json"))
@@ -181,7 +181,7 @@ def test_upload_video_cookie_missing_returns_false(monkeypatch, tmp_path: Path):
 
 
 def test_upload_video_reads_env_and_forwards_to_impl(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
     monkeypatch.setenv("BILI_PROXY", "http://127.0.0.1:7890")
@@ -212,7 +212,7 @@ def test_upload_video_reads_env_and_forwards_to_impl(monkeypatch, tmp_path: Path
 
 
 def test_upload_all_videos_counts_uploaded_folders(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
+    import youdub.steps.upload as up
 
     monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
     monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "cookies.json"))
@@ -234,8 +234,8 @@ def test_upload_all_videos_counts_uploaded_folders(monkeypatch, tmp_path: Path):
 
 
 def test_upload_video_with_biliup_respects_cancellation(monkeypatch, tmp_path: Path):
-    import youdub.core.steps.upload as up
-    from youdub.core.interrupts import CancelledByUser
+    import youdub.steps.upload as up
+    from youdub.interrupts import CancelledByUser
 
     fake = _FakeStreamGears()
     monkeypatch.setattr(up, "stream_gears", fake, raising=False)

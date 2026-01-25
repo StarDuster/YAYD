@@ -2,7 +2,7 @@ import json
 
 
 def test_normalize_translation_strategy_defaults_to_guide_parallel():
-    from youdub.core.steps.translate import _normalize_translation_strategy
+    from youdub.steps.translate import _normalize_translation_strategy
 
     assert _normalize_translation_strategy(None) == "guide_parallel"
     assert _normalize_translation_strategy("") == "guide_parallel"
@@ -11,7 +11,7 @@ def test_normalize_translation_strategy_defaults_to_guide_parallel():
 
 
 def test_normalize_translation_strategy_accepts_parallel_aliases():
-    from youdub.core.steps.translate import _normalize_translation_strategy
+    from youdub.steps.translate import _normalize_translation_strategy
 
     assert _normalize_translation_strategy("guide_parallel") == "guide_parallel"
     assert _normalize_translation_strategy("parallel") == "guide_parallel"
@@ -19,7 +19,7 @@ def test_normalize_translation_strategy_accepts_parallel_aliases():
 
 
 def test_translate_content_default_history_includes_previous_turns(monkeypatch):
-    import youdub.core.steps.translate as tr
+    import youdub.steps.translate as tr
 
     monkeypatch.setattr(tr.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")
@@ -55,7 +55,7 @@ def test_translate_content_default_history_includes_previous_turns(monkeypatch):
 
 
 def test_translate_content_guide_parallel_returns_indexed_translations(monkeypatch):
-    import youdub.core.steps.translate as tr
+    import youdub.steps.translate as tr
 
     monkeypatch.setattr(tr.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")

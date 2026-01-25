@@ -8,8 +8,8 @@ from typing import Any, Iterable
 
 from loguru import logger
 
-from ..config import Settings
-from ..models import ModelCheckError, ModelManager
+from .config import Settings
+from .models import ModelCheckError, ModelManager
 from .interrupts import check_cancelled, sleep_with_cancel
 from .steps import (
     download,
