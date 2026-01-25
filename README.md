@@ -262,4 +262,6 @@ BILI_COOKIE_PATH=cookies.json
 
 ## 许可证
 
-MIT License. 详见 `pyproject.toml`。
+MIT License. 详见 [LICENSE](./LICENSE) 文件。
+
+本项目 fork 自 [liuzhao1225/YouDub-webui](https://github.com/liuzhao1225/YouDub-webui)（原仓库未指定许可证）。
