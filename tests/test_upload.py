@@ -1,3 +1,7 @@
+"""Upload 步骤测试."""
+
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -57,6 +61,11 @@ def _make_minimal_upload_folder(folder: Path, *, with_cover: bool = True) -> Non
     )
 
 
+# --------------------------------------------------------------------------- #
+# stream_gears availability
+# --------------------------------------------------------------------------- #
+
+
 def test_upload_video_returns_false_when_stream_gears_missing(monkeypatch, tmp_path: Path):
     import youdub.steps.upload as up
 
@@ -72,6 +81,11 @@ def test_upload_all_videos_returns_error_when_stream_gears_missing(monkeypatch, 
     monkeypatch.setattr(up, "_STREAM_GEARS_IMPORT_ERROR", RuntimeError("no"), raising=False)
     out = up.upload_all_videos_under_folder(str(tmp_path))
     assert out.startswith("错误：stream_gears 不可用")
+
+
+# --------------------------------------------------------------------------- #
+# Cookie file handling
+# --------------------------------------------------------------------------- #
 
 
 def test_ensure_cookie_file_uses_existing_nonempty_cookie(monkeypatch, tmp_path: Path):
@@ -99,6 +113,19 @@ def test_ensure_cookie_file_adopts_existing_cookies_json(monkeypatch, tmp_path: 
     assert ok is True
     assert cookie_path.exists()
     assert cookie_path.read_text(encoding="utf-8") == "cookie"
+
+
+def test_upload_video_cookie_missing_returns_false(monkeypatch, tmp_path: Path):
+    import youdub.steps.upload as up
+
+    monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
+    monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "missing.json"))
+    assert up.upload_video(str(tmp_path)) is False
+
+
+# --------------------------------------------------------------------------- #
+# Biliup integration
+# --------------------------------------------------------------------------- #
 
 
 def test_upload_video_with_biliup_writes_marker_and_calls_stream_gears_upload(monkeypatch, tmp_path: Path):
@@ -172,14 +199,6 @@ def test_upload_video_with_biliup_skips_when_already_uploaded(monkeypatch, tmp_p
     assert ok is True
 
 
-def test_upload_video_cookie_missing_returns_false(monkeypatch, tmp_path: Path):
-    import youdub.steps.upload as up
-
-    monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
-    monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "missing.json"))
-    assert up.upload_video(str(tmp_path)) is False
-
-
 def test_upload_video_reads_env_and_forwards_to_impl(monkeypatch, tmp_path: Path):
     import youdub.steps.upload as up
 
@@ -211,6 +230,11 @@ def test_upload_video_reads_env_and_forwards_to_impl(monkeypatch, tmp_path: Path
     assert str(captured["cookie_path"]) == str(tmp_path / "cookies.json")
 
 
+# --------------------------------------------------------------------------- #
+# Batch upload
+# --------------------------------------------------------------------------- #
+
+
 def test_upload_all_videos_counts_uploaded_folders(monkeypatch, tmp_path: Path):
     import youdub.steps.upload as up
 
@@ -233,27 +257,42 @@ def test_upload_all_videos_counts_uploaded_folders(monkeypatch, tmp_path: Path):
     assert "成功 1 个" in out
 
 
-def test_upload_video_with_biliup_respects_cancellation(monkeypatch, tmp_path: Path):
+def test_upload_all_videos_waits_between_uploads(monkeypatch, tmp_path: Path):
+    """Test that upload_all_videos waits between consecutive uploads."""
     import youdub.steps.upload as up
-    from youdub.interrupts import CancelledByUser
 
-    fake = _FakeStreamGears()
-    monkeypatch.setattr(up, "stream_gears", fake, raising=False)
+    monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
+    monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "cookies.json"))
+    monkeypatch.setenv("BILI_UPLOAD_INTERVAL", "30")
+    (tmp_path / "cookies.json").write_text("cookie", encoding="utf-8")
 
-    folder = tmp_path / "job"
-    _make_minimal_upload_folder(folder, with_cover=False)
+    job1 = tmp_path / "job1"
+    job2 = tmp_path / "job2"
+    job1.mkdir(parents=True, exist_ok=True)
+    job2.mkdir(parents=True, exist_ok=True)
+    (job1 / "video.mp4").write_bytes(b"0")
+    (job2 / "video.mp4").write_bytes(b"0")
 
-    monkeypatch.setattr(up, "check_cancelled", lambda *_args, **_kwargs: (_ for _ in ()).throw(CancelledByUser("SIGINT")))
-    monkeypatch.setattr(up, "sleep_with_cancel", lambda *_args, **_kwargs: None)
+    uploaded: list[str] = []
+    waits: list[int] = []
 
-    with pytest.raises(CancelledByUser):
-        up._upload_video_with_biliup(  # noqa: SLF001
-            str(folder),
-            proxy=None,
-            upload_cdn=None,
-            cookie_path=tmp_path / "bili_cookies.json",
-        )
-    assert not (folder / "bilibili.json").exists()
+    def _fake_impl(folder, *_args, **_kwargs):  # noqa: ANN001
+        uploaded.append(folder)
+        return True
+
+    monkeypatch.setattr(up, "_upload_video_with_biliup", _fake_impl)
+    monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
+
+    out = up.upload_all_videos_under_folder(str(tmp_path))
+    assert "成功 2 个" in out
+    assert len(uploaded) == 2
+    # Should wait 30s between first and second upload
+    assert waits == [30]
+
+
+# --------------------------------------------------------------------------- #
+# Retry and error handling
+# --------------------------------------------------------------------------- #
 
 
 def test_upload_video_with_biliup_retries_on_failure(monkeypatch, tmp_path: Path):
@@ -322,35 +361,24 @@ def test_upload_video_with_biliup_stops_on_auth_error(monkeypatch, tmp_path: Pat
     assert call_count == 1  # Should stop after first auth error
 
 
-def test_upload_all_videos_waits_between_uploads(monkeypatch, tmp_path: Path):
-    """Test that upload_all_videos waits between consecutive uploads."""
+def test_upload_video_with_biliup_respects_cancellation(monkeypatch, tmp_path: Path):
     import youdub.steps.upload as up
+    from youdub.interrupts import CancelledByUser
 
-    monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
-    monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "cookies.json"))
-    monkeypatch.setenv("BILI_UPLOAD_INTERVAL", "30")
-    (tmp_path / "cookies.json").write_text("cookie", encoding="utf-8")
+    fake = _FakeStreamGears()
+    monkeypatch.setattr(up, "stream_gears", fake, raising=False)
 
-    job1 = tmp_path / "job1"
-    job2 = tmp_path / "job2"
-    job1.mkdir(parents=True, exist_ok=True)
-    job2.mkdir(parents=True, exist_ok=True)
-    (job1 / "video.mp4").write_bytes(b"0")
-    (job2 / "video.mp4").write_bytes(b"0")
+    folder = tmp_path / "job"
+    _make_minimal_upload_folder(folder, with_cover=False)
 
-    uploaded: list[str] = []
-    waits: list[int] = []
+    monkeypatch.setattr(up, "check_cancelled", lambda *_args, **_kwargs: (_ for _ in ()).throw(CancelledByUser("SIGINT")))
+    monkeypatch.setattr(up, "sleep_with_cancel", lambda *_args, **_kwargs: None)
 
-    def _fake_impl(folder, *_args, **_kwargs):  # noqa: ANN001
-        uploaded.append(folder)
-        return True
-
-    monkeypatch.setattr(up, "_upload_video_with_biliup", _fake_impl)
-    monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
-
-    out = up.upload_all_videos_under_folder(str(tmp_path))
-    assert "成功 2 个" in out
-    assert len(uploaded) == 2
-    # Should wait 30s between first and second upload
-    assert waits == [30]
-
+    with pytest.raises(CancelledByUser):
+        up._upload_video_with_biliup(  # noqa: SLF001
+            str(folder),
+            proxy=None,
+            upload_cdn=None,
+            cookie_path=tmp_path / "bili_cookies.json",
+        )
+    assert not (folder / "bilibili.json").exists()
