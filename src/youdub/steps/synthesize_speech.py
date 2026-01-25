@@ -941,6 +941,7 @@ class _QwenTtsWorker:
         icl_audio: str | None = None,
         icl_text: str | None = None,
         x_vector_only_mode: bool | None = None,
+        timeout_sec: float = 180.0,
     ) -> dict:
         if self._proc.poll() is not None:
             raise RuntimeError("Qwen3-TTS worker 已退出")
@@ -968,8 +969,27 @@ class _QwenTtsWorker:
 
         skipped: list[str] = []
         max_skip = 50
+        start_time = time.monotonic()
+        last_heartbeat = start_time
         while True:
             check_cancelled()
+            elapsed = time.monotonic() - start_time
+            if elapsed > timeout_sec:
+                stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                # Worker may be stuck in GPU inference; try hard to terminate it.
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Qwen3-TTS worker 超时 ({timeout_sec:.0f}秒)，"
+                    f"text={text[:30]}...，已等待 {elapsed:.1f}秒。{extra}"
+                )
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                last_heartbeat = now
+                logger.info(f"Qwen3-TTS 等待中... ({elapsed:.1f}s / {timeout_sec:.0f}s)")
             line = self._read_stdout_line(timeout_sec=0.2)
             if line is None:
                 if self._proc.poll() is not None:
@@ -1009,7 +1029,7 @@ class _QwenTtsWorker:
             raise RuntimeError(err)
         return resp
 
-    def synthesize_batch(self, items: list[dict]) -> dict:
+    def synthesize_batch(self, items: list[dict], timeout_sec: float = 300.0) -> dict:
         if self._proc.poll() is not None:
             raise RuntimeError("Qwen3-TTS worker 已退出")
 
@@ -1025,8 +1045,31 @@ class _QwenTtsWorker:
 
         skipped: list[str] = []
         max_skip = 50
+        start_time = time.monotonic()
+        last_heartbeat = start_time
         while True:
             check_cancelled()
+            elapsed = time.monotonic() - start_time
+            if elapsed > timeout_sec:
+                stderr_tail = "\n".join(list(self._stderr_tail)).strip()
+                extra = f"\nstderr:\n{stderr_tail}" if stderr_tail else ""
+                # Worker may be stuck in GPU inference; try hard to terminate it.
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Qwen3-TTS worker 超时 ({timeout_sec:.0f}秒)，"
+                    f"batch_size={len(items)}，已等待 {elapsed:.1f}秒。"
+                    f"可能是 GPU 推理卡住或显存不足。{extra}"
+                )
+            # Heartbeat log every 30s to show we're still waiting
+            now = time.monotonic()
+            if now - last_heartbeat >= 30.0:
+                last_heartbeat = now
+                logger.info(
+                    f"Qwen3-TTS 批处理等待中... ({elapsed:.1f}s / {timeout_sec:.0f}s) batch_size={len(items)}"
+                )
             line = self._read_stdout_line(timeout_sec=0.2)
             if line is None:
                 if self._proc.poll() is not None:
@@ -1419,6 +1462,42 @@ def generate_wavs(
                 qwen_batch_size = 1
             qwen_batch_size = max(1, min(qwen_batch_size, 64))
 
+        qwen_timeout_sec = 180.0
+        qwen_batch_timeout_sec = 300.0
+        if tts_method == "qwen":
+            try:
+                qwen_timeout_sec = float(os.getenv("YOUDUB_QWEN_WORKER_REQUEST_TIMEOUT_SEC", "120") or "120")
+            except Exception:
+                qwen_timeout_sec = 120.0
+            try:
+                qwen_batch_timeout_sec = float(os.getenv("YOUDUB_QWEN_WORKER_BATCH_TIMEOUT_SEC", "180") or "180")
+            except Exception:
+                qwen_batch_timeout_sec = 180.0
+            if not (qwen_timeout_sec > 0):
+                qwen_timeout_sec = 120.0
+            if not (qwen_batch_timeout_sec > 0):
+                qwen_batch_timeout_sec = 180.0
+
+        def _should_restart_qwen_worker(err: str) -> bool:
+            s = (err or "").lower()
+            return (
+                ("已退出" in err)
+                or ("无输出" in err)
+                or ("超时" in err)
+                or ("broken pipe" in s)
+                or ("eof" in s)
+            )
+
+        def _restart_qwen_worker(reason: str) -> None:
+            nonlocal qwen_worker
+            if qwen_worker is not None:
+                try:
+                    qwen_worker.close()
+                except Exception:
+                    pass
+            qwen_worker = _QwenTtsWorker.from_settings(_DEFAULT_SETTINGS)
+            logger.warning(f"Qwen3-TTS worker 已重启: {reason}")
+
         qwen_resp_by_index: dict[int, dict] = {}
         qwen_cached_before: set[int] = set()
         if tts_method == "qwen" and qwen_worker is not None and qwen_batch_size > 1:
@@ -1433,7 +1512,7 @@ def generate_wavs(
                 s = (err or "").lower()
                 return ("out of memory" in s) or ("cuda" in s and "memory" in s) or ("oom" in s)
 
-            def _run_qwen_batch(batch_indices: list[int]) -> None:
+            def _run_qwen_batch(batch_indices: list[int], attempt: int = 0) -> None:
                 if not batch_indices:
                     return
                 check_cancelled()
@@ -1483,12 +1562,75 @@ def generate_wavs(
 
                 try:
                     check_cancelled()
-                    resp = qwen_worker.synthesize_batch(batch_items)
+                    if qwen_worker is None:
+                        _restart_qwen_worker("worker is None")
+                    assert qwen_worker is not None
+                    resp = qwen_worker.synthesize_batch(batch_items, timeout_sec=qwen_batch_timeout_sec)
+                except CancelledByUser:
+                    raise
                 except Exception as exc:
-                    if len(batch_indices) > 1 and _looks_like_oom(str(exc)):
+                    err = str(exc)
+                    if attempt == 0 and _should_restart_qwen_worker(err):
+                        logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {err}")
+                        try:
+                            _restart_qwen_worker(err)
+                            _run_qwen_batch(batch_indices, attempt=attempt + 1)
+                        except Exception as exc2:
+                            logger.warning(f"Qwen3-TTS worker 重启/重试失败，段 {batch_indices}: {exc2}")
+                            for j in batch_indices:
+                                qwen_resp_by_index[j] = {"ok": False, "error": str(exc2)}
+                        return
+
+                    if len(batch_indices) > 1 and _looks_like_oom(err):
                         mid = len(batch_indices) // 2
-                        _run_qwen_batch(batch_indices[:mid])
-                        _run_qwen_batch(batch_indices[mid:])
+                        _run_qwen_batch(batch_indices[:mid], attempt=attempt)
+                        _run_qwen_batch(batch_indices[mid:], attempt=attempt)
+                        return
+
+                    # Non-OOM failures: fall back to per-item synthesis to avoid "batch卡死/无输出"。
+                    if len(batch_indices) > 1:
+                        logger.warning(f"Qwen3-TTS批处理失败，降级为逐条合成: 段 {batch_indices} (原因: {err})")
+                        for j, it in zip(batch_indices, batch_items):
+                            check_cancelled()
+                            try:
+                                if qwen_worker is None:
+                                    _restart_qwen_worker("worker missing before single fallback")
+                                assert qwen_worker is not None
+                                qwen_resp_by_index[j] = qwen_worker.synthesize(
+                                    text=str(it.get("text", "")),
+                                    speaker_wav=str(it.get("speaker_wav", "")),
+                                    output_path=str(it.get("output_path", "")),
+                                    language=str(it.get("language", "Auto") or "Auto"),
+                                    speaker_anchor_wav=str(it.get("speaker_anchor_wav", "") or "") or None,
+                                    icl_audio=str(it.get("icl_audio", "") or "") or None,
+                                    icl_text=str(it.get("icl_text", "") or "") or None,
+                                    x_vector_only_mode=it.get("x_vector_only_mode", None),
+                                    timeout_sec=qwen_timeout_sec,
+                                )
+                            except CancelledByUser:
+                                raise
+                            except Exception as exc_one:
+                                err_one = str(exc_one)
+                                if _should_restart_qwen_worker(err_one):
+                                    logger.warning(f"Qwen3-TTS worker 异常，重启后再试一次(单条 idx={j}): {err_one}")
+                                    _restart_qwen_worker(err_one)
+                                    assert qwen_worker is not None
+                                    try:
+                                        qwen_resp_by_index[j] = qwen_worker.synthesize(
+                                            text=str(it.get("text", "")),
+                                            speaker_wav=str(it.get("speaker_wav", "")),
+                                            output_path=str(it.get("output_path", "")),
+                                            language=str(it.get("language", "Auto") or "Auto"),
+                                            speaker_anchor_wav=str(it.get("speaker_anchor_wav", "") or "") or None,
+                                            icl_audio=str(it.get("icl_audio", "") or "") or None,
+                                            icl_text=str(it.get("icl_text", "") or "") or None,
+                                            x_vector_only_mode=it.get("x_vector_only_mode", None),
+                                            timeout_sec=qwen_timeout_sec,
+                                        )
+                                    except Exception as exc_one2:
+                                        qwen_resp_by_index[j] = {"ok": False, "error": str(exc_one2)}
+                                else:
+                                    qwen_resp_by_index[j] = {"ok": False, "error": err_one}
                         return
                     logger.warning(f"Qwen3-TTS批处理失败，段 {batch_indices}: {exc}")
                     for j in batch_indices:
@@ -1520,8 +1662,8 @@ def generate_wavs(
                         oom_failed.append(j)
                 if len(oom_failed) > 1:
                     mid = len(oom_failed) // 2
-                    _run_qwen_batch(oom_failed[:mid])
-                    _run_qwen_batch(oom_failed[mid:])
+                    _run_qwen_batch(oom_failed[:mid], attempt=attempt)
+                    _run_qwen_batch(oom_failed[mid:], attempt=attempt)
 
         for i, line in enumerate(transcript):
             check_cancelled()
@@ -1567,29 +1709,86 @@ def generate_wavs(
                                 icl = _ensure_qwen_icl_ref_for_index(i)
                                 if icl is not None:
                                     icl_audio, icl_text = icl
-                                    qwen_resp = qwen_worker.synthesize(
-                                        text,
-                                        speaker_wav=qwen_speaker_anchor_wav,
-                                        output_path=output_path,
-                                        language="Auto",
-                                        speaker_anchor_wav=qwen_speaker_anchor_wav,
-                                        icl_audio=icl_audio,
-                                        icl_text=icl_text,
-                                        x_vector_only_mode=False,
-                                    )
+                                    try:
+                                        qwen_resp = qwen_worker.synthesize(
+                                            text,
+                                            speaker_wav=qwen_speaker_anchor_wav,
+                                            output_path=output_path,
+                                            language="Auto",
+                                            speaker_anchor_wav=qwen_speaker_anchor_wav,
+                                            icl_audio=icl_audio,
+                                            icl_text=icl_text,
+                                            x_vector_only_mode=False,
+                                            timeout_sec=qwen_timeout_sec,
+                                        )
+                                    except Exception as exc_qwen:
+                                        if _should_restart_qwen_worker(str(exc_qwen)):
+                                            logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
+                                            _restart_qwen_worker(str(exc_qwen))
+                                            assert qwen_worker is not None
+                                            qwen_resp = qwen_worker.synthesize(
+                                                text,
+                                                speaker_wav=qwen_speaker_anchor_wav,
+                                                output_path=output_path,
+                                                language="Auto",
+                                                speaker_anchor_wav=qwen_speaker_anchor_wav,
+                                                icl_audio=icl_audio,
+                                                icl_text=icl_text,
+                                                x_vector_only_mode=False,
+                                                timeout_sec=qwen_timeout_sec,
+                                            )
+                                        else:
+                                            raise
                                 else:
+                                    try:
+                                        qwen_resp = qwen_worker.synthesize(
+                                            text,
+                                            speaker_wav=qwen_speaker_anchor_wav,
+                                            output_path=output_path,
+                                            language="Auto",
+                                            speaker_anchor_wav=qwen_speaker_anchor_wav,
+                                            x_vector_only_mode=True,
+                                            timeout_sec=qwen_timeout_sec,
+                                        )
+                                    except Exception as exc_qwen:
+                                        if _should_restart_qwen_worker(str(exc_qwen)):
+                                            logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
+                                            _restart_qwen_worker(str(exc_qwen))
+                                            assert qwen_worker is not None
+                                            qwen_resp = qwen_worker.synthesize(
+                                                text,
+                                                speaker_wav=qwen_speaker_anchor_wav,
+                                                output_path=output_path,
+                                                language="Auto",
+                                                speaker_anchor_wav=qwen_speaker_anchor_wav,
+                                                x_vector_only_mode=True,
+                                                timeout_sec=qwen_timeout_sec,
+                                            )
+                                        else:
+                                            raise
+                            else:
+                                try:
                                     qwen_resp = qwen_worker.synthesize(
                                         text,
-                                        speaker_wav=qwen_speaker_anchor_wav,
-                                        output_path=output_path,
+                                        speaker_wav,
+                                        output_path,
                                         language="Auto",
-                                        speaker_anchor_wav=qwen_speaker_anchor_wav,
-                                        x_vector_only_mode=True,
+                                        timeout_sec=qwen_timeout_sec,
                                     )
-                            else:
-                                qwen_resp = qwen_worker.synthesize(
-                                    text, speaker_wav, output_path, language="Auto"
-                                )
+                                except Exception as exc_qwen:
+                                    if _should_restart_qwen_worker(str(exc_qwen)):
+                                        logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
+                                        _restart_qwen_worker(str(exc_qwen))
+                                        assert qwen_worker is not None
+                                        qwen_resp = qwen_worker.synthesize(
+                                            text,
+                                            speaker_wav,
+                                            output_path,
+                                            language="Auto",
+                                            timeout_sec=qwen_timeout_sec,
+                                        )
+                                    else:
+                                        raise
                     elif tts_method == "gemini":
                         gemini_tts(text, output_path)
                     else:

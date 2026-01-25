@@ -47,6 +47,10 @@ _TARGET_LANGUAGE_CHOICES = [
 _TRANSLATION_STRATEGY_CHOICES = [("串行（带上下文，慢）", "history"), ("并行（先生成指南，快）", "guide_parallel")]
 _TTS_METHOD_CHOICES = [("ByteDance", "bytedance"), ("Qwen", "qwen"), ("Gemini", "gemini")]
 
+# Gradio 6.x 默认 time_limit=30s，会导致长任务“前端一直转圈但没有输出”
+# （后台线程仍在跑，所以你能在终端看到日志）。这里显式关掉时间限制。
+_INTERFACE_STREAM_KWARGS: dict[str, object] = {"time_limit": None, "stream_every": 0.2}
+
 _LOGURU_LINE_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \| "
     r"(TRACE|DEBUG|INFO|SUCCESS|WARNING|ERROR|CRITICAL)\s+\| "
@@ -141,6 +145,20 @@ _AUTO_SCROLL_JS = r"""
   };
   trySetup();
 })();
+"""
+
+_OUTPUT_CSS = r"""
+/* 让输出框在 disabled 状态下依旧可读（部分环境 disabled textarea 会变得几乎不可见） */
+.youdub-output textarea:disabled,
+.youdub-output textarea[disabled] {
+  opacity: 1 !important;
+  color: #111 !important;
+  -webkit-text-fill-color: #111 !important;
+  background: #fcfcfc !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.4;
+}
 """
 
 
@@ -246,11 +264,13 @@ def _capture_output_to_queue(q: "queue.Queue[str]"):
 
     sink_id: int | None
     try:
-        # Match loguru's common terminal style (module:function:line) for readability.
+        # IMPORTANT:
+        # - enqueue=False so UI gets logs immediately (enqueue=True may delay output)
+        # - keep format consistent with terminal output for readability
         sink_id = logger.add(
             _sink,
             level="INFO",
-            enqueue=True,
+            enqueue=False,
             colorize=False,
             backtrace=False,
             diagnose=False,
@@ -318,6 +338,10 @@ def _stream_run(fn: Callable[[], Any], *, max_lines: int = 400) -> Iterator[str]
         if len(lines) > max_lines:
             # Drop oldest lines to keep UI payload bounded.
             del lines[: max(50, max_lines // 5)]
+
+    # Always emit an initial line so the UI never stays blank.
+    _append_text("开始执行…")
+    yield _render()
 
     last_yield = 0.0
     while True:
@@ -575,6 +599,7 @@ do_everything_interface = gr.Interface(
     submit_btn="开始全流程",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 youtube_interface = gr.Interface(
@@ -599,6 +624,7 @@ youtube_interface = gr.Interface(
     submit_btn="开始下载",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 demucs_interface = gr.Interface(
@@ -630,6 +656,7 @@ demucs_interface = gr.Interface(
     submit_btn="开始分离",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 whisper_inference = gr.Interface(
@@ -667,6 +694,7 @@ whisper_inference = gr.Interface(
     submit_btn="开始识别",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 
@@ -709,6 +737,7 @@ translation_interface = gr.Interface(
     submit_btn="开始翻译",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 
@@ -753,6 +782,7 @@ tts_interface = gr.Interface(
     submit_btn="开始配音",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 synthesize_video_interface = gr.Interface(
@@ -775,6 +805,7 @@ synthesize_video_interface = gr.Interface(
     submit_btn="开始合成",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 generate_info_interface = gr.Interface(
@@ -788,6 +819,7 @@ generate_info_interface = gr.Interface(
     submit_btn="开始生成",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 upload_bilibili_interface = gr.Interface(
@@ -801,6 +833,7 @@ upload_bilibili_interface = gr.Interface(
     submit_btn="开始上传",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 model_status_interface = gr.Interface(
@@ -813,6 +846,7 @@ model_status_interface = gr.Interface(
     submit_btn="刷新",
     stop_btn="停止",
     clear_btn="清空",
+    **_INTERFACE_STREAM_KWARGS,
 )
 
 app = gr.TabbedInterface(
@@ -854,6 +888,8 @@ def main():
         pass
     # Auto-follow Output scroll (tail -f style).
     launch_kwargs.setdefault("js", _AUTO_SCROLL_JS)
+    # Ensure output textbox is readable across browsers/webviews.
+    launch_kwargs.setdefault("css", _OUTPUT_CSS)
 
     try:
         app.launch(**launch_kwargs)
