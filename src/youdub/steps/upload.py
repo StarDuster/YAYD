@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +22,185 @@ except Exception as exc:  # noqa: BLE001 - keep best-effort import to avoid brea
     _STREAM_GEARS_IMPORT_ERROR: Exception | None = exc
 else:
     _STREAM_GEARS_IMPORT_ERROR = None
+
+
+_STDIO_CAPTURE_LOCK = threading.Lock()
+
+
+class _StdioTeeCapture:
+    """
+    Capture C/Rust side logs by tee-ing process stdio fds.
+
+    Why:
+    - `stream_gears` prints Rust logs like `biliup::...` directly to stdout/stderr,
+      which does NOT go through Python's `logging` module.
+    - This capture keeps output visible (tee to original fd) while collecting it
+      for error code extraction.
+
+    Safety:
+    - Uses a process-wide lock to avoid concurrent fd redirections.
+    - Disabled automatically under pytest to avoid breaking test capture.
+    """
+
+    def __init__(self, *, max_bytes: int = 512_000, fds: tuple[int, ...] = (1, 2)):
+        self._max_bytes = max_bytes
+        self._fds = fds
+        self._enabled = os.getenv("PYTEST_CURRENT_TEST") is None
+        self._buffers: dict[int, bytearray] = {}
+        self._saved_fds: dict[int, int] = {}
+        self._read_fds: dict[int, int] = {}
+        self._threads: list[threading.Thread] = []
+
+    def __enter__(self) -> "_StdioTeeCapture":
+        if not self._enabled:
+            return self
+        _STDIO_CAPTURE_LOCK.acquire()
+        try:
+            for fd in self._fds:
+                saved = os.dup(fd)
+                r, w = os.pipe()
+                os.dup2(w, fd)
+                os.close(w)
+
+                self._saved_fds[fd] = saved
+                self._read_fds[fd] = r
+                self._buffers[fd] = bytearray()
+
+                t = threading.Thread(
+                    target=self._reader,
+                    args=(fd,),
+                    daemon=True,
+                )
+                t.start()
+                self._threads.append(t)
+            return self
+        except Exception:
+            # Best-effort restore if capture setup fails.
+            self._restore()
+            _STDIO_CAPTURE_LOCK.release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+        if not self._enabled:
+            return
+        try:
+            self._restore()
+            # Give reader threads a moment to drain remaining output.
+            for t in self._threads:
+                t.join(timeout=0.5)
+        finally:
+            for saved in self._saved_fds.values():
+                try:
+                    os.close(saved)
+                except Exception:
+                    pass
+            for r in self._read_fds.values():
+                try:
+                    os.close(r)
+                except Exception:
+                    pass
+            _STDIO_CAPTURE_LOCK.release()
+
+    def _restore(self) -> None:
+        for fd, saved in self._saved_fds.items():
+            try:
+                os.dup2(saved, fd)
+            except Exception:
+                # If restoration fails, we can't do much.
+                pass
+
+    def _reader(self, fd: int) -> None:
+        r = self._read_fds.get(fd)
+        saved = self._saved_fds.get(fd)
+        buf = self._buffers.get(fd)
+        if r is None or saved is None or buf is None:
+            return
+
+        try:
+            while True:
+                chunk = os.read(r, 4096)
+                if not chunk:
+                    break
+                # Tee to original fd so user still sees logs.
+                try:
+                    os.write(saved, chunk)
+                except Exception:
+                    pass
+                # Store (bounded).
+                if self._max_bytes > 0:
+                    buf.extend(chunk)
+                    if len(buf) > self._max_bytes:
+                        del buf[: len(buf) - self._max_bytes]
+        except Exception:
+            return
+
+    def lines(self) -> list[str]:
+        out: list[str] = []
+        for fd in self._fds:
+            b = self._buffers.get(fd)
+            if not b:
+                continue
+            try:
+                text = b.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            out.extend([ln for ln in text.splitlines() if ln.strip()])
+        return out
+
+
+def _extract_biliup_error(lines: list[str]) -> tuple[int | None, str | None, str | None]:
+    """
+    Best-effort extract a Bilibili error (code/message) from biliup logs.
+
+    Returns (code, message, raw_line).
+    """
+    if not lines:
+        return None, None, None
+
+    text = "\n".join(lines)
+
+    # Rust debug formatting e.g.:
+    # ResponseData { code: 21566, data: None, message: "...", ttl: Some(1) }
+    m_all = list(
+        re.finditer(
+            r'ResponseData\s*\{\s*code:\s*(\d+),.*?message:\s*"([^"]*)"',
+            text,
+            flags=re.DOTALL,
+        )
+    )
+    if m_all:
+        m = m_all[-1]
+        try:
+            return int(m.group(1)), m.group(2), m.group(0)
+        except Exception:
+            pass
+
+    # JSON error line e.g.:
+    # Failed to pre_upload from {"code":601,"message":"...","info":"..."}
+    for line in reversed(lines):
+        if '"code"' not in line or "{" not in line or "}" not in line:
+            continue
+        candidate = line[line.find("{") : line.rfind("}") + 1]
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        code = obj.get("code")
+        if isinstance(code, int):
+            msg = obj.get("message") or obj.get("info")
+            return code, msg if isinstance(msg, str) else None, line
+
+    # Fallback: any "code: NNN" / "(code: NNN)" style.
+    for line in reversed(lines):
+        m = re.search(r"\bcode[:=]\s*(\d+)\b", line)
+        if not m:
+            continue
+        try:
+            return int(m.group(1)), None, line
+        except Exception:
+            continue
+
+    return None, None, None
 
 
 def _is_uploaded(submission_result: object) -> bool:
@@ -74,6 +255,34 @@ def _iter_upload_lines(preferred_cdn: Optional[str]) -> list[object | None]:
         if line not in out:
             out.append(line)
     return out
+
+
+def _iter_submit_apis() -> list[object | None]:
+    """
+    Build a small list of submit APIs to rotate through.
+
+    Notes:
+    - `submit=None` keeps backward-compatible default behavior (usually app).
+    - Newer biliup versions may support `submit="web"`.
+    - `BILI_SUBMIT_APIS` can override the order, e.g. "app,web" or "b-cut-android".
+    """
+    raw = (os.getenv("BILI_SUBMIT_APIS") or "").strip()
+    if raw:
+        candidates = [x.strip() for x in raw.replace("|", ",").split(",") if x.strip()]
+    else:
+        # Default: prefer web submit, then fall back to app and other backends.
+        candidates = ["web", "app", "b-cut-android"]
+
+    out: list[object | None] = []
+    for item in candidates:
+        key = item.strip().lower()
+        if key in ("app", "default", "auto", "none"):
+            val: object | None = None
+        else:
+            val = key
+        if val not in out:
+            out.append(val)
+    return out or [None]
 
 
 def _ensure_cookie_file(cookie_path: Path) -> bool:
@@ -221,25 +430,35 @@ def _upload_video_with_biliup(
     # Total attempts capped at MAX_ATTEMPTS to avoid endless retries.
     MAX_ATTEMPTS = 5
     lines = _iter_upload_lines(upload_cdn)
+    submit_apis = _iter_submit_apis()
+    strategies: list[tuple[object | None, object | None]] = [
+        (line, submit) for line in lines for submit in submit_apis
+    ]
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        line, submit = strategies[(attempt - 1) % len(strategies)]
         check_cancelled()
-        line = lines[(attempt - 1) % len(lines)]  # rotate through lines
         line_name = getattr(line, "name", None) or "auto"
+        submit_name = "app" if submit is None else str(submit)
         try:
-            logger.info(f"通过biliup上传中 (尝试 {attempt}/{MAX_ATTEMPTS}, 线路={line_name})")
-            stream_gears.upload(  # type: ignore[union-attr]
-                video_path=[video_path],
-                cookie_file=str(cookie_path),
-                title=title,
-                tid=201,
-                tag=",".join(final_tags),
-                copyright=2,
-                source=str(webpage_url or ""),
-                desc=description,
-                cover=cover_path if os.path.exists(cover_path) else "",
-                line=line,
-                proxy=proxy,
+            logger.info(
+                f"通过biliup上传中 (尝试 {attempt}/{MAX_ATTEMPTS}, 线路={line_name}, 投稿接口={submit_name})"
             )
+            with _StdioTeeCapture() as cap:
+                stream_gears.upload(  # type: ignore[union-attr]
+                    video_path=[video_path],
+                    cookie_file=str(cookie_path),
+                    title=title,
+                    tid=201,
+                    tag=",".join(final_tags),
+                    copyright=2,
+                    source=str(webpage_url or ""),
+                    desc=description,
+                    cover=cover_path if os.path.exists(cover_path) else "",
+                    line=line,
+                    submit=submit,
+                    proxy=proxy,
+                )
 
             # write a success marker compatible with pipeline._already_uploaded()
             with open(submission_result_path, "w", encoding="utf-8") as f:
@@ -260,7 +479,17 @@ def _upload_video_with_biliup(
             logger.info("上传成功")
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.exception(f"biliup上传失败: {exc}")
+            # Try to recover the real code/message from rust-side logs.
+            code, code_msg, raw = _extract_biliup_error(cap.lines() if "cap" in locals() else [])
+            if code is not None:
+                msg_part = f": {code_msg}" if code_msg else ""
+                logger.error(f"biliup上传失败 (code={code}){msg_part}")
+                if raw:
+                    logger.debug(f"biliup错误详情: {raw}")
+                # Avoid printing huge tracebacks for common rate-limit responses.
+                logger.debug(f"biliup异常: {exc}")
+            else:
+                logger.exception(f"biliup上传失败: {exc}")
             msg = str(exc).lower()
             if "cookie" in msg or "csrf" in msg or "登录" in msg or "unauthorized" in msg:
                 logger.error(
@@ -268,9 +497,16 @@ def _upload_video_with_biliup(
                     "请重新运行 `biliup login` 刷新cookies.json，然后重试。"
                 )
                 return False
-            # Exponential backoff: 5s, 10s, 20s, 40s
-            if attempt < MAX_ATTEMPTS:
+            # Backoff strategy:
+            # - For known rate-limit codes (e.g. 601/21566), wait minutes (like biliup-cli does).
+            # - Otherwise keep the short exponential backoff for transient errors.
+            rate_limit_codes = {601, 21566, 406}
+            if code in rate_limit_codes:
+                wait = 60 * attempt  # 60s, 120s, 180s, 240s...
+            else:
+                # Exponential backoff: 5s, 10s, 20s, 40s
                 wait = 5 * (2 ** (attempt - 1))
+            if attempt < MAX_ATTEMPTS:
                 logger.info(f"等待 {wait} 秒后重试...")
                 sleep_with_cancel(wait)
 
