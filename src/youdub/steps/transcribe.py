@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import importlib.util
 import json
@@ -18,6 +19,36 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
 from ..utils import ensure_torchaudio_backend_compat, save_wav
+
+
+@contextlib.contextmanager
+def _torch_load_weights_only_compat():
+    """Temporarily force `torch.load(weights_only=False)` for legacy checkpoints.
+
+    Newer PyTorch versions changed `weights_only` default to True, which breaks loading
+    older (pickled) checkpoints used by pyannote.audio. We scope this monkeypatch to
+    diarization pipeline loading only.
+    """
+
+    orig_load = torch.load
+
+    def _load(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # Force legacy behavior even if callers explicitly pass weights_only=True
+        # (e.g. lightning_fabric cloud_io).
+        patched = dict(kwargs)
+        patched["weights_only"] = False
+        try:
+            return orig_load(*args, **patched)
+        except TypeError:
+            # Older torch versions may not accept `weights_only`.
+            patched.pop("weights_only", None)
+            return orig_load(*args, **patched)
+
+    torch.load = _load  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        torch.load = orig_load  # type: ignore[assignment]
 
 
 def _import_faster_whisper():
@@ -287,17 +318,18 @@ def load_diarize_model(
 
     logger.info(f"加载说话人分离管道 (设备={device})")
     t0 = time.time()
-    if cfg and cfg.exists():
-        pipeline = Pipeline.from_pretrained(str(cfg))
-    else:
-        token = settings.hf_token
-        if not token:
-            raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
-        # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
-        try:
-            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
-        except TypeError:
-            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+    with _torch_load_weights_only_compat():
+        if cfg and cfg.exists():
+            pipeline = Pipeline.from_pretrained(str(cfg))
+        else:
+            token = settings.hf_token
+            if not token:
+                raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
+            # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
+            try:
+                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+            except TypeError:
+                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
 
     pipeline.to(torch.device(device))
     _DIARIZATION_PIPELINE = pipeline

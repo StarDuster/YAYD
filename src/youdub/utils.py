@@ -33,6 +33,64 @@ def ensure_torchaudio_backend_compat() -> None:
     except Exception:
         return
 
+    # torchaudio>=2.x may remove the `torchaudio.backend` package entirely.
+    # Some downstream libs/checkpoints still import it (e.g. during torch.load/unpickling),
+    # which would crash diarization. Provide a minimal module tree for compatibility.
+    try:
+        import importlib.util
+        import sys
+        import types
+        from typing import NamedTuple
+
+        if importlib.util.find_spec("torchaudio.backend") is None:
+            backend_mod = types.ModuleType("torchaudio.backend")
+            # Mark as a package so `import torchaudio.backend.xxx` won't complain.
+            backend_mod.__path__ = []  # type: ignore[attr-defined]
+
+            class AudioMetaData(NamedTuple):
+                sample_rate: int
+                num_frames: int
+                num_channels: int
+                bits_per_sample: int
+                encoding: str
+
+            common_mod = types.ModuleType("torchaudio.backend.common")
+            common_mod.AudioMetaData = AudioMetaData
+
+            def _wrap_top_level(fn_name: str):
+                fn = getattr(torchaudio, fn_name, None)
+                if callable(fn):
+                    return fn
+
+                def _missing(*_args, **_kwargs):
+                    raise RuntimeError(f"torchaudio.{fn_name} 不可用，无法兼容旧的 torchaudio.backend 调用。")
+
+                return _missing
+
+            # Commonly referenced legacy backend submodules.
+            legacy_backend_names = [
+                "sox_io_backend",
+                "soundfile_backend",
+                "ffmpeg_backend",
+            ]
+
+            for name in legacy_backend_names:
+                mod = types.ModuleType(f"torchaudio.backend.{name}")
+                mod.load = _wrap_top_level("load")  # type: ignore[attr-defined]
+                mod.save = _wrap_top_level("save")  # type: ignore[attr-defined]
+                mod.info = _wrap_top_level("info")  # type: ignore[attr-defined]
+                sys.modules[f"torchaudio.backend.{name}"] = mod
+                setattr(backend_mod, name, mod)
+
+            setattr(backend_mod, "common", common_mod)
+            sys.modules["torchaudio.backend"] = backend_mod
+            sys.modules["torchaudio.backend.common"] = common_mod
+            # Ensure attribute access works: `torchaudio.backend`.
+            setattr(torchaudio, "backend", backend_mod)
+    except Exception:
+        # Best-effort only; never crash the main pipeline.
+        pass
+
     # Keep a tiny per-process backend state so set/get/list are consistent.
     state_attr = "_youdub_audio_backend"
     if not hasattr(torchaudio, state_attr):
