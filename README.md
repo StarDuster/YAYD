@@ -210,7 +210,7 @@ uv run youdub
 
 ### yt-dlp 使用 Cookie（可选）
 
-当下载 YouTube 遇到需要登录/年龄限制/私有内容等情况，可配置 cookies：
+当下载 YouTube 遇到需要登录/年龄限制/私有内容等情况，可配置 cookies，使用 cookie 也是回避 Youtube 限流最可靠的方法：
 
 1.  导出 cookies.txt（Netscape 格式）并设置：
 
@@ -263,5 +263,3 @@ BILI_COOKIE_PATH=cookies.json
 ## 许可证
 
 MIT License. 详见 [LICENSE](./LICENSE) 文件。
-
-本项目 fork 自 [liuzhao1225/YouDub-webui](https://github.com/liuzhao1225/YouDub-webui)（原仓库未指定许可证）。
