@@ -255,3 +255,102 @@ def test_upload_video_with_biliup_respects_cancellation(monkeypatch, tmp_path: P
         )
     assert not (folder / "bilibili.json").exists()
 
+
+def test_upload_video_with_biliup_retries_on_failure(monkeypatch, tmp_path: Path):
+    """Test that upload retries on failure with exponential backoff."""
+    import youdub.steps.upload as up
+
+    call_count = 0
+    waits: list[int] = []
+
+    def _failing_upload(**kwargs):  # noqa: ANN003
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("Unknown Error")
+
+    fake = _FakeStreamGears()
+    fake.upload = _failing_upload  # type: ignore[method-assign]
+    monkeypatch.setattr(up, "stream_gears", fake, raising=False)
+    monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
+    monkeypatch.setattr(up, "_iter_upload_lines", lambda _cdn: [_Line("Auto")])
+
+    folder = tmp_path / "job"
+    _make_minimal_upload_folder(folder)
+    cookie_path = tmp_path / "bili_cookies.json"
+    cookie_path.write_text("cookie", encoding="utf-8")
+
+    ok = up._upload_video_with_biliup(  # noqa: SLF001
+        str(folder),
+        proxy=None,
+        upload_cdn=None,
+        cookie_path=cookie_path,
+    )
+    assert ok is False
+    assert call_count == 5  # MAX_ATTEMPTS
+    # Exponential backoff: 5, 10, 20, 40
+    assert waits == [5, 10, 20, 40]
+
+
+def test_upload_video_with_biliup_stops_on_auth_error(monkeypatch, tmp_path: Path):
+    """Test that upload stops immediately on authentication errors."""
+    import youdub.steps.upload as up
+
+    call_count = 0
+
+    def _auth_error_upload(**kwargs):  # noqa: ANN003
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("cookie expired")
+
+    fake = _FakeStreamGears()
+    fake.upload = _auth_error_upload  # type: ignore[method-assign]
+    monkeypatch.setattr(up, "stream_gears", fake, raising=False)
+    monkeypatch.setattr(up, "sleep_with_cancel", lambda *_args, **_kwargs: None)
+
+    folder = tmp_path / "job"
+    _make_minimal_upload_folder(folder)
+    cookie_path = tmp_path / "bili_cookies.json"
+    cookie_path.write_text("cookie", encoding="utf-8")
+
+    ok = up._upload_video_with_biliup(  # noqa: SLF001
+        str(folder),
+        proxy=None,
+        upload_cdn=None,
+        cookie_path=cookie_path,
+    )
+    assert ok is False
+    assert call_count == 1  # Should stop after first auth error
+
+
+def test_upload_all_videos_waits_between_uploads(monkeypatch, tmp_path: Path):
+    """Test that upload_all_videos waits between consecutive uploads."""
+    import youdub.steps.upload as up
+
+    monkeypatch.setattr(up, "stream_gears", _FakeStreamGears(), raising=False)
+    monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "cookies.json"))
+    monkeypatch.setenv("BILI_UPLOAD_INTERVAL", "30")
+    (tmp_path / "cookies.json").write_text("cookie", encoding="utf-8")
+
+    job1 = tmp_path / "job1"
+    job2 = tmp_path / "job2"
+    job1.mkdir(parents=True, exist_ok=True)
+    job2.mkdir(parents=True, exist_ok=True)
+    (job1 / "video.mp4").write_bytes(b"0")
+    (job2 / "video.mp4").write_bytes(b"0")
+
+    uploaded: list[str] = []
+    waits: list[int] = []
+
+    def _fake_impl(folder, *_args, **_kwargs):  # noqa: ANN001
+        uploaded.append(folder)
+        return True
+
+    monkeypatch.setattr(up, "_upload_video_with_biliup", _fake_impl)
+    monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
+
+    out = up.upload_all_videos_under_folder(str(tmp_path))
+    assert "成功 2 个" in out
+    assert len(uploaded) == 2
+    # Should wait 30s between first and second upload
+    assert waits == [30]
+

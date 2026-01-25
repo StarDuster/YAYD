@@ -217,62 +217,64 @@ def _upload_video_with_biliup(
         logger.error(f"访问cookie文件失败 {cookie_path}: {exc}")
         return False
 
-    # one upload attempt may still fail due to line/proxy/network; try a small set of lines
-    attempts = 0
-    for retry in range(5):
+    # Retry logic: try different lines, with exponential backoff.
+    # Total attempts capped at MAX_ATTEMPTS to avoid endless retries.
+    MAX_ATTEMPTS = 5
+    lines = _iter_upload_lines(upload_cdn)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         check_cancelled()
-        for line in _iter_upload_lines(upload_cdn):
-            check_cancelled()
-            attempts += 1
-            try:
-                line_name = getattr(line, "name", None) or str(line)
-                logger.info(f"通过biliup上传中 (尝试 {attempts}, 重试 {retry+1}/5, 线路={line_name})")
-                stream_gears.upload(  # type: ignore[union-attr]
-                    video_path=[video_path],
-                    cookie_file=str(cookie_path),
-                    title=title,
-                    tid=201,
-                    tag=",".join(final_tags),
-                    copyright=2,
-                    source=str(webpage_url or ""),
-                    desc=description,
-                    cover=cover_path if os.path.exists(cover_path) else "",
-                    line=line,
-                    proxy=proxy,
+        line = lines[(attempt - 1) % len(lines)]  # rotate through lines
+        line_name = getattr(line, "name", None) or "auto"
+        try:
+            logger.info(f"通过biliup上传中 (尝试 {attempt}/{MAX_ATTEMPTS}, 线路={line_name})")
+            stream_gears.upload(  # type: ignore[union-attr]
+                video_path=[video_path],
+                cookie_file=str(cookie_path),
+                title=title,
+                tid=201,
+                tag=",".join(final_tags),
+                copyright=2,
+                source=str(webpage_url or ""),
+                desc=description,
+                cover=cover_path if os.path.exists(cover_path) else "",
+                line=line,
+                proxy=proxy,
+            )
+
+            # write a success marker compatible with pipeline._already_uploaded()
+            with open(submission_result_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    _success_marker(
+                        {
+                            "tool": "biliup",
+                            "title": title,
+                            "tid": 201,
+                            "tag": final_tags,
+                            "source": webpage_url,
+                        }
+                    ),
+                    f,
+                    ensure_ascii=False,
+                    indent=4,
                 )
+            logger.info("上传成功")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"biliup上传失败: {exc}")
+            msg = str(exc).lower()
+            if "cookie" in msg or "csrf" in msg or "登录" in msg or "unauthorized" in msg:
+                logger.error(
+                    "检测到可能的认证/cookie错误。 "
+                    "请重新运行 `biliup login` 刷新cookies.json，然后重试。"
+                )
+                return False
+            # Exponential backoff: 5s, 10s, 20s, 40s
+            if attempt < MAX_ATTEMPTS:
+                wait = 5 * (2 ** (attempt - 1))
+                logger.info(f"等待 {wait} 秒后重试...")
+                sleep_with_cancel(wait)
 
-                # write a success marker compatible with pipeline._already_uploaded()
-                with open(submission_result_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        _success_marker(
-                            {
-                                "tool": "biliup",
-                                "title": title,
-                                "tid": 201,
-                                "tag": final_tags,
-                                "source": webpage_url,
-                            }
-                        ),
-                        f,
-                        ensure_ascii=False,
-                        indent=4,
-                    )
-                logger.info("上传成功")
-                return True
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(f"biliup上传失败: {exc}")
-                msg = str(exc).lower()
-                if "cookie" in msg or "csrf" in msg or "登录" in msg or "unauthorized" in msg:
-                    logger.error(
-                        "检测到可能的认证/cookie错误。 "
-                        "请重新运行 `biliup login` 刷新cookies.json，然后重试。"
-                    )
-                    return False
-                sleep_with_cancel(2)
-
-        sleep_with_cancel(8)
-
-    logger.error("重试后仍上传失败")
+    logger.error(f"重试 {MAX_ATTEMPTS} 次后仍上传失败")
     return False
 
 
@@ -301,12 +303,18 @@ def upload_all_videos_under_folder(folder: str) -> str:
     proxy = (os.getenv("BILI_PROXY") or "").strip() or None
     upload_cdn = (os.getenv("BILI_UPLOAD_CDN") or "").strip() or None
     cookie_path = Path((os.getenv("BILI_COOKIE_PATH") or "bili_cookies.json").strip() or "bili_cookies.json")
+    # Interval between uploads to avoid rate limiting (default 60s)
+    try:
+        upload_interval = int(os.getenv("BILI_UPLOAD_INTERVAL") or "60")
+    except ValueError:
+        upload_interval = 60
 
     if proxy:
         logger.info(f"B站上传代理已配置: {proxy}")
     if upload_cdn:
         logger.info(f"B站首选上传CDN: {upload_cdn}")
     logger.info(f"B站cookie路径: {cookie_path}")
+    logger.info(f"B站上传间隔: {upload_interval}秒")
 
     # Prepare cookie file once to avoid repeated attempts for each video folder.
     if not _ensure_cookie_file(cookie_path):
@@ -316,9 +324,15 @@ def upload_all_videos_under_folder(folder: str) -> str:
         )
 
     count = 0
+    first_upload = True
     for root, _, files in os.walk(folder):
         check_cancelled()
         if "video.mp4" in files:
+            # Wait between uploads to avoid rate limiting
+            if not first_upload and upload_interval > 0:
+                logger.info(f"等待 {upload_interval} 秒后上传下一个视频...")
+                sleep_with_cancel(upload_interval)
             if _upload_video_with_biliup(root, proxy, upload_cdn, cookie_path):
                 count += 1
+                first_upload = False
     return f"上传完成: {folder}（成功 {count} 个）"
