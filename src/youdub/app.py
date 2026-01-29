@@ -46,6 +46,7 @@ _TARGET_LANGUAGE_CHOICES = [
 ]
 _TRANSLATION_STRATEGY_CHOICES = [("串行（带上下文，慢）", "history"), ("并行（先生成指南，快）", "guide_parallel")]
 _TTS_METHOD_CHOICES = [("ByteDance", "bytedance"), ("Qwen", "qwen"), ("Gemini", "gemini")]
+_ASR_METHOD_CHOICES = [("Whisper (本地)", "whisper"), ("Qwen3-ASR (本地)", "qwen")]
 
 # Gradio 6.x 默认 time_limit=30s，会导致长任务“前端一直转圈但没有输出”
 # （后台线程仍在跑，所以你能在终端看到日志）。这里显式关掉时间限制。
@@ -116,30 +117,68 @@ _AUTO_SCROLL_JS = r"""
   };
   requestAnimationFrame(loop);
 
-  // 监听自适应拉伸checkbox，控制加速倍率slider
-  const setupAdaptiveStretchToggle = () => {
-    const checkbox = document.querySelector("#adaptive-stretch-checkbox input[type='checkbox']");
-    const sliderContainer = document.getElementById("speed-up-slider");
-    if (!checkbox || !sliderContainer) return false;
+  // 监听“按段自适应拉伸”checkbox，禁用/灰化同一页的“加速倍率”slider。
+  // TabbedInterface 会同时挂载多个页面，因此这里显式绑定两组（全自动 / 视频合成）。
+  const setupAdaptiveStretchToggles = () => {
+    const pairs = [
+      {
+        checkboxSelector: "#adaptive-stretch-checkbox input[type='checkbox']",
+        sliderId: "speed-up-slider",
+      },
+      {
+        checkboxSelector: "#adaptive-stretch-checkbox-synthesize input[type='checkbox']",
+        sliderId: "speed-up-slider-synthesize",
+      },
+    ];
 
-    const updateSlider = () => {
-      const isAdaptive = checkbox.checked;
-      sliderContainer.style.opacity = isAdaptive ? "0.5" : "1";
-      sliderContainer.style.pointerEvents = isAdaptive ? "none" : "auto";
-      const sliderInput = sliderContainer.querySelector("input[type='range']");
-      const numberInput = sliderContainer.querySelector("input[type='number']");
-      if (sliderInput) sliderInput.disabled = isAdaptive;
-      if (numberInput) numberInput.disabled = isAdaptive;
-    };
+    let anyFound = false;
+    let allReady = true;
 
-    checkbox.addEventListener("change", updateSlider);
-    updateSlider();
-    return true;
+    pairs.forEach(({ checkboxSelector, sliderId }) => {
+      const checkbox = document.querySelector(checkboxSelector);
+      const sliderContainer = document.getElementById(sliderId);
+      if (!checkbox || !sliderContainer) {
+        allReady = false;
+        return;
+      }
+      anyFound = true;
+
+      // Avoid duplicate binding across retries.
+      if (checkbox.dataset.youdubAdaptiveBound === sliderId) return;
+
+      const setDisabled = (disabled) => {
+        sliderContainer.classList.toggle("youdub-disabled", !!disabled);
+        sliderContainer.setAttribute("aria-disabled", disabled ? "true" : "false");
+
+        // Gradio slider 通常包含 range + number + reset button；统一禁用。
+        const controls = sliderContainer.querySelectorAll("input, button, select, textarea");
+        controls.forEach((el) => {
+          try {
+            el.disabled = !!disabled;
+          } catch (e) {}
+          try {
+            el.setAttribute("aria-disabled", disabled ? "true" : "false");
+          } catch (e) {}
+        });
+      };
+
+      const update = () => {
+        const isAdaptive = !!checkbox.checked;
+        setDisabled(isAdaptive);
+      };
+
+      checkbox.addEventListener("change", update);
+      update();
+      checkbox.dataset.youdubAdaptiveBound = sliderId;
+    });
+
+    // Wait until both pages are mounted so both bindings work reliably.
+    return anyFound && allReady;
   };
 
-  // 重试直到找到元素（因为Gradio动态加载）
+  // 重试直到元素就绪（Gradio 动态加载/切 tab 时会延迟挂载）
   const trySetup = () => {
-    if (!setupAdaptiveStretchToggle()) {
+    if (!setupAdaptiveStretchToggles()) {
       setTimeout(trySetup, 500);
     }
   };
@@ -158,6 +197,16 @@ _OUTPUT_CSS = r"""
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
   line-height: 1.4;
+}
+
+/* 通用禁用态：用于“启用自适应拉伸后，加速倍率无效”的灰化展示 */
+.youdub-disabled {
+  opacity: 0.5 !important;
+  filter: grayscale(1) !important;
+}
+.youdub-disabled * {
+  pointer-events: none !important;
+  cursor: not-allowed !important;
 }
 """
 
@@ -462,10 +511,14 @@ def run_pipeline(
     demucs_model,
     device,
     shifts,
+    asr_method,
+    qwen_asr_model_dir,
     whisper_model,
     whisper_device,
     whisper_cpu_model,
     whisper_batch_size,
+    qwen_asr_num_threads,
+    qwen_asr_vad_segment_threshold,
     whisper_diarization,
     whisper_min_speakers,
     whisper_max_speakers,
@@ -477,6 +530,7 @@ def run_pipeline(
     tts_method,
     qwen_tts_batch_size,
     subtitles,
+    bilingual_subtitle,
     tts_adaptive_segment_stretch,
     speed_up,
     fps,
@@ -503,10 +557,14 @@ def run_pipeline(
                 demucs_model=demucs_model,
                 device=device,
                 shifts=shifts,
+                asr_method=asr_method,
+                qwen_asr_model_dir=qwen_asr_model_dir,
                 whisper_model=whisper_model,
                 whisper_device=whisper_device,
                 whisper_cpu_model=whisper_cpu_model,
                 whisper_batch_size=whisper_batch_size,
+                qwen_asr_num_threads=qwen_asr_num_threads,
+                qwen_asr_vad_segment_threshold=qwen_asr_vad_segment_threshold,
                 whisper_diarization=whisper_diarization,
                 whisper_min_speakers=whisper_min_speakers,
                 whisper_max_speakers=whisper_max_speakers,
@@ -515,6 +573,7 @@ def run_pipeline(
                 qwen_tts_batch_size=qwen_tts_batch_size,
                 tts_adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
                 subtitles=subtitles,
+                bilingual_subtitle=bool(bilingual_subtitle),
                 speed_up=speed_up,
                 fps=fps,
                 target_resolution=target_resolution,
@@ -529,6 +588,121 @@ def run_pipeline(
 
 def show_model_status():
     return model_manager.describe_status()
+
+
+def download_models(hf_token: str):
+    """下载所有需要的离线模型。"""
+    import torch
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return "缺少 huggingface_hub：请运行 `pip install huggingface-hub`（或 `uv sync`）"
+
+    # 模型版本配置
+    MODELS_TO_DOWNLOAD = {
+        "whisper": {
+            "repo_id": "Systran/faster-whisper-large-v3",
+            "revision": "edc79942a0352e00c3b03657b4943f293cf0f1d0",
+        },
+        "diarization": {
+            "repo_id": "pyannote/speaker-diarization-3.1",
+            "revision": "84fd25912480287da0247647c3d2b4853cb3ee5d",
+        },
+        "segmentation": {
+            "repo_id": "pyannote/segmentation-3.0",
+            "revision": "4ca4d5a8d2ab82ddfbea8aa3b29c15431671239c",
+        },
+    }
+
+    # 临时清除离线模式环境变量
+    env_vars_to_clear = ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]
+    old_env = {}
+    for var in env_vars_to_clear:
+        old_env[var] = os.environ.get(var)
+        if var in os.environ:
+            del os.environ[var]
+
+    # 启用快速传输
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
+    try:
+        logger.info("开始下载离线模型...")
+        logger.info(f"目标目录: {settings.root_folder}")
+
+        # 1. Demucs
+        logger.info("\n=== 1. Demucs 模型 ===")
+        try:
+            from demucs_infer.pretrained import get_model
+
+            demucs_dir = settings.resolve_path(settings.demucs_model_dir)
+            if demucs_dir:
+                demucs_dir.mkdir(parents=True, exist_ok=True)
+                torch.hub.set_dir(str(demucs_dir))
+                logger.info(f"设置 torch hub 目录: {demucs_dir}")
+
+            model_name = settings.demucs_model_name
+            logger.info(f"下载 Demucs 模型: {model_name} ...")
+            get_model(model_name)
+            logger.info("Demucs 模型下载完成。")
+        except Exception as e:
+            logger.error(f"Demucs 下载失败: {e}")
+
+        # 2. Whisper
+        logger.info("\n=== 2. Whisper 模型 ===")
+        wx_conf = MODELS_TO_DOWNLOAD["whisper"]
+        wx_path = settings.resolve_path(settings.whisper_model_path)
+        logger.info(f"下载 Whisper 模型 ({wx_conf['revision'][:7]}) -> {wx_path} ...")
+        try:
+            snapshot_download(
+                repo_id=wx_conf["repo_id"],
+                revision=wx_conf["revision"],
+                local_dir=wx_path,
+                local_dir_use_symlinks=False,
+                resume_download=True,
+            )
+            logger.info("Whisper 模型下载完成。")
+        except Exception as e:
+            logger.error(f"Whisper 下载失败: {e}")
+
+        # 3. Pyannote 说话人分离
+        logger.info("\n=== 3. Pyannote 说话人分离 ===")
+        if not hf_token:
+            logger.warning("未提供 HF_TOKEN，跳过 Pyannote 模型下载（需要同意协议并设置 token）")
+        else:
+            diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
+            old_hf_home = os.environ.get("HF_HOME")
+            os.environ["HF_HOME"] = str(diar_dir)
+
+            for key in ["diarization", "segmentation"]:
+                conf = MODELS_TO_DOWNLOAD[key]
+                logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
+                try:
+                    snapshot_download(
+                        repo_id=conf["repo_id"],
+                        revision=conf["revision"],
+                        token=hf_token,
+                        resume_download=True,
+                    )
+                    logger.info(f"{conf['repo_id']} 下载完成。")
+                except Exception as e:
+                    logger.error(f"下载失败 {conf['repo_id']}: {e}")
+
+            if old_hf_home is not None:
+                os.environ["HF_HOME"] = old_hf_home
+            else:
+                os.environ.pop("HF_HOME", None)
+
+        logger.info("\n下载流程已结束。")
+        return model_manager.describe_status()
+
+    finally:
+        # 恢复环境变量
+        for var, val in old_env.items():
+            if val is not None:
+                os.environ[var] = val
+            else:
+                os.environ.pop(var, None)
 
 
 do_everything_interface = gr.Interface(
@@ -553,10 +727,14 @@ do_everything_interface = gr.Interface(
         ),
         gr.Radio(_DEVICE_CHOICES, label="Demucs 运行设备", value=settings.demucs_device),
         gr.Slider(minimum=0, maximum=10, step=1, label="随机移位次数", value=settings.demucs_shifts),
+        gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method),
+        gr.Textbox(label="Qwen3-ASR 模型路径", value=str(settings.qwen_asr_model_path or "")),
         gr.Textbox(label="Whisper 模型路径", value=str(settings.whisper_model_path)),
         gr.Radio(_DEVICE_CHOICES, label="Whisper 运行设备", value=settings.whisper_device),
         gr.Textbox(label="Whisper CPU 模型路径（可选）", value=str(settings.whisper_cpu_model_path or "")),
         gr.Slider(minimum=1, maximum=128, step=1, label="Whisper 批大小", value=settings.whisper_batch_size),
+        gr.Slider(minimum=1, maximum=16, step=1, label="Qwen3-ASR 并发线程数", value=settings.qwen_asr_num_threads),
+        gr.Slider(minimum=30, maximum=180, step=10, label="Qwen3-ASR VAD分段时长(秒)", value=settings.qwen_asr_vad_segment_threshold),
         gr.Checkbox(label="说话人分离", value=True),
         gr.Number(label="最少说话人数（可选）", value=None, step=1, precision=0),
         gr.Number(label="最多说话人数（可选）", value=None, step=1, precision=0),
@@ -580,8 +758,21 @@ do_everything_interface = gr.Interface(
         ),
         gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size),
         gr.Checkbox(label="字幕", value=True),
-        gr.Checkbox(label="按段自适应拉伸语音(减少无声)", value=False, elem_id="adaptive-stretch-checkbox", info="启用后下方的加速倍率无效"),
-        gr.Slider(minimum=0.5, maximum=2, step=0.05, label="加速倍率", value=DEFAULT_SPEED_UP, elem_id="speed-up-slider"),
+        gr.Checkbox(label="双语字幕", value=False),
+        gr.Checkbox(
+            label="按段自适应拉伸语音(减少无声)",
+            value=False,
+            elem_id="adaptive-stretch-checkbox",
+            info="启用后下方的加速倍率无效",
+        ),
+        gr.Slider(
+            minimum=0.5,
+            maximum=2,
+            step=0.05,
+            label="加速倍率",
+            value=DEFAULT_SPEED_UP,
+            elem_id="speed-up-slider",
+        ),
         gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30),
         gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU"),
         gr.Radio(
@@ -659,13 +850,15 @@ demucs_interface = gr.Interface(
     **_INTERFACE_STREAM_KWARGS,
 )
 
-whisper_inference = gr.Interface(
-    fn=_streamify(lambda folder, model, cpu_model, device, batch_size, diarization, min_speakers, max_speakers: _safe_run(
-        (
-            [model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
-            if diarization
-            else []
-        ),
+def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device, batch_size, qwen_threads, qwen_vad, diarization, min_speakers, max_speakers):
+    # Determine required models based on ASR method
+    names = []
+    if asr_method == "qwen":
+        names.append(model_manager._qwen_asr_requirement().name)  # type: ignore[attr-defined]
+    if diarization:
+        names.append(model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
+    return _safe_run(
+        names,
         transcribe_all_audio_under_folder,
         folder,
         model_name=model,
@@ -677,13 +870,24 @@ whisper_inference = gr.Interface(
         max_speakers=max_speakers,
         settings=settings,
         model_manager=model_manager,
-    )),
+        asr_method=asr_method,
+        qwen_asr_model_dir=qwen_model_dir,
+        qwen_asr_num_threads=qwen_threads,
+        qwen_asr_vad_segment_threshold=qwen_vad,
+    )
+
+whisper_inference = gr.Interface(
+    fn=_streamify(_run_transcribe),
     inputs=[
         gr.Textbox(label="目录", value=str(settings.root_folder)),
+        gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method),
+        gr.Textbox(label="Qwen3-ASR 模型路径", value=str(settings.qwen_asr_model_path or "")),
         gr.Textbox(label="Whisper 模型路径", value=str(settings.whisper_model_path)),
         gr.Textbox(label="Whisper CPU 模型路径（可选）", value=str(settings.whisper_cpu_model_path or "")),
-        gr.Radio(_DEVICE_CHOICES, label="运行设备", value=settings.whisper_device),
-        gr.Slider(minimum=1, maximum=128, step=1, label="批大小", value=settings.whisper_batch_size),
+        gr.Radio(_DEVICE_CHOICES, label="Whisper 运行设备", value=settings.whisper_device),
+        gr.Slider(minimum=1, maximum=128, step=1, label="Whisper 批大小", value=settings.whisper_batch_size),
+        gr.Slider(minimum=1, maximum=16, step=1, label="Qwen3-ASR 并发线程数", value=settings.qwen_asr_num_threads),
+        gr.Slider(minimum=30, maximum=180, step=10, label="Qwen3-ASR VAD分段时长(秒)", value=settings.qwen_asr_vad_segment_threshold),
         gr.Checkbox(label="说话人分离", value=True),
         gr.Number(label="最少说话人数（可选）", value=None, step=1, precision=0),
         gr.Number(label="最多说话人数（可选）", value=None, step=1, precision=0),
@@ -785,12 +989,40 @@ tts_interface = gr.Interface(
     **_INTERFACE_STREAM_KWARGS,
 )
 
+def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_stretch, speed_up, fps, resolution, use_nvenc):
+    # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
+    effective_speed_up = 1.0 if adaptive_stretch else speed_up
+    return synthesize_all_video_under_folder(
+        folder,
+        subtitles=subtitles,
+        bilingual_subtitle=bilingual_subtitle,
+        speed_up=effective_speed_up,
+        fps=fps,
+        resolution=resolution,
+        use_nvenc=use_nvenc,
+    )
+
+
 synthesize_video_interface = gr.Interface(
-    fn=_streamify(synthesize_all_video_under_folder),
+    fn=_streamify(_synthesize_video_wrapper),
     inputs=[
         gr.Textbox(label="目录", value=str(settings.root_folder)),
         gr.Checkbox(label="字幕", value=True),
-        gr.Slider(minimum=0.5, maximum=2, step=0.05, label="加速倍率", value=DEFAULT_SPEED_UP),
+        gr.Checkbox(label="双语字幕", value=False),
+        gr.Checkbox(
+            label="按段自适应拉伸语音(减少无声)",
+            value=False,
+            elem_id="adaptive-stretch-checkbox-synthesize",
+            info="启用后下方的加速倍率无效",
+        ),
+        gr.Slider(
+            minimum=0.5,
+            maximum=2,
+            step=0.05,
+            label="加速倍率",
+            value=DEFAULT_SPEED_UP,
+            elem_id="speed-up-slider-synthesize",
+        ),
         gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30),
         gr.Radio(
             _RESOLUTION_CHOICES,
@@ -836,18 +1068,40 @@ upload_bilibili_interface = gr.Interface(
     **_INTERFACE_STREAM_KWARGS,
 )
 
-model_status_interface = gr.Interface(
-    fn=_streamify(show_model_status),
-    inputs=[],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    description="当前需要的语音识别/语音合成模型状态（仅本地，不会自动下载）。",
-    title="模型检查",
-    flagging_mode="never",
-    submit_btn="刷新",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+with gr.Blocks(title="模型检查") as model_status_interface:
+    gr.Markdown("## 模型检查")
+    gr.Markdown("当前需要的语音识别/语音合成模型状态（仅本地，不会自动下载）。")
+
+    output_box = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+    with gr.Row():
+        refresh_btn = gr.Button("刷新状态", variant="secondary")
+
+    gr.Markdown("---")
+    gr.Markdown("### 模型下载")
+    gr.Markdown("下载 Demucs、Whisper 和 Pyannote 说话人分离模型到本地。Pyannote 需要 HF_TOKEN（需先在 HuggingFace 同意协议）。")
+
+    hf_token_input = gr.Textbox(
+        label="HF_TOKEN（Hugging Face Token）",
+        placeholder="hf_xxx...",
+        type="password",
+        value=settings.hf_token or "",
+    )
+    download_btn = gr.Button("下载模型", variant="primary")
+
+    refresh_btn.click(
+        fn=_streamify(show_model_status),
+        inputs=[],
+        outputs=output_box,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+
+    download_btn.click(
+        fn=_streamify(download_models),
+        inputs=[hf_token_input],
+        outputs=output_box,
+        **_INTERFACE_STREAM_KWARGS,
+    )
 
 app = gr.TabbedInterface(
     interface_list=[

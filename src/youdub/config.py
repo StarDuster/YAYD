@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     demucs_device: str = Field(default="auto", description="cuda/cpu/auto for Demucs")
     demucs_shifts: int = Field(default=5, description="Number of shifts for Demucs separator")
 
+    # ASR
+    asr_method: str = Field(
+        default="whisper",
+        description="ASR Engine to use (whisper / qwen)",
+        alias="ASR_METHOD",
+    )
+
     # ASR (Whisper via faster-whisper / CTranslate2)
     whisper_model_path: Path = Field(
         default=Path("models/ASR/whisper"),
@@ -74,6 +81,23 @@ class Settings(BaseSettings):
         alias="WHISPER_MODEL_NAME",
     )
     whisper_batch_size: int = Field(default=32, description="Batch size for faster-whisper")
+
+    # ASR (Qwen3-ASR via qwen-asr)
+    qwen_asr_model_path: Optional[Path] = Field(
+        default=Path("models/ASR/Qwen3-ASR-1.7B"),
+        description="Local path to Qwen3-ASR model directory (no auto-download)",
+        alias="QWEN_ASR_MODEL_PATH",
+    )
+    qwen_asr_num_threads: int = Field(
+        default=1,
+        description="Concurrency for Qwen3-ASR chunk transcription (not GPU parallelism)",
+        alias="QWEN_ASR_NUM_THREADS",
+    )
+    qwen_asr_vad_segment_threshold: int = Field(
+        default=60,
+        description="Chunk length (seconds) for Qwen3-ASR transcription (name kept for backward compatibility)",
+        alias="QWEN_ASR_VAD_SEGMENT_THRESHOLD",
+    )
 
     # Translation
     translation_target_language: str = Field(default="简体中文", description="Default translation target language")

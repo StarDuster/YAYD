@@ -5,8 +5,11 @@ import ctypes
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
+import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -70,11 +73,68 @@ _ASR_MODEL = None
 _ASR_PIPELINE = None
 _ASR_KEY: str | None = None
 
+_QWEN_ASR_MODEL = None
+_QWEN_ASR_KEY: str | None = None
+
 _DIARIZATION_PIPELINE = None
 _DIARIZATION_KEY: str | None = None
 
 
 _CUDNN_PRELOADED = False
+
+
+def _import_qwen_asr():
+    try:
+        from qwen_asr import Qwen3ASRModel  # type: ignore
+    except Exception as exc:  # pylint: disable=broad-except
+        raise RuntimeError(
+            "缺少依赖 qwen-asr，无法使用 Qwen3-ASR。\n"
+            "请在当前虚拟环境中安装：`uv sync`（或 `uv add qwen-asr`）。\n"
+            f"原始错误: {exc}"
+        ) from exc
+    return Qwen3ASRModel
+
+
+def _wav_duration_seconds(path: str) -> float | None:
+    try:
+        with wave.open(path, "rb") as wf:
+            rate = int(wf.getframerate() or 0)
+            if rate <= 0:
+                return None
+            frames = int(wf.getnframes() or 0)
+            if frames <= 0:
+                return 0.0
+            return frames / float(rate)
+    except Exception:
+        return None
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\.])\s*")
+
+
+def _split_text_with_timing(text: str, start_s: float, end_s: float) -> list[dict[str, Any]]:
+    s = (text or "").strip()
+    if not s:
+        return []
+    duration = float(max(0.0, end_s - start_s))
+    if duration <= 0:
+        return [{"start": float(start_s), "end": float(start_s), "text": s, "speaker": "SPEAKER_00"}]
+
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(s) if p and p.strip()]
+    if not parts:
+        return [{"start": float(start_s), "end": float(end_s), "text": s, "speaker": "SPEAKER_00"}]
+
+    weights = [max(1, len(p.replace(" ", ""))) for p in parts]
+    total = float(sum(weights)) or 1.0
+
+    out: list[dict[str, Any]] = []
+    cur = float(start_s)
+    for i, (p, w) in enumerate(zip(parts, weights)):
+        seg_dur = duration * (float(w) / total)
+        seg_end = float(end_s) if i == (len(parts) - 1) else float(cur + seg_dur)
+        out.append({"start": float(cur), "end": float(seg_end), "text": p, "speaker": "SPEAKER_00"})
+        cur = seg_end
+    return out
 
 
 def _read_speaker_ref_seconds(default: float = 15.0) -> float:
@@ -146,7 +206,7 @@ def _preload_cudnn_for_onnxruntime_gpu() -> None:
 
 
 def unload_all_models() -> None:
-    global _ASR_MODEL, _ASR_PIPELINE, _DIARIZATION_PIPELINE
+    global _ASR_MODEL, _ASR_PIPELINE, _QWEN_ASR_MODEL, _DIARIZATION_PIPELINE
 
     cleared = False
     if _ASR_PIPELINE is not None:
@@ -156,6 +216,10 @@ def unload_all_models() -> None:
     if _ASR_MODEL is not None:
         del _ASR_MODEL
         _ASR_MODEL = None
+        cleared = True
+    if _QWEN_ASR_MODEL is not None:
+        del _QWEN_ASR_MODEL
+        _QWEN_ASR_MODEL = None
         cleared = True
     if _DIARIZATION_PIPELINE is not None:
         del _DIARIZATION_PIPELINE
@@ -241,6 +305,98 @@ def load_asr_model(
     _ASR_PIPELINE = BatchedInferencePipeline(model=_ASR_MODEL) if use_batched else None
     _ASR_KEY = key
     logger.info(f"Whisper模型加载完成，耗时 {time.time() - t0:.2f}秒")
+
+
+def _qwen_device_map(device: str) -> str:
+    if device.startswith("cuda"):
+        return "cuda:0"
+    return "cpu"
+
+
+def _qwen_default_dtype(device: str) -> torch.dtype:
+    if device.startswith("cuda"):
+        try:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float16
+    return torch.float32
+
+
+def _looks_like_qwen_model_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    # Minimal heuristic: allow either config.json or any safetensors in the directory.
+    if (path / "config.json").exists():
+        return True
+    for p in path.glob("*.safetensors"):
+        if p.is_file():
+            return True
+    if (path / "model.safetensors.index.json").exists():
+        return True
+    # Fallback: non-empty dir.
+    try:
+        return any(path.iterdir())
+    except Exception:
+        return False
+
+
+def load_qwen_asr_model(
+    model_dir: str,
+    device: str = "auto",
+    dtype: torch.dtype | None = None,
+    max_new_tokens: int | None = None,
+    max_inference_batch_size: int | None = None,
+    settings: Settings | None = None,
+    model_manager: ModelManager | None = None,
+) -> None:
+    check_cancelled()
+    global _QWEN_ASR_MODEL, _QWEN_ASR_KEY
+
+    settings = settings or _DEFAULT_SETTINGS
+    model_manager = model_manager or _DEFAULT_MODEL_MANAGER
+
+    _ensure_assets(settings, model_manager, require_diarization=False)
+    _ensure_offline_mode()
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if dtype is None:
+        dtype = _qwen_default_dtype(device)
+
+    model_path = Path(str(model_dir)).expanduser()
+    if not _looks_like_qwen_model_dir(model_path):
+        raise ModelCheckError(
+            "Qwen3-ASR 模型目录无效或不存在（需要离线模型目录）。"
+            f"\n当前: {model_path}\n请下载模型并设置 QWEN_ASR_MODEL_PATH（或在 UI 中填写路径）。"
+        )
+
+    key = f"{model_path.absolute()}|device={device}|dtype={dtype}|max_new={max_new_tokens}|bs={max_inference_batch_size}"
+    if _QWEN_ASR_KEY == key and _QWEN_ASR_MODEL is not None:
+        return
+
+    Qwen3ASRModel = _import_qwen_asr()
+    logger.info(f"加载Qwen3-ASR模型 {model_path} (device={device}, dtype={dtype})")
+    t0 = time.time()
+
+    kwargs: dict[str, Any] = {"dtype": dtype, "device_map": _qwen_device_map(device)}
+    if max_inference_batch_size is not None:
+        kwargs["max_inference_batch_size"] = int(max_inference_batch_size)
+    if max_new_tokens is not None:
+        kwargs["max_new_tokens"] = int(max_new_tokens)
+
+    try:
+        _QWEN_ASR_MODEL = Qwen3ASRModel.from_pretrained(str(model_path), **kwargs)
+    except TypeError:
+        # Backward/forward compatibility: older versions may not accept some kwargs.
+        kwargs.pop("max_inference_batch_size", None)
+        kwargs.pop("max_new_tokens", None)
+        _QWEN_ASR_MODEL = Qwen3ASRModel.from_pretrained(str(model_path), **kwargs)
+
+    _QWEN_ASR_KEY = key
+    logger.info(f"Qwen3-ASR模型加载完成，耗时 {time.time() - t0:.2f}秒")
 
 
 def init_asr(settings: Settings | None = None, model_manager: ModelManager | None = None) -> None:
@@ -492,6 +648,10 @@ def transcribe_audio(
     max_speakers: int | None = None,
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
+    asr_method: str | None = None,
+    qwen_asr_model_dir: str | None = None,
+    qwen_asr_num_threads: int | None = None,
+    qwen_asr_vad_segment_threshold: int | None = None,
 ) -> bool:
     check_cancelled()
     transcript_path = os.path.join(folder, "transcript.json")
@@ -534,76 +694,162 @@ def transcribe_audio(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
+    method = (asr_method or getattr(settings, "asr_method", "whisper") or "whisper").strip().lower()
+    if method not in ("whisper", "qwen"):
+        method = "whisper"
+
     if model_name is None:
         model_name = str(settings.whisper_model_path)
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if device == "cpu":
-        # Prefer explicit CPU model path (UI arg) -> settings default -> fallback to model_name.
-        cpu_candidate = (cpu_model_name or "").strip()
-        if not cpu_candidate:
-            cpu_dir = getattr(settings, "whisper_cpu_model_path", None)
-            cpu_candidate = str(cpu_dir).strip() if cpu_dir else ""
-        if cpu_candidate:
-            model_name = cpu_candidate
+    transcript: list[dict[str, Any]] = []
 
-    check_cancelled()
-    load_asr_model(
-        model_dir=model_name,
-        device=device,
-        settings=settings,
-        model_manager=model_manager,
-        use_batched=True,
-    )
+    if method == "qwen":
+        # Qwen3-ASR: chunk the audio (seconds) and approximate timestamps per sentence.
+        qwen_model_dir = (qwen_asr_model_dir or str(getattr(settings, "qwen_asr_model_path", "") or "")).strip()
+        qwen_threads = int(qwen_asr_num_threads or getattr(settings, "qwen_asr_num_threads", 1) or 1)
+        qwen_chunk_s = int(qwen_asr_vad_segment_threshold or getattr(settings, "qwen_asr_vad_segment_threshold", 60) or 60)
+        qwen_threads = max(1, min(qwen_threads, 32))
+        qwen_chunk_s = max(5, qwen_chunk_s)
 
-    assert _ASR_MODEL is not None
+        load_qwen_asr_model(
+            model_dir=qwen_model_dir,
+            device=device,
+            settings=settings,
+            model_manager=model_manager,
+            max_inference_batch_size=1,
+        )
+        assert _QWEN_ASR_MODEL is not None
 
-    logger.info(f"转录中 {wav_path}")
-    t0 = time.time()
+        logger.info(f"转录中(Qwen3-ASR) {wav_path}")
+        t0 = time.time()
 
-    _preload_cudnn_for_onnxruntime_gpu()
+        dur = _wav_duration_seconds(wav_path)
+        if dur is None:
+            # Fallback: use librosa header-based duration.
+            try:
+                dur = float(librosa.get_duration(filename=wav_path))
+            except Exception:
+                dur = None
 
-    # Prefer batched pipeline if available (much higher throughput on GPU).
-    if _ASR_PIPELINE is not None:
-        check_cancelled()
-        segments_iter, info = _ASR_PIPELINE.transcribe(
-            wav_path,
-            batch_size=batch_size,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
+        if dur is None:
+            # Last resort: treat whole file as one chunk without timestamps.
+            dur = float(qwen_chunk_s)
+
+        starts = [float(x) for x in np.arange(0.0, float(dur) + 1e-6, float(qwen_chunk_s)).tolist()]
+
+        def _run_chunk(start_s: float) -> tuple[float, float, str, str | None]:
+            check_cancelled()
+            logger.info(f"Qwen3-ASR: 处理 chunk offset={start_s:.1f}s / {dur:.1f}s")
+            # Load chunk as 16k mono.
+            chunk, sr = librosa.load(wav_path, sr=16000, mono=True, offset=max(0.0, float(start_s)), duration=float(qwen_chunk_s))
+            if chunk.size <= 0:
+                return float(start_s), float(start_s), "", None
+            chunk_dur = float(chunk.shape[0]) / float(sr)
+            end_s = float(start_s) + chunk_dur
+            check_cancelled()
+            results = _QWEN_ASR_MODEL.transcribe(audio=(chunk, int(sr)), language=None)  # type: ignore[attr-defined]
+            if not results:
+                return float(start_s), float(end_s), "", None
+            r0 = results[0]
+            text = str(getattr(r0, "text", "") or "").strip()
+            lang = getattr(r0, "language", None)
+            lang_str = str(lang) if lang is not None else None
+            return float(start_s), float(end_s), text, lang_str
+
+        chunk_results: list[tuple[float, float, str, str | None]] = []
+        if qwen_threads <= 1 or len(starts) <= 1:
+            for st in starts:
+                check_cancelled()
+                chunk_results.append(_run_chunk(float(st)))
+        else:
+            with ThreadPoolExecutor(max_workers=qwen_threads) as ex:
+                futs = [ex.submit(_run_chunk, float(st)) for st in starts]
+                for fut in as_completed(futs):
+                    check_cancelled()
+                    chunk_results.append(fut.result())
+
+        chunk_results.sort(key=lambda x: x[0])
+        lang_seen: str | None = None
+        for st, ed, txt, lang in chunk_results:
+            check_cancelled()
+            if lang and not lang_seen:
+                lang_seen = lang
+            if not txt:
+                continue
+            transcript.extend(_split_text_with_timing(txt, st, ed))
+
+        logger.info(
+            f"ASR完成(Qwen3-ASR)，耗时 {time.time() - t0:.2f}秒 (段数={len(transcript)}, 语言={lang_seen})"
         )
     else:
+        if device == "cpu":
+            # Prefer explicit CPU model path (UI arg) -> settings default -> fallback to model_name.
+            cpu_candidate = (cpu_model_name or "").strip()
+            if not cpu_candidate:
+                cpu_dir = getattr(settings, "whisper_cpu_model_path", None)
+                cpu_candidate = str(cpu_dir).strip() if cpu_dir else ""
+            if cpu_candidate:
+                model_name = cpu_candidate
+
         check_cancelled()
-        segments_iter, info = _ASR_MODEL.transcribe(
-            wav_path,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
+        load_asr_model(
+            model_dir=model_name,
+            device=device,
+            settings=settings,
+            model_manager=model_manager,
+            use_batched=True,
         )
 
-    segments_list = []
-    for seg in segments_iter:
-        check_cancelled()
-        segments_list.append(seg)
-    logger.info(f"ASR完成，耗时 {time.time() - t0:.2f}秒 (段数={len(segments_list)}, 语言={getattr(info, 'language', None)})")
+        assert _ASR_MODEL is not None
 
-    transcript: list[dict[str, Any]] = []
-    for seg in segments_list:
-        check_cancelled()
-        text = (getattr(seg, "text", "") or "").strip()
-        if not text:
-            continue
-        transcript.append(
-            {
-                "start": float(getattr(seg, "start", 0.0)),
-                "end": float(getattr(seg, "end", 0.0)),
-                "text": text,
-                "speaker": "SPEAKER_00",
-            }
+        logger.info(f"转录中 {wav_path}")
+        t0 = time.time()
+
+        _preload_cudnn_for_onnxruntime_gpu()
+
+        # Prefer batched pipeline if available (much higher throughput on GPU).
+        if _ASR_PIPELINE is not None:
+            check_cancelled()
+            segments_iter, info = _ASR_PIPELINE.transcribe(
+                wav_path,
+                batch_size=batch_size,
+                beam_size=5,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+        else:
+            check_cancelled()
+            segments_iter, info = _ASR_MODEL.transcribe(
+                wav_path,
+                beam_size=5,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+
+        segments_list = []
+        for seg in segments_iter:
+            check_cancelled()
+            segments_list.append(seg)
+        logger.info(
+            f"ASR完成，耗时 {time.time() - t0:.2f}秒 (段数={len(segments_list)}, 语言={getattr(info, 'language', None)})"
         )
+
+        for seg in segments_list:
+            check_cancelled()
+            text = (getattr(seg, "text", "") or "").strip()
+            if not text:
+                continue
+            transcript.append(
+                {
+                    "start": float(getattr(seg, "start", 0.0)),
+                    "end": float(getattr(seg, "end", 0.0)),
+                    "text": text,
+                    "speaker": "SPEAKER_00",
+                }
+            )
 
     if diarization:
         check_cancelled()
@@ -647,6 +893,10 @@ def transcribe_all_audio_under_folder(
     max_speakers: int | None = None,
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
+    asr_method: str | None = None,
+    qwen_asr_model_dir: str | None = None,
+    qwen_asr_num_threads: int | None = None,
+    qwen_asr_vad_segment_threshold: int | None = None,
 ) -> str:
     check_cancelled()
     count = 0
@@ -665,6 +915,10 @@ def transcribe_all_audio_under_folder(
             max_speakers=max_speakers,
             settings=settings,
             model_manager=model_manager,
+            asr_method=asr_method,
+            qwen_asr_model_dir=qwen_asr_model_dir,
+            qwen_asr_num_threads=qwen_asr_num_threads,
+            qwen_asr_vad_segment_threshold=qwen_asr_vad_segment_threshold,
         )
         if ok:
             count += 1

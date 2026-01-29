@@ -42,6 +42,8 @@ dependencies = [
     "faster-whisper>=1.2.1",
     # Use CTranslate2 >= 4.5.0 to align with cuDNN 9 (avoid cuDNN 8 split libs like libcudnn_ops_infer.so.8).
     "ctranslate2>=4.5.0,<5.0.0",
+    # Qwen3-ASR (offline, transformers backend)
+    "qwen-asr>=0.0.4",
     # faster-whisper VAD uses onnxruntime. Keep it in cpu/gpu extras so you can choose the build.
 
     # Speaker diarization / speaker embedding (used by diarization + bytedance voice matching; optional at runtime)
@@ -138,7 +140,7 @@ dependency-metadata = [
     ] },
     # Patch qwen-tts to avoid forcing a bundled onnxruntime dependency.
     { name = "qwen-tts", version = "0.0.5", requires-dist = [
-        "transformers==4.57.3",
+        "transformers==4.57.6",
         "accelerate==1.12.0",
         "gradio",
         "librosa",

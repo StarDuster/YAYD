@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
 
+import torch
 from loguru import logger
 
 from .config import Settings
@@ -65,9 +66,15 @@ class VideoPipeline:
         target_resolution: str,
         max_retries: int,
         auto_upload_video: bool,
+        bilingual_subtitle: bool = False,
         use_nvenc: bool = False,
         whisper_device: str | None = None,
         whisper_cpu_model: str | None = None,
+        *,
+        asr_method: str = "whisper",
+        qwen_asr_model_dir: str | None = None,
+        qwen_asr_num_threads: int = 1,
+        qwen_asr_vad_segment_threshold: int = 60,
     ) -> bool:
         for retry in range(max_retries):
             check_cancelled()
@@ -136,6 +143,10 @@ class VideoPipeline:
                         max_speakers=whisper_max_speakers,
                         settings=self.settings,
                         model_manager=self.model_manager,
+                        asr_method=asr_method,
+                        qwen_asr_model_dir=qwen_asr_model_dir,
+                        qwen_asr_num_threads=qwen_asr_num_threads,
+                        qwen_asr_vad_segment_threshold=qwen_asr_vad_segment_threshold,
                     )
                 finally:
                     try:
@@ -166,6 +177,7 @@ class VideoPipeline:
                 synthesize_all_video_under_folder(
                     folder,
                     subtitles=subtitles,
+                    bilingual_subtitle=bilingual_subtitle,
                     speed_up=speed_up,
                     fps=fps,
                     resolution=target_resolution,
@@ -196,6 +208,10 @@ class VideoPipeline:
         demucs_model: str | None = None,
         device: str | None = None,
         shifts: int | None = None,
+        asr_method: str | None = None,
+        qwen_asr_model_dir: str | None = None,
+        qwen_asr_num_threads: int | None = None,
+        qwen_asr_vad_segment_threshold: int | None = None,
         whisper_model: str | None = None,
         whisper_cpu_model: str | None = None,
         whisper_device: str | None = None,
@@ -208,6 +224,7 @@ class VideoPipeline:
         qwen_tts_batch_size: int | None = None,
         tts_adaptive_segment_stretch: bool = False,
         subtitles: bool = True,
+        bilingual_subtitle: bool = False,
         speed_up: float = 1.2,
         fps: int = 30,
         target_resolution: str = "1080p",
@@ -221,6 +238,16 @@ class VideoPipeline:
         demucs_model = demucs_model or self.settings.demucs_model_name
         device = device or self.settings.demucs_device
         shifts = self.settings.demucs_shifts if shifts is None else shifts
+        asr_method = (asr_method or getattr(self.settings, "asr_method", None) or "whisper").strip().lower()
+        if asr_method not in ("whisper", "qwen"):
+            asr_method = "whisper"
+        qwen_asr_model_dir = (
+            (qwen_asr_model_dir or str(getattr(self.settings, "qwen_asr_model_path", "") or "")).strip() or None
+        )
+        qwen_asr_num_threads = int(qwen_asr_num_threads or getattr(self.settings, "qwen_asr_num_threads", 1) or 1)
+        qwen_asr_vad_segment_threshold = int(
+            qwen_asr_vad_segment_threshold or getattr(self.settings, "qwen_asr_vad_segment_threshold", 60) or 60
+        )
         whisper_model = whisper_model or str(self.settings.whisper_model_path)
         # Backward compatible defaults: ASR device defaults to Demucs device, unless explicitly set.
         whisper_device = (whisper_device or getattr(self.settings, "whisper_device", None) or device).strip()
@@ -242,36 +269,71 @@ class VideoPipeline:
                 return False
             return path.is_dir() and (path / "model.bin").exists()
 
+        def _looks_like_qwen_asr_model_dir(model_dir: str | None) -> bool:
+            if not model_dir:
+                return False
+            try:
+                path = Path(str(model_dir)).expanduser()
+            except Exception:
+                return False
+            if not path.is_dir():
+                return False
+            if (path / "config.json").exists():
+                return True
+            if (path / "model.safetensors.index.json").exists():
+                return True
+            try:
+                for p in path.glob("*.safetensors"):
+                    if p.is_file():
+                        return True
+            except Exception:
+                pass
+            # Fallback: non-empty dir
+            try:
+                return any(path.iterdir())
+            except Exception:
+                return False
+
         wd = (whisper_device or "auto").lower().strip()
         if wd not in ("auto", "cuda", "cpu"):
             wd = "auto"
 
         # Validate ASR model path(s) early so UI can show friendly error instead of silent failures.
-        if wd == "cuda":
-            if not _has_whisper_model_bin(whisper_model):
+        if asr_method == "qwen":
+            if not _looks_like_qwen_asr_model_dir(qwen_asr_model_dir):
                 raise ModelCheckError(
-                    f"Whisper GPU 模型目录无效或缺少 model.bin：{whisper_model}\n"
-                    "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_MODEL_PATH。"
-                )
-        elif wd == "cpu":
-            chosen = whisper_cpu_model or whisper_model
-            if not _has_whisper_model_bin(chosen):
-                raise ModelCheckError(
-                    f"Whisper CPU 模型目录无效或缺少 model.bin：{chosen}\n"
-                    "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_CPU_MODEL_PATH / WHISPER_MODEL_PATH。"
+                    "Qwen3-ASR 模型目录无效或不存在。\n"
+                    f"- QWEN_ASR_MODEL_PATH: {qwen_asr_model_dir}\n"
+                    "请在 UI 中填写正确路径，或在 .env 中设置 QWEN_ASR_MODEL_PATH。"
                 )
         else:
-            if not (_has_whisper_model_bin(whisper_model) or _has_whisper_model_bin(whisper_cpu_model)):
-                raise ModelCheckError(
-                    "Whisper 模型目录无效或缺少 model.bin。\n"
-                    f"- WHISPER_MODEL_PATH: {whisper_model}\n"
-                    f"- WHISPER_CPU_MODEL_PATH: {whisper_cpu_model}\n"
-                    "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_MODEL_PATH / WHISPER_CPU_MODEL_PATH。"
-                )
+            if wd == "cuda":
+                if not _has_whisper_model_bin(whisper_model):
+                    raise ModelCheckError(
+                        f"Whisper GPU 模型目录无效或缺少 model.bin：{whisper_model}\n"
+                        "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_MODEL_PATH。"
+                    )
+            elif wd == "cpu":
+                chosen = whisper_cpu_model or whisper_model
+                if not _has_whisper_model_bin(chosen):
+                    raise ModelCheckError(
+                        f"Whisper CPU 模型目录无效或缺少 model.bin：{chosen}\n"
+                        "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_CPU_MODEL_PATH / WHISPER_MODEL_PATH。"
+                    )
+            else:
+                if not (_has_whisper_model_bin(whisper_model) or _has_whisper_model_bin(whisper_cpu_model)):
+                    raise ModelCheckError(
+                        "Whisper 模型目录无效或缺少 model.bin。\n"
+                        f"- WHISPER_MODEL_PATH: {whisper_model}\n"
+                        f"- WHISPER_CPU_MODEL_PATH: {whisper_cpu_model}\n"
+                        "请在 UI 中填写正确路径，或在 .env 中设置 WHISPER_MODEL_PATH / WHISPER_CPU_MODEL_PATH。"
+                    )
         
         required_models = [
             self.model_manager._demucs_requirement().name,  # type: ignore[attr-defined]
         ]
+        if asr_method == "qwen":
+            required_models.append(self.model_manager._qwen_asr_requirement().name)  # type: ignore[attr-defined]
         if whisper_diarization:
             required_models.append(self.model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
             
@@ -301,23 +363,35 @@ class VideoPipeline:
         check_cancelled()
         try:
             # Preload ASR model best-effort to reduce first-request latency.
-            # Respect explicit Whisper device selection from UI; for "auto" keep legacy behavior.
-            if wd == "cpu":
-                transcribe.load_asr_model(
-                    whisper_cpu_model or whisper_model,
-                    device="cpu",
+            # Respect explicit ASR device selection from UI; for "auto" keep legacy behavior.
+            if asr_method == "qwen":
+                resolved = wd
+                if resolved == "auto":
+                    resolved = "cuda" if torch.cuda.is_available() else "cpu"
+                transcribe.load_qwen_asr_model(
+                    qwen_asr_model_dir or "",
+                    device=resolved,
                     settings=self.settings,
                     model_manager=self.model_manager,
-                )
-            elif wd == "cuda":
-                transcribe.load_asr_model(
-                    whisper_model,
-                    device="cuda",
-                    settings=self.settings,
-                    model_manager=self.model_manager,
+                    max_inference_batch_size=1,
                 )
             else:
-                transcribe.init_asr(self.settings, self.model_manager)
+                if wd == "cpu":
+                    transcribe.load_asr_model(
+                        whisper_cpu_model or whisper_model,
+                        device="cpu",
+                        settings=self.settings,
+                        model_manager=self.model_manager,
+                    )
+                elif wd == "cuda":
+                    transcribe.load_asr_model(
+                        whisper_model,
+                        device="cuda",
+                        settings=self.settings,
+                        model_manager=self.model_manager,
+                    )
+                else:
+                    transcribe.init_asr(self.settings, self.model_manager)
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(f"ASR 预热失败（忽略）: {exc}")
 
@@ -351,9 +425,14 @@ class VideoPipeline:
                     target_resolution,
                     max_retries,
                     auto_upload_video,
+                    bool(bilingual_subtitle),
                     use_nvenc,
                     wd,
                     whisper_cpu_model,
+                    asr_method=asr_method,
+                    qwen_asr_model_dir=qwen_asr_model_dir,
+                    qwen_asr_num_threads=int(qwen_asr_num_threads),
+                    qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
                 )
                 if success:
                     success_list.append(info)
@@ -386,9 +465,14 @@ class VideoPipeline:
                         target_resolution,
                         max_retries,
                         auto_upload_video,
+                        bool(bilingual_subtitle),
                         use_nvenc,
                         wd,
                         whisper_cpu_model,
+                        asr_method=asr_method,
+                        qwen_asr_model_dir=qwen_asr_model_dir,
+                        qwen_asr_num_threads=int(qwen_asr_num_threads),
+                        qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
                     ): info
                     for info in info_list
                 }

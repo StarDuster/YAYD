@@ -88,6 +88,18 @@ class ModelManager:
             hint=hint,
         )
 
+    def _qwen_asr_requirement(self) -> ModelRequirement:
+        path = self.settings.resolve_path(getattr(self.settings, "qwen_asr_model_path", None))
+        hint = (
+            "需要本地 Qwen3-ASR 模型目录（建议包含 config.json / model.safetensors 或 *.safetensors）。"
+            f"请下载并放到: {path}（或设置 QWEN_ASR_MODEL_PATH）。"
+        )
+        return ModelRequirement(
+            name="Qwen3-ASR (qwen-asr)",
+            path=path,
+            hint=hint,
+        )
+
     def _qwen_tts_runtime_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.qwen_tts_python_path)
         hint = (
@@ -130,6 +142,7 @@ class ModelManager:
             self._demucs_requirement(),
             self._whisper_requirement(),
             self._whisper_diarization_requirement(),
+            self._qwen_asr_requirement(),
             self._qwen_tts_runtime_requirement(),
             self._qwen_tts_weights_requirement(),
             self._gemini_tts_requirement(),

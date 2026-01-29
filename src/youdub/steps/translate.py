@@ -312,6 +312,19 @@ def split_text_into_sentences(para: str) -> list[str]:
     return para.split("\n")
 
 
+def _split_source_text_into_sentences(text: str) -> list[str]:
+    s = " ".join((text or "").split()).strip()
+    if not s:
+        return []
+    # Chinese punctuation
+    s = re.sub(r"([。！？])([^”’])", r"\1\n\2", s)
+    s = re.sub(r"([。！？][”’])([^，。！？])", r"\1\n\2", s)
+    # English punctuation: split on .!? followed by whitespace
+    s = re.sub(r"([.!?][\"”’']?)\s+(?=\S)", r"\1\n", s)
+    out = [x.strip() for x in s.splitlines() if x.strip()]
+    return out or ([s] if s else [])
+
+
 def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output_data = []
     for item in translation:
@@ -321,6 +334,23 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
         speaker = item['speaker']
         translation_text = item.get('translation', '')
         sentences = split_text_into_sentences(translation_text)
+        src_sentences = _split_source_text_into_sentences(text)
+
+        if src_sentences and sentences:
+            if len(src_sentences) == len(sentences):
+                mapped_src = src_sentences
+            elif len(src_sentences) > len(sentences):
+                mapped_src = [
+                    src_sentences[i] if i < len(sentences) - 1 else " ".join(src_sentences[i:])
+                    for i in range(len(sentences))
+                ]
+            else:
+                mapped_src = [
+                    src_sentences[i] if i < len(src_sentences) else src_sentences[-1]
+                    for i in range(len(sentences))
+                ]
+        else:
+            mapped_src = []
         
         if not translation_text or not sentences:
             # Handle empty translation
@@ -345,7 +375,7 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
             output_data.append({
                 "start": round(start, 3),
                 "end": round(sentence_end, 3),
-                "text": text,
+                "text": (mapped_src[i] if mapped_src else text),
                 "speaker": speaker,
                 "translation": sentence
             })
