@@ -521,6 +521,7 @@ def _translate_single_with_guide(
         "请只输出译文本身：\n"
         "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
+        "- 标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
         "- 不要换行\n"
@@ -577,6 +578,7 @@ def _translate_chunk_with_guide(
         "请只返回 JSON 对象，保持相同 key，value 只包含译文本身：\n"
         "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
+        "- 标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
         "- 不要换行\n"
@@ -685,7 +687,7 @@ def _translate_content(
     full_translation: list[str] = []
 
     fixed_message = [
-        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。只输出译文，不要包含“翻译”二字。'},
+        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。只输出译文，不要包含“翻译”二字。'},
         {'role': 'user', 'content': 'Translate:"Knowledge is power."'},
         {'role': 'assistant', 'content': '知识就是力量。'},
         {'role': 'user', 'content': 'Translate:"To be or not to be, that is the question."'},
@@ -739,6 +741,7 @@ def _translate_content(
 def translate_folder(folder: str, target_language: str = '简体中文', settings: Settings | None = None) -> bool:
     check_cancelled()
     translation_path = os.path.join(folder, 'translation.json')
+    translation_raw_path = os.path.join(folder, 'translation_raw.json')
     summary_path = os.path.join(folder, 'summary.json')
 
     translation_ok = False
@@ -762,6 +765,10 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
 
     # If both translation + summary exist, we consider this step ready.
     if translation_ok and os.path.exists(summary_path):
+        if not os.path.exists(translation_raw_path):
+            logger.warning(
+                f"检测到 {translation_path} 已存在，但缺少对轴前翻译文件: {translation_raw_path}（不会自动重翻译）"
+            )
         logger.info(f'翻译已存在于 {folder}')
         return True
 
@@ -815,6 +822,10 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
     
     for i, line in enumerate(transcript):
         line['translation'] = translations[i] if i < len(translations) else ""
+
+    # Save pre-alignment translation (1:1 with transcript.json).
+    with open(translation_raw_path, 'w', encoding='utf-8') as f:
+        json.dump(transcript, f, indent=2, ensure_ascii=False)
         
     transcript = split_sentences(transcript)
     

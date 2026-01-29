@@ -216,7 +216,8 @@ def test_translate_folder_generates_translation_and_summary_schema(tmp_path: Pat
     )
 
     monkeypatch.setattr(tr, "summarize", lambda *_args, **_kwargs: {"title": "t", "author": "u", "summary": "s", "tags": []})
-    monkeypatch.setattr(tr, "_translate_content", lambda *_args, **_kwargs: ["你好", "世界"])
+    # Make the first segment contain two sentences, so postprocess alignment produces more items than transcript.
+    monkeypatch.setattr(tr, "_translate_content", lambda *_args, **_kwargs: ["你好。再见。", "世界！"])
 
     ok = tr.translate_folder(str(folder), target_language="简体中文")
     assert ok is True
@@ -227,8 +228,46 @@ def test_translate_folder_generates_translation_and_summary_schema(tmp_path: Pat
     assert isinstance(summary.get("summary"), str)
     assert isinstance(summary.get("translation_model"), str)
 
+    translation_raw = json.loads((folder / "translation_raw.json").read_text(encoding="utf-8"))
+    _assert_translation_items_schema(translation_raw)
+    assert len(translation_raw) == 2
+    assert translation_raw[0]["translation"] == "你好。再见。"
+    assert translation_raw[1]["translation"] == "世界！"
+
     translation = json.loads((folder / "translation.json").read_text(encoding="utf-8"))
     _assert_translation_items_schema(translation)
+    assert len(translation) > len(translation_raw)
+
+
+def test_translate_folder_skips_when_translation_and_summary_exist(tmp_path: Path, monkeypatch):
+    import youdub.steps.translate as tr
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    # Prereqs
+    (folder / "download.info.json").write_text(json.dumps({"title": "t", "uploader": "u", "upload_date": "20260101"}), encoding="utf-8")
+    (folder / "transcript.json").write_text(json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00"}]), encoding="utf-8")
+
+    # Existing translation.json + summary.json (translation_raw.json intentionally missing).
+    (folder / "translation.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "summary.json").write_text(
+        json.dumps({"title": "t", "author": "u", "summary": "s", "tags": [], "translation_model": "dummy"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    def _should_not_call(*_args, **_kwargs):
+        raise AssertionError("should not be called when translation+summary already exist")
+
+    monkeypatch.setattr(tr, "summarize", _should_not_call)
+    monkeypatch.setattr(tr, "_translate_content", _should_not_call)
+
+    ok = tr.translate_folder(str(folder), target_language="简体中文")
+    assert ok is True
+    assert not (folder / "translation_raw.json").exists()
 
 
 # --------------------------------------------------------------------------- #
