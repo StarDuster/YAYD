@@ -89,16 +89,6 @@ class VideoPipeline:
                         raise FileNotFoundError(f"无法读取{desc}: {path}") from None
 
                 check_cancelled()
-                folder = download.get_target_folder(info, root_folder)
-                if folder is None:
-                    logger.warning(f"获取视频目录失败: {info.get('title')}")
-                    return False
-
-                if self._already_uploaded(folder):
-                    logger.info(f"已上传: {folder}")
-                    return True
-
-                check_cancelled()
                 folder = download.download_single_video(info, root_folder, resolution, settings=self.settings)
                 if folder is None:
                     logger.warning(f"下载失败: {info.get('title')}")
