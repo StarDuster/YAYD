@@ -945,7 +945,7 @@ translation_interface = gr.Interface(
 )
 
 
-def _tts_wrapper(folder, tts_method, qwen_tts_batch_size, tts_adaptive_segment_stretch):
+def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
     names = (
         [model_manager._bytedance_requirement().name]  # type: ignore[attr-defined]
         if tts_method == "bytedance"
@@ -964,7 +964,6 @@ def _tts_wrapper(folder, tts_method, qwen_tts_batch_size, tts_adaptive_segment_s
         folder,
         tts_method=tts_method,
         qwen_tts_batch_size=qwen_tts_batch_size,
-        adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
     )
 
 
@@ -978,7 +977,6 @@ tts_interface = gr.Interface(
             value=settings.tts_method,
         ),
         gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size),
-        gr.Checkbox(label="按段自适应拉伸语音(减少无声)", value=False, info="启用后视频合成步骤的加速倍率无效"),
     ],
     outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
     title="语音合成",
