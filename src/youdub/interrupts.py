@@ -45,6 +45,14 @@ def cancel_reason() -> str | None:
     return _CANCEL_REASON
 
 
+def reset_cancel() -> None:
+    """Reset cancellation state for a new task."""
+    global _CANCEL_REASON, _SIGINT_COUNT  # noqa: PLW0603
+    _CANCEL_EVENT.clear()
+    _CANCEL_REASON = None
+    _SIGINT_COUNT = 0
+
+
 def check_cancelled(reason: str | None = None) -> None:
     """Raise CancelledByUser if cancellation has been requested."""
     if _CANCEL_EVENT.is_set():
