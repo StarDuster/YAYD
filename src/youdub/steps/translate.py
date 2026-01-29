@@ -826,14 +826,31 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
 
 def translate_all_transcript_under_folder(folder: str, target_language: str, settings: Settings | None = None) -> str:
     count = 0
+    skipped = 0
+    no_transcript = 0
     for root, dirs, files in os.walk(folder):
         check_cancelled()
         if 'transcript.json' not in files:
+            # 只统计有 download.info.json 的文件夹（说明是视频目录）
+            if 'download.info.json' in files:
+                no_transcript += 1
             continue
         need = ('translation.json' not in files) or ('summary.json' not in files)
         if translate_folder(root, target_language, settings=settings):
             if need:
                 count += 1
-    msg = f"翻译完成: {folder}（处理 {count} 个文件）"
+            else:
+                skipped += 1
+    parts = []
+    if count > 0:
+        parts.append(f"翻译 {count} 个")
+    if skipped > 0:
+        parts.append(f"跳过 {skipped} 个")
+    if no_transcript > 0:
+        parts.append(f"缺少转录 {no_transcript} 个")
+    if parts:
+        msg = f"翻译完成: {folder}（{', '.join(parts)}）"
+    else:
+        msg = f"翻译完成: {folder}（无可处理文件）"
     logger.info(msg)
     return msg
