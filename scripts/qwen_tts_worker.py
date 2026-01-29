@@ -35,13 +35,10 @@ def main() -> int:
     # In stub mode we don't import qwen_tts at all; useful for CI/tests.
     tts = None
     xvec_prompt_cache: dict[str, object] = {}
-    spk_embedding_cache: dict[str, object] = {}
-    VoiceClonePromptItem = None
 
     if not args.stub:
         import torch
         from qwen_tts import Qwen3TTSModel
-        from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem as _VoiceClonePromptItem
 
         if torch.cuda.is_available():
             device_map = "cuda:0"
@@ -73,7 +70,6 @@ def main() -> int:
                     "无法在 CPU 上加载 Qwen3-TTS 模型（已尝试 bf16/fp16/fp32）。"
                     "建议启用 CUDA/GPU，或换更小/量化的模型权重。"
                 ) from last_exc
-        VoiceClonePromptItem = _VoiceClonePromptItem
 
     # Signal parent that we're ready.
     print(READY_LINE, flush=True)
@@ -95,63 +91,6 @@ def main() -> int:
             )
             xvec_prompt_cache[key] = prompt
         return prompt
-
-    def _get_speaker_embedding(anchor_wav: str):
-        assert tts is not None
-        key = os.path.abspath(anchor_wav)
-        emb = spk_embedding_cache.get(key)
-        if emb is None:
-            prompt = _get_prompt_xvec_only(anchor_wav)
-            try:
-                emb = prompt[0].ref_spk_embedding  # type: ignore[attr-defined]
-            except Exception as exc:
-                raise RuntimeError("无法从 voice clone prompt 提取 ref_spk_embedding") from exc
-            spk_embedding_cache[key] = emb
-        return emb
-
-    def _to_bool(v, default: bool = False) -> bool:
-        if v is None:
-            return bool(default)
-        if isinstance(v, bool):
-            return v
-        s = str(v).strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
-            return True
-        if s in {"0", "false", "no", "n", "off"}:
-            return False
-        return bool(default)
-
-    def _build_prompt_hybrid(
-        speaker_anchor_wav: str,
-        icl_audio: str,
-        icl_text: str,
-    ):
-        """Hybrid prompt: speaker embedding from anchor, prosody from (icl_audio, icl_text)."""
-        assert tts is not None
-        if VoiceClonePromptItem is None:
-            raise RuntimeError("VoiceClonePromptItem 未加载")
-        if not speaker_anchor_wav:
-            speaker_anchor_wav = icl_audio
-        spk_emb = _get_speaker_embedding(speaker_anchor_wav)
-        icl_items = tts.create_voice_clone_prompt(
-            ref_audio=icl_audio,
-            ref_text=icl_text,
-            x_vector_only_mode=False,
-        )
-        if not icl_items:
-            raise RuntimeError("ICL prompt 为空")
-        out = []
-        for it in icl_items:
-            out.append(
-                VoiceClonePromptItem(
-                    ref_code=getattr(it, "ref_code", None),
-                    ref_spk_embedding=spk_emb,
-                    x_vector_only_mode=False,
-                    icl_mode=True,
-                    ref_text=getattr(it, "ref_text", None) or icl_text,
-                )
-            )
-        return out
 
     try:
         for raw in sys.stdin:
@@ -176,26 +115,17 @@ def main() -> int:
                     text = str(req.get("text", ""))
                     language = str(req.get("language", "Auto") or "Auto")
                     speaker_wav = str(req.get("speaker_wav", ""))
-                    speaker_anchor_wav = str(req.get("speaker_anchor_wav", "") or "")
-                    icl_audio = str(req.get("icl_audio", "") or "")
-                    icl_text = str(req.get("icl_text", "") or "")
-                    xvec_only = _to_bool(req.get("x_vector_only_mode"), default=(not (icl_audio and icl_text)))
                     output_path = str(req.get("output_path", ""))
                     if not output_path:
                         raise ValueError("缺少 output_path")
-                    if not speaker_anchor_wav:
-                        speaker_anchor_wav = speaker_wav
-                    if not speaker_wav and not speaker_anchor_wav:
-                        raise ValueError("缺少 speaker_wav/speaker_anchor_wav")
+                    if not speaker_wav:
+                        raise ValueError("缺少 speaker_wav")
 
                     if args.stub:
                         sr = 24000
                         wav = np.zeros(int(sr * 0.2), dtype=np.float32)
                     else:
-                        if (not xvec_only) and icl_audio and icl_text:
-                            prompt = _build_prompt_hybrid(speaker_anchor_wav, icl_audio, icl_text)
-                        else:
-                            prompt = _get_prompt_xvec_only(speaker_wav or speaker_anchor_wav)
+                        prompt = _get_prompt_xvec_only(speaker_wav)
                         wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
                             text=text,
                             language=language,
@@ -227,27 +157,17 @@ def main() -> int:
                     text = str(it.get("text", ""))
                     language = str(it.get("language", "Auto") or "Auto")
                     speaker_wav = str(it.get("speaker_wav", ""))
-                    speaker_anchor_wav = str(it.get("speaker_anchor_wav", "") or "")
-                    icl_audio = str(it.get("icl_audio", "") or "")
-                    icl_text = str(it.get("icl_text", "") or "")
-                    xvec_only = _to_bool(it.get("x_vector_only_mode"), default=(not (icl_audio and icl_text)))
                     output_path = str(it.get("output_path", ""))
                     if not output_path:
                         raise ValueError(f"items[{idx}] 缺少 output_path")
-                    if not speaker_anchor_wav:
-                        speaker_anchor_wav = speaker_wav
-                    if not speaker_wav and not speaker_anchor_wav:
-                        raise ValueError(f"items[{idx}] 缺少 speaker_wav/speaker_anchor_wav")
+                    if not speaker_wav:
+                        raise ValueError(f"items[{idx}] 缺少 speaker_wav")
                     parsed.append(
                         {
                             "idx": idx,
                             "text": text,
                             "language": language,
                             "speaker_wav": speaker_wav,
-                            "speaker_anchor_wav": speaker_anchor_wav,
-                            "icl_audio": icl_audio,
-                            "icl_text": icl_text,
-                            "x_vector_only_mode": bool(xvec_only),
                             "output_path": output_path,
                         }
                     )
@@ -266,92 +186,37 @@ def main() -> int:
                     continue
 
                 assert tts is not None
-                # Group by mode + speaker source to maximize prompt reuse.
-                by_key: dict[tuple[str, str], list[dict]] = {}
+                # Group by speaker_wav to maximize prompt reuse.
+                by_key: dict[str, list[dict]] = {}
                 for it in parsed:
-                    mode = "icl" if (not it["x_vector_only_mode"] and it["icl_audio"] and it["icl_text"]) else "xvec"
-                    if mode == "icl":
-                        k = ("icl", os.path.abspath(str(it["speaker_anchor_wav"] or it["speaker_wav"])))
-                    else:
-                        k = ("xvec", os.path.abspath(str(it["speaker_wav"] or it["speaker_anchor_wav"])))
-                    by_key.setdefault(k, []).append(it)
+                    key_path = os.path.abspath(str(it["speaker_wav"]))
+                    by_key.setdefault(key_path, []).append(it)
 
-                for (mode, key_path), group in by_key.items():
+                for key_path, group in by_key.items():
                     try:
-                        if mode == "icl":
-                            if VoiceClonePromptItem is None:
-                                raise RuntimeError("VoiceClonePromptItem 未加载")
-                            anchor = key_path
-                            spk_emb = _get_speaker_embedding(anchor)
-                            texts = [str(it["text"]) for it in group]
-                            langs = [str(it["language"]) for it in group]
-                            icl_audios = [str(it["icl_audio"]) for it in group]
-                            icl_texts = [str(it["icl_text"]) for it in group]
-                            icl_items = tts.create_voice_clone_prompt(
-                                ref_audio=icl_audios,
-                                ref_text=icl_texts,
-                                x_vector_only_mode=False,
-                            )
-                            if len(icl_items) != len(group):
-                                raise RuntimeError(
-                                    f"ICL prompt 数量不匹配: got {len(icl_items)}, expected {len(group)}"
-                                )
-                            prompt_items = []
-                            for it_prompt, it_req in zip(icl_items, group):
-                                prompt_items.append(
-                                    VoiceClonePromptItem(
-                                        ref_code=getattr(it_prompt, "ref_code", None),
-                                        ref_spk_embedding=spk_emb,
-                                        x_vector_only_mode=False,
-                                        icl_mode=True,
-                                        ref_text=getattr(it_prompt, "ref_text", None) or str(it_req["icl_text"]),
-                                    )
-                                )
-                            wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
-                                text=texts,
-                                language=langs,
-                                voice_clone_prompt=prompt_items,
-                            )
-                            if not wavs:
-                                raise RuntimeError("返回空音频")
-                            if len(wavs) != len(group):
-                                raise RuntimeError(f"批量返回数量不匹配: got {len(wavs)}, expected {len(group)}")
-                            for wav, it_req in zip(wavs, group):
-                                idx = int(it_req["idx"])
-                                out = str(it_req["output_path"])
-                                wav_np = np.asarray(wav, dtype=np.float32)
-                                _write_wav(out, wav_np, int(sr))
-                                results[idx] = {
-                                    "ok": True,
-                                    "output_path": out,
-                                    "sr": int(sr),
-                                    "n_samples": int(wav_np.shape[0]),
-                                }
-                        else:
-                            speaker_wav = key_path
-                            prompt = _get_prompt_xvec_only(speaker_wav)
-                            texts = [str(it["text"]) for it in group]
-                            langs = [str(it["language"]) for it in group]
-                            wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
-                                text=texts,
-                                language=langs,
-                                voice_clone_prompt=prompt,
-                            )
-                            if not wavs:
-                                raise RuntimeError("返回空音频")
-                            if len(wavs) != len(group):
-                                raise RuntimeError(f"批量返回数量不匹配: got {len(wavs)}, expected {len(group)}")
-                            for wav, it_req in zip(wavs, group):
-                                idx = int(it_req["idx"])
-                                out = str(it_req["output_path"])
-                                wav_np = np.asarray(wav, dtype=np.float32)
-                                _write_wav(out, wav_np, int(sr))
-                                results[idx] = {
-                                    "ok": True,
-                                    "output_path": out,
-                                    "sr": int(sr),
-                                    "n_samples": int(wav_np.shape[0]),
-                                }
+                        prompt = _get_prompt_xvec_only(key_path)
+                        texts = [str(it["text"]) for it in group]
+                        langs = [str(it["language"]) for it in group]
+                        wavs, sr = tts.generate_voice_clone(  # type: ignore[union-attr]
+                            text=texts,
+                            language=langs,
+                            voice_clone_prompt=prompt,
+                        )
+                        if not wavs:
+                            raise RuntimeError("返回空音频")
+                        if len(wavs) != len(group):
+                            raise RuntimeError(f"批量返回数量不匹配: got {len(wavs)}, expected {len(group)}")
+                        for wav, it_req in zip(wavs, group):
+                            idx = int(it_req["idx"])
+                            out = str(it_req["output_path"])
+                            wav_np = np.asarray(wav, dtype=np.float32)
+                            _write_wav(out, wav_np, int(sr))
+                            results[idx] = {
+                                "ok": True,
+                                "output_path": out,
+                                "sr": int(sr),
+                                "n_samples": int(wav_np.shape[0]),
+                            }
                     except Exception as exc:
                         err_res = _error_result(exc)
                         for it_req in group:

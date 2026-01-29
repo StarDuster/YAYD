@@ -728,7 +728,6 @@ def bytedance_tts(
 
 _QWEN_WORKER_READY = "__READY__"
 _QWEN_WORKER_STUB_ENV = "YOUDUB_QWEN_WORKER_STUB"
-_QWEN_TTS_ICL_ENV = "QWEN_TTS_ICL"
 
 
 def _env_flag(name: str) -> bool:
@@ -937,10 +936,6 @@ class _QwenTtsWorker:
         output_path: str,
         language: str = "Auto",
         *,
-        speaker_anchor_wav: str | None = None,
-        icl_audio: str | None = None,
-        icl_text: str | None = None,
-        x_vector_only_mode: bool | None = None,
         timeout_sec: float = 180.0,
     ) -> dict:
         if self._proc.poll() is not None:
@@ -953,14 +948,6 @@ class _QwenTtsWorker:
             "speaker_wav": speaker_wav,
             "output_path": output_path,
         }
-        if speaker_anchor_wav:
-            req["speaker_anchor_wav"] = speaker_anchor_wav
-        if icl_audio:
-            req["icl_audio"] = icl_audio
-        if icl_text:
-            req["icl_text"] = icl_text
-        if x_vector_only_mode is not None:
-            req["x_vector_only_mode"] = bool(x_vector_only_mode)
 
         assert self._proc.stdin is not None
         assert self._proc.stdout is not None
@@ -1312,136 +1299,6 @@ def generate_wavs(
     for spk in speakers:
         check_cancelled()
         _ensure_wav_max_duration(os.path.join(speaker_dir, f"{spk}.wav"), max_ref_seconds, sample_rate=24000)
-
-    # --- Qwen ICL（语气/节奏）支持 ---
-    # 启用方式：设置环境变量 QWEN_TTS_ICL=1。
-    #
-    # 设计：
-    # - 音色锚点：每个视频取 audio_vocals.wav 前 max_ref_seconds 秒
-    # - 语气锚点：按“同 speaker + 同 text 且时间连续”的片段组，提取该组对应的音频区间，并用该组的英文 text 做 ref_text
-    #
-    # NOTE: translation.json 可能经过 split_sentences()（只拆译文不拆原文），导致单条记录的 text 与其时间窗不严格对齐。
-    # 为了保证 ICL 的 (ref_audio, ref_text) 对齐，我们在这里以“组”为单位做 ICL，而不是对每个拆分后的子句强行切音频。
-    qwen_use_icl = (tts_method == "qwen") and _env_flag(_QWEN_TTS_ICL_ENV)
-    qwen_speaker_anchor_wav: str | None = None
-    icl_group_for_index: dict[int, int] = {}
-    icl_groups: dict[int, dict[str, object]] = {}
-
-    if qwen_use_icl:
-        if not os.path.exists(vocals_path):
-            logger.warning("Qwen ICL 已启用但未找到 audio_vocals.wav，将回退到 x-vector only。")
-            qwen_use_icl = False
-        else:
-            qwen_speaker_anchor_wav = os.path.join(folder, ".qwen_speaker_anchor.wav")
-            if not (os.path.exists(qwen_speaker_anchor_wav) and is_valid_wav(qwen_speaker_anchor_wav)):
-                try:
-                    wav, _sr = librosa.load(vocals_path, sr=24000, mono=True, duration=max_ref_seconds)
-                    if wav.size > 0:
-                        save_wav(wav.astype(np.float32), qwen_speaker_anchor_wav, sample_rate=24000)
-                except Exception as exc:
-                    logger.warning(f"生成 Qwen 音色锚点失败，将回退到 x-vector only: {exc}")
-                    qwen_use_icl = False
-
-            if qwen_use_icl and qwen_speaker_anchor_wav and is_valid_wav(qwen_speaker_anchor_wav):
-                icl_ref_dir = os.path.join(folder, ".qwen_icl_ref")
-                os.makedirs(icl_ref_dir, exist_ok=True)
-
-                # Build groups.
-                tol = 0.02  # translation.json 的时间戳通常 round 到 1e-3；这里留一点容差
-                gid = 0
-                i = 0
-                while i < total_segments:
-                    seg = transcript[i]
-                    spk = str(seg.get("speaker", ""))
-                    txt = str(seg.get("text", "") or "")
-                    try:
-                        g_start = float(seg.get("start", 0.0) or 0.0)
-                        g_end = float(seg.get("end", g_start) or g_start)
-                    except Exception:
-                        g_start, g_end = 0.0, 0.0
-
-                    j = i
-                    while (j + 1) < total_segments:
-                        nxt = transcript[j + 1]
-                        if str(nxt.get("speaker", "")) != spk:
-                            break
-                        if str(nxt.get("text", "") or "") != txt:
-                            break
-                        try:
-                            nxt_start = float(nxt.get("start", 0.0) or 0.0)
-                            nxt_end = float(nxt.get("end", nxt_start) or nxt_start)
-                        except Exception:
-                            break
-                        if abs(nxt_start - g_end) > tol:
-                            break
-                        g_end = nxt_end
-                        j += 1
-
-                    for k in range(i, j + 1):
-                        icl_group_for_index[k] = gid
-                    icl_groups[gid] = {
-                        "speaker": spk,
-                        "text": txt,
-                        "start": float(g_start),
-                        "end": float(g_end),
-                        "wav_path": os.path.join(icl_ref_dir, f"{gid:04d}.wav"),
-                    }
-                    gid += 1
-                    i = j + 1
-
-                logger.info(
-                    f"Qwen ICL已启用: anchor={Path(qwen_speaker_anchor_wav).name}, groups={len(icl_groups)}"
-                )
-            else:
-                logger.warning("Qwen ICL 已启用但音色锚点无效，将回退到 x-vector only。")
-                qwen_use_icl = False
-
-    def _ensure_qwen_icl_ref_for_index(idx: int) -> tuple[str, str] | None:
-        """Return (icl_audio_path, icl_text) if available; otherwise None."""
-        if not qwen_use_icl:
-            return None
-        gid = icl_group_for_index.get(int(idx))
-        if gid is None:
-            return None
-        meta = icl_groups.get(gid)
-        if not meta:
-            return None
-        txt = str(meta.get("text", "") or "").strip()
-        if not txt:
-            return None
-
-        wav_path = str(meta.get("wav_path", "") or "")
-        if not wav_path:
-            return None
-        if os.path.exists(wav_path) and is_valid_wav(wav_path):
-            return wav_path, txt
-
-        # Extract group audio from vocals.
-        try:
-            start_s = float(meta.get("start", 0.0) or 0.0)
-            end_s = float(meta.get("end", start_s) or start_s)
-        except Exception:
-            return None
-        dur = float(end_s - start_s)
-        if dur <= 0.05:
-            return None
-        try:
-            wav, _sr = librosa.load(
-                vocals_path,
-                sr=24000,
-                mono=True,
-                offset=max(0.0, float(start_s)),
-                duration=max(0.0, dur),
-            )
-            if wav.size <= 0:
-                return None
-            save_wav(wav.astype(np.float32), wav_path, sample_rate=24000)
-            if is_valid_wav(wav_path):
-                return wav_path, txt
-        except Exception as exc:
-            logger.warning(f"生成 Qwen ICL 参考音频失败 (idx={idx}, gid={gid}): {exc}")
-            return None
-        return None
     
     qwen_worker: _QwenTtsWorker | None = None
     if tts_method == "qwen":
@@ -1519,7 +1376,7 @@ def generate_wavs(
                     text = preprocess_text(seg["translation"])
                     out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
                     spk_wav = os.path.join(folder, "SPEAKER", f"{speaker}.wav")
-                    speaker_wav_for_req = qwen_speaker_anchor_wav if qwen_speaker_anchor_wav else spk_wav
+                    speaker_wav_for_req = spk_wav
                     # If invalid/corrupted file exists, remove so worker can rewrite cleanly.
                     if os.path.exists(out) and not is_valid_wav(out):
                         try:
@@ -1532,26 +1389,6 @@ def generate_wavs(
                         "speaker_wav": speaker_wav_for_req,
                         "output_path": out,
                     }
-                    if qwen_use_icl and qwen_speaker_anchor_wav:
-                        icl = _ensure_qwen_icl_ref_for_index(j)
-                        if icl is not None:
-                            icl_audio, icl_text = icl
-                            item.update(
-                                {
-                                    "speaker_anchor_wav": qwen_speaker_anchor_wav,
-                                    "icl_audio": icl_audio,
-                                    "icl_text": icl_text,
-                                    "x_vector_only_mode": False,
-                                }
-                            )
-                        else:
-                            # Fallback to embedding-only while keeping the anchor timbre.
-                            item.update(
-                                {
-                                    "speaker_anchor_wav": qwen_speaker_anchor_wav,
-                                    "x_vector_only_mode": True,
-                                }
-                            )
                     batch_items.append(item)
 
                 try:
@@ -1595,10 +1432,6 @@ def generate_wavs(
                                     speaker_wav=str(it.get("speaker_wav", "")),
                                     output_path=str(it.get("output_path", "")),
                                     language=str(it.get("language", "Auto") or "Auto"),
-                                    speaker_anchor_wav=str(it.get("speaker_anchor_wav", "") or "") or None,
-                                    icl_audio=str(it.get("icl_audio", "") or "") or None,
-                                    icl_text=str(it.get("icl_text", "") or "") or None,
-                                    x_vector_only_mode=it.get("x_vector_only_mode", None),
                                     timeout_sec=qwen_timeout_sec,
                                 )
                             except CancelledByUser:
@@ -1615,10 +1448,6 @@ def generate_wavs(
                                             speaker_wav=str(it.get("speaker_wav", "")),
                                             output_path=str(it.get("output_path", "")),
                                             language=str(it.get("language", "Auto") or "Auto"),
-                                            speaker_anchor_wav=str(it.get("speaker_anchor_wav", "") or "") or None,
-                                            icl_audio=str(it.get("icl_audio", "") or "") or None,
-                                            icl_text=str(it.get("icl_text", "") or "") or None,
-                                            x_vector_only_mode=it.get("x_vector_only_mode", None),
                                             timeout_sec=qwen_timeout_sec,
                                         )
                                     except Exception as exc_one2:
@@ -1703,69 +1532,19 @@ def generate_wavs(
                             _run_qwen_batch(batch_indices)
                             qwen_resp = qwen_resp_by_index.get(i)
                         else:
-                            if qwen_use_icl and qwen_speaker_anchor_wav:
-                                icl = _ensure_qwen_icl_ref_for_index(i)
-                                if icl is not None:
-                                    icl_audio, icl_text = icl
-                                    try:
-                                        qwen_resp = qwen_worker.synthesize(
-                                            text,
-                                            speaker_wav=qwen_speaker_anchor_wav,
-                                            output_path=output_path,
-                                            language="Auto",
-                                            speaker_anchor_wav=qwen_speaker_anchor_wav,
-                                            icl_audio=icl_audio,
-                                            icl_text=icl_text,
-                                            x_vector_only_mode=False,
-                                            timeout_sec=qwen_timeout_sec,
-                                        )
-                                    except Exception as exc_qwen:
-                                        if _should_restart_qwen_worker(str(exc_qwen)):
-                                            logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
-                                            _restart_qwen_worker(str(exc_qwen))
-                                            assert qwen_worker is not None
-                                            qwen_resp = qwen_worker.synthesize(
-                                                text,
-                                                speaker_wav=qwen_speaker_anchor_wav,
-                                                output_path=output_path,
-                                                language="Auto",
-                                                speaker_anchor_wav=qwen_speaker_anchor_wav,
-                                                icl_audio=icl_audio,
-                                                icl_text=icl_text,
-                                                x_vector_only_mode=False,
-                                                timeout_sec=qwen_timeout_sec,
-                                            )
-                                        else:
-                                            raise
-                                else:
-                                    try:
-                                        qwen_resp = qwen_worker.synthesize(
-                                            text,
-                                            speaker_wav=qwen_speaker_anchor_wav,
-                                            output_path=output_path,
-                                            language="Auto",
-                                            speaker_anchor_wav=qwen_speaker_anchor_wav,
-                                            x_vector_only_mode=True,
-                                            timeout_sec=qwen_timeout_sec,
-                                        )
-                                    except Exception as exc_qwen:
-                                        if _should_restart_qwen_worker(str(exc_qwen)):
-                                            logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
-                                            _restart_qwen_worker(str(exc_qwen))
-                                            assert qwen_worker is not None
-                                            qwen_resp = qwen_worker.synthesize(
-                                                text,
-                                                speaker_wav=qwen_speaker_anchor_wav,
-                                                output_path=output_path,
-                                                language="Auto",
-                                                speaker_anchor_wav=qwen_speaker_anchor_wav,
-                                                x_vector_only_mode=True,
-                                                timeout_sec=qwen_timeout_sec,
-                                            )
-                                        else:
-                                            raise
-                            else:
-                                try:
+                            try:
+                                qwen_resp = qwen_worker.synthesize(
+                                    text,
+                                    speaker_wav,
+                                    output_path,
+                                    language="Auto",
+                                    timeout_sec=qwen_timeout_sec,
+                                )
+                            except Exception as exc_qwen:
+                                if _should_restart_qwen_worker(str(exc_qwen)):
+                                    logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
+                                    _restart_qwen_worker(str(exc_qwen))
+                                    assert qwen_worker is not None
                                     qwen_resp = qwen_worker.synthesize(
                                         text,
                                         speaker_wav,
@@ -1773,20 +1552,8 @@ def generate_wavs(
                                         language="Auto",
                                         timeout_sec=qwen_timeout_sec,
                                     )
-                                except Exception as exc_qwen:
-                                    if _should_restart_qwen_worker(str(exc_qwen)):
-                                        logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
-                                        _restart_qwen_worker(str(exc_qwen))
-                                        assert qwen_worker is not None
-                                        qwen_resp = qwen_worker.synthesize(
-                                            text,
-                                            speaker_wav,
-                                            output_path,
-                                            language="Auto",
-                                            timeout_sec=qwen_timeout_sec,
-                                        )
-                                    else:
-                                        raise
+                                else:
+                                    raise
                     elif tts_method == "gemini":
                         gemini_tts(text, output_path)
                     else:
