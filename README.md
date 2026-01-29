@@ -48,6 +48,7 @@ cd YAYD
 |-------|------|----------|
 | `cpu` | CPU 运行时 | `onnxruntime` (CPU 版) |
 | `gpu` | GPU 加速栈 (Linux) | `onnxruntime-gpu`, `nvidia-cudnn-cu12`, PyTorch cu128 轮子 |
+| `flash` | Flash Attention (可选) | `flash-attn`，加速 Transformer 推理，不装也能跑 |
 | `dev` | 开发工具 | `pytest`, `black`, `ruff` |
 
 > **注意**: `onnxruntime` 和 `onnxruntime-gpu` 不能共存。选择 `--extra cpu` 或 `--extra gpu` 其中之一。
@@ -63,6 +64,15 @@ uv sync --extra gpu
 
 # GPU + 开发工具（开发/测试）
 uv sync --extra gpu --extra dev
+```
+
+#### Flash Attention（可选加速）
+
+`flash-attn` 可显著加速 Transformer 推理（如 Qwen3-ASR），但**编译安装时间很长**（参见 https://github.com/QwenLM/Qwen3-ASR?tab=readme-ov-file#environment-setup）。
+
+```bash
+# 需要先安装 gpu extra，然后单独安装 flash-attn
+uv pip install flash-attn --no-build-isolation
 ```
 
 #### PyTorch GPU/CPU 自动选择

@@ -90,6 +90,10 @@ gpu = [
     "onnxruntime-gpu; sys_platform == 'linux'",
 ]
 
+# Flash Attention (optional, significantly speeds up Transformer inference but takes a long time to compile).
+# Use: `uv pip install flash-attn --no-build-isolation`
+flash = ["flash-attn; sys_platform == 'linux'"]
+
 [project.scripts]
 youdub = "youdub.app:main"
 
