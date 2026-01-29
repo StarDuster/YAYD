@@ -6,9 +6,213 @@ from typing import Any
 import re
 import math
 
+import librosa
+import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
+from ..utils import save_wav, save_wav_norm
+from . import synthesize_speech as ss
+
+_AUDIO_SAMPLE_RATE = 24000
+# Per-segment speed clamp: min_speed_factor controls the maximum "加速倍率" (speed-up).
+# Example: min=0.65 => max speed-up ≈ 1/0.65 ≈ 1.54x (slightly lower than old 1/0.6 ≈ 1.67x).
+_AUDIO_MIN_SPEED_FACTOR = 0.65
+_AUDIO_MAX_STRETCH = 1.10
+_AUDIO_MAX_STRETCH_ADAPTIVE = 1.35
+
+
+def _ensure_audio_combined(
+    folder: str,
+    *,
+    adaptive_segment_stretch: bool = False,
+    min_speed_factor: float = _AUDIO_MIN_SPEED_FACTOR,
+    max_stretch: float = _AUDIO_MAX_STRETCH,
+    max_stretch_adaptive: float = _AUDIO_MAX_STRETCH_ADAPTIVE,
+    sample_rate: int = _AUDIO_SAMPLE_RATE,
+) -> str:
+    """
+    Ensure `audio_combined.wav` exists and is up-to-date.
+
+    This builds the aligned TTS track from per-segment wavs under `wavs/` using `translation.json` timestamps,
+    then mixes with `audio_instruments.wav` if present.
+
+    NOTE: This function does NOT modify `translation.json`.
+    """
+    check_cancelled()
+    translation_path = os.path.join(folder, "translation.json")
+    if not os.path.exists(translation_path):
+        raise FileNotFoundError(f"缺少合成音频所需文件：{translation_path}")
+
+    wavs_dir = os.path.join(folder, "wavs")
+    if not os.path.isdir(wavs_dir):
+        raise FileNotFoundError(f"缺少 TTS 分段音频目录：{wavs_dir}（请先运行“语音合成”生成 wavs/*.wav）")
+
+    tts_done_path = os.path.join(folder, ".tts_done.json")
+    instruments_path = os.path.join(folder, "audio_instruments.wav")
+    vocals_path = os.path.join(folder, "audio_vocals.wav")
+    audio_tts_path = os.path.join(folder, "audio_tts.wav")
+    audio_combined_path = os.path.join(folder, "audio_combined.wav")
+    marker_path = os.path.join(folder, ".audio_done.json")
+
+    max_speed_factor = float(max_stretch_adaptive if adaptive_segment_stretch else max_stretch)
+
+    def _marker_ok() -> bool:
+        if not (os.path.exists(marker_path) and os.path.exists(audio_combined_path) and ss.is_valid_wav(audio_combined_path)):
+            return False
+        try:
+            with open(marker_path, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if bool(st.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
+                return False
+            if abs(float(st.get("min_speed_factor")) - float(min_speed_factor)) > 1e-6:
+                return False
+            if abs(float(st.get("max_speed_factor")) - float(max_speed_factor)) > 1e-6:
+                return False
+            if int(st.get("sample_rate")) != int(sample_rate):
+                return False
+
+            need_mtime = os.path.getmtime(translation_path)
+            if os.path.exists(tts_done_path):
+                need_mtime = max(need_mtime, os.path.getmtime(tts_done_path))
+            if os.path.exists(instruments_path):
+                need_mtime = max(need_mtime, os.path.getmtime(instruments_path))
+            if os.path.exists(vocals_path):
+                need_mtime = max(need_mtime, os.path.getmtime(vocals_path))
+            done_mtime = os.path.getmtime(marker_path)
+            return done_mtime >= need_mtime
+        except Exception:
+            return False
+
+    if _marker_ok():
+        return audio_combined_path
+
+    with open(translation_path, "r", encoding="utf-8") as f:
+        translation = json.load(f)
+    if not isinstance(translation, list) or not translation:
+        raise ValueError(f"translation.json 结构异常（应为非空 list）：{translation_path}")
+
+    # Build voice track aligned to original timestamps.
+    chunks: list[np.ndarray] = []
+    cur_samples = 0
+    total_segments = len(translation)
+    for i, seg in enumerate(translation):
+        check_cancelled()
+        try:
+            start_s = float(seg.get("start", 0.0) or 0.0)
+            end_s = float(seg.get("end", start_s) or start_s)
+        except Exception:
+            start_s, end_s = 0.0, 0.0
+        if end_s < start_s:
+            end_s = start_s
+
+        start_samples = int(round(start_s * sample_rate))
+        end_samples = int(round(end_s * sample_rate))
+        if end_samples < start_samples:
+            end_samples = start_samples
+
+        if start_samples > cur_samples:
+            gap = start_samples - cur_samples
+            if gap > 0:
+                chunks.append(np.zeros((gap,), dtype=np.float32))
+                cur_samples += gap
+        elif start_samples < cur_samples:
+            # Overlap/out-of-order timestamps; best-effort: clamp to current cursor.
+            start_samples = cur_samples
+            end_samples = max(end_samples, start_samples)
+
+        desired_samples = max(0, end_samples - start_samples)
+        if desired_samples <= 0:
+            continue
+
+        seg_path = os.path.join(wavs_dir, f"{i:04d}.wav")
+        if not (os.path.exists(seg_path) and ss.is_valid_wav(seg_path)):
+            chunks.append(np.zeros((desired_samples,), dtype=np.float32))
+            cur_samples += desired_samples
+            continue
+
+        desired_len = float(desired_samples) / float(sample_rate)
+        wav_adj, _actual_len = ss.adjust_audio_length(
+            seg_path,
+            desired_len,
+            sample_rate=sample_rate,
+            min_speed_factor=float(min_speed_factor),
+            max_speed_factor=float(max_speed_factor),
+        )
+        wav_adj = wav_adj.astype(np.float32, copy=False)
+
+        if wav_adj.shape[0] < desired_samples:
+            wav_adj = np.pad(wav_adj, (0, desired_samples - wav_adj.shape[0]), mode="constant")
+        elif wav_adj.shape[0] > desired_samples:
+            wav_adj = wav_adj[:desired_samples]
+
+        chunks.append(wav_adj)
+        cur_samples += desired_samples
+
+        if (i + 1) % 50 == 0 or (i + 1) == total_segments:
+            logger.info(f"对齐音频进度: {i + 1}/{total_segments}")
+
+    if chunks:
+        voice = np.concatenate(chunks).astype(np.float32, copy=False)
+    else:
+        voice = np.zeros((0,), dtype=np.float32)
+    del chunks
+
+    # Match voice loudness to original vocals peak (best-effort).
+    if os.path.exists(vocals_path) and voice.size > 0:
+        try:
+            check_cancelled()
+            vocal_wav, _ = librosa.load(vocals_path, sr=sample_rate, mono=True)
+            max_val = float(np.max(voice))
+            min_val = float(np.min(voice))
+            voice_peak = max(abs(max_val), abs(min_val))
+            if voice_peak > 0.0 and vocal_wav.size > 0:
+                v_max = float(np.max(vocal_wav))
+                v_min = float(np.min(vocal_wav))
+                vocal_peak = max(abs(v_max), abs(v_min))
+                if vocal_peak > 0.0:
+                    voice *= np.float32(vocal_peak / voice_peak)
+        except Exception as exc:
+            logger.warning(f"对齐音量失败（将跳过缩放）: {exc}")
+
+    check_cancelled()
+    save_wav(voice, audio_tts_path, sample_rate=sample_rate)
+
+    # Mix instruments.
+    if os.path.exists(instruments_path):
+        check_cancelled()
+        inst, _ = librosa.load(instruments_path, sr=sample_rate, mono=True)
+        inst = inst.astype(np.float32, copy=False)
+
+        if voice.shape[0] > inst.shape[0]:
+            inst = np.pad(inst, (0, voice.shape[0] - inst.shape[0]), mode="constant")
+        elif inst.shape[0] > voice.shape[0]:
+            voice = np.pad(voice, (0, inst.shape[0] - voice.shape[0]), mode="constant")
+
+        voice += inst
+        del inst
+        check_cancelled()
+        save_wav_norm(voice.astype(np.float32, copy=False), audio_combined_path, sample_rate=sample_rate)
+    else:
+        check_cancelled()
+        save_wav_norm(voice.astype(np.float32, copy=False), audio_combined_path, sample_rate=sample_rate)
+
+    # Marker for caching.
+    try:
+        state = {
+            "adaptive_segment_stretch": bool(adaptive_segment_stretch),
+            "min_speed_factor": float(min_speed_factor),
+            "max_speed_factor": float(max_speed_factor),
+            "sample_rate": int(sample_rate),
+            "segments": int(total_segments),
+            "created_at": time.time(),
+        }
+        with open(marker_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return audio_combined_path
 
 
 def _is_cjk_char(ch: str) -> bool:
@@ -583,6 +787,7 @@ def synthesize_video(
     folder: str, 
     subtitles: bool = True, 
     bilingual_subtitle: bool = False,
+    adaptive_segment_stretch: bool = False,
     speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
@@ -601,13 +806,15 @@ def synthesize_video(
             # Best-effort: proceed to re-generate
             pass
     
-    translation_path = os.path.join(folder, 'translation.json')
-    input_audio = os.path.join(folder, 'audio_combined.wav')
     input_video = os.path.join(folder, 'download.mp4')
+    translation_path = os.path.join(folder, 'translation.json')
     
-    missing = [p for p in (translation_path, input_audio, input_video) if not os.path.exists(p)]
+    missing = [p for p in (translation_path, input_video) if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(f"缺少合成视频所需文件：{missing}")
+
+    # Ensure audio_combined.wav exists (built from wavs/*.wav).
+    input_audio = _ensure_audio_combined(folder, adaptive_segment_stretch=adaptive_segment_stretch)
     
     with open(translation_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
@@ -783,6 +990,7 @@ def synthesize_all_video_under_folder(
     folder: str, 
     subtitles: bool = True, 
     bilingual_subtitle: bool = False,
+    adaptive_segment_stretch: bool = False,
     speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
@@ -804,6 +1012,7 @@ def synthesize_all_video_under_folder(
             root,
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
+            adaptive_segment_stretch=adaptive_segment_stretch,
             speed_up=speed_up,
             fps=fps,
             resolution=resolution,

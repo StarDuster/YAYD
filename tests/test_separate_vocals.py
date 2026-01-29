@@ -42,3 +42,26 @@ def test_separate_all_audio_under_folder_regenerates_when_outputs_missing(tmp_pa
     assert "processed" in msg
     assert (job / "audio_vocals.wav").exists()
     assert (job / "audio_instruments.wav").exists()
+
+
+def test_separate_all_audio_under_folder_short_circuits_without_loading_model_when_outputs_exist(
+    tmp_path: Path, monkeypatch
+):
+    import youdub.steps.separate_vocals as sv
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("should not load/check Demucs when outputs already exist")
+
+    monkeypatch.setattr(sv, "_ensure_demucs_ready", _boom)
+    monkeypatch.setattr(sv, "load_model", _boom)
+    monkeypatch.setattr(sv, "separate_audio", _boom)
+    monkeypatch.setattr(sv, "extract_audio_from_video", _boom)
+
+    job = tmp_path / "job"
+    job.mkdir(parents=True, exist_ok=True)
+    (job / "download.mp4").write_bytes(b"0" * 2048)
+    _write_dummy_wav(job / "audio_vocals.wav", seconds=0.5)
+    _write_dummy_wav(job / "audio_instruments.wav", seconds=0.5)
+
+    msg = sv.separate_all_audio_under_folder(str(tmp_path))
+    assert "processed 0 files" in msg

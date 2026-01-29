@@ -21,7 +21,7 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
-from ..utils import ensure_torchaudio_backend_compat, save_wav, save_wav_norm
+from ..utils import ensure_torchaudio_backend_compat, save_wav
 
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
@@ -1264,7 +1264,6 @@ def generate_wavs(
     folder: str,
     tts_method: str = "bytedance",
     qwen_tts_batch_size: int = 1,
-    adaptive_segment_stretch: bool = False,
 ) -> None:
     check_cancelled()
     transcript_path = os.path.join(folder, 'translation.json')
@@ -1444,11 +1443,6 @@ def generate_wavs(
             return None
         return None
     
-    # 使用分块累积，避免对 full_wav 反复 np.concatenate 造成 O(n^2) 内存峰值；
-    # 同时确保全程 float32，避免默认 np.zeros(float64) 导致整体上浮到 float64 占用翻倍。
-    chunks: list[np.ndarray] = []
-    full_samples = 0  # 已累积的总采样点数（24kHz）
-
     qwen_worker: _QwenTtsWorker | None = None
     if tts_method == "qwen":
         qwen_worker = _QwenTtsWorker.from_settings(_DEFAULT_SETTINGS)
@@ -1681,8 +1675,12 @@ def generate_wavs(
                 f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}"
             )
 
-            start = line["start"]
-            original_length = line["end"] - start
+            try:
+                seg_start = float(line.get("start", 0.0) or 0.0)
+                seg_end = float(line.get("end", seg_start) or seg_start)
+            except Exception:
+                seg_start, seg_end = 0.0, 0.0
+            seg_dur = float(max(0.0, seg_end - seg_start))
 
             tts_elapsed = 0.0
             qwen_resp: dict | None = qwen_resp_by_index.get(i)
@@ -1796,52 +1794,22 @@ def generate_wavs(
                 except Exception as exc:
                     logger.warning(f"TTS({tts_method})段 {i} 失败: {exc}")
                 tts_elapsed = time.monotonic() - tts_begin
-            
-            current_full_end = full_samples / 24000.0
-            
-            if start > current_full_end:
-                silence_dur = start - current_full_end
-                silence_samples = int(silence_dur * 24000)
-                if silence_samples > 0:
-                    chunks.append(np.zeros((silence_samples,), dtype=np.float32))
-                    full_samples += silence_samples
-                
-            new_start = full_samples / 24000.0
-            line['start'] = new_start
-            
-            if i < len(transcript) - 1:
-                next_line = transcript[i+1]
-                target_end = min(new_start + original_length, next_line['end'])
-            else:
-                target_end = new_start + original_length
-                
-            desired_len = target_end - new_start
-            
-            adjust_elapsed = 0.0
+
             valid_wav = os.path.exists(output_path) and is_valid_wav(output_path)
             if valid_wav:
-                adjust_begin = time.monotonic()
-                check_cancelled()
-                # 默认限制“放慢(拉长)”幅度，避免明显失真；但有些语言对（如英->中）
-                # 可能需要更大的拉伸才能消除无声段，因此提供可选的更激进模式。
-                max_stretch = 1.35 if adaptive_segment_stretch else 1.1
-                wav_chunk, actual_len = adjust_audio_length(
-                    output_path,
-                    desired_len,
-                    max_speed_factor=max_stretch,
-                )
-                adjust_elapsed = time.monotonic() - adjust_begin
+                source = "cached" if was_cached else "tts"
             else:
                 logger.warning(f"TTS生成失败 {tts_method} 段 {i}，使用静音回退。")
                 failed_segments.append(i)
-                target_samples = int(desired_len * 24000)
-                wav_chunk = np.zeros(target_samples, dtype=np.float32)
-                actual_len = desired_len
-            
-            wav_chunk = wav_chunk.astype(np.float32, copy=False)
-            chunks.append(wav_chunk)
-            full_samples += int(wav_chunk.shape[0])
-            line['end'] = new_start + actual_len
+                source = "silence"
+                if allow_silence_fallback:
+                    try:
+                        target_samples = int(seg_dur * 24000)
+                        silence = np.zeros((max(0, target_samples),), dtype=np.float32)
+                        save_wav(silence, output_path, sample_rate=24000)
+                        valid_wav = is_valid_wav(output_path)
+                    except Exception as exc_silence:
+                        logger.warning(f"静音回退写入失败 {output_path}: {exc_silence}")
 
             # 段落完成日志：便于在终端观察“是否卡死/进度/耗时”
             qwen_extra = ""
@@ -1850,10 +1818,9 @@ def generate_wavs(
                 n_samples = qwen_resp.get("n_samples")
                 if sr is not None and n_samples is not None:
                     qwen_extra = f", sr={sr}, n_samples={n_samples}"
-            source = "cached" if was_cached else ("tts" if valid_wav else "silence")
             logger.info(
                 f"TTS({tts_method}) {seg_no}/{total_segments} 完成: source={source}, "
-                f"tts={tts_elapsed:.2f}s, adjust={adjust_elapsed:.2f}s, desired={desired_len:.2f}s, actual={actual_len:.2f}s"
+                f"tts={tts_elapsed:.2f}s, segment_dur={seg_dur:.2f}s, valid_wav={bool(valid_wav)}"
                 f"{qwen_extra}"
             )
     finally:
@@ -1868,64 +1835,25 @@ def generate_wavs(
             "为避免产出大量静音，已中止；如确实要用静音补齐请设置 TTS_ALLOW_SILENCE_FALLBACK=1。"
         )
 
-    check_cancelled()
-    if chunks:
-        full_wav = np.concatenate(chunks).astype(np.float32, copy=False)
-    else:
-        full_wav = np.zeros((0,), dtype=np.float32)
-    # 释放分块引用，降低峰值占用
-    del chunks
-
-    vocal_wav_path = os.path.join(folder, 'audio_vocals.wav')
-    if os.path.exists(vocal_wav_path):
-        check_cancelled()
-        vocal_wav, _ = librosa.load(vocal_wav_path, sr=24000)
-        if full_wav.size > 0:
-            # 避免 np.abs(full_wav) 产生同等大小的临时数组（长音频会非常吃内存）
-            max_val = float(np.max(full_wav))
-            min_val = float(np.min(full_wav))
-            full_peak = max(abs(max_val), abs(min_val))
-            if full_peak > 0.0:
-                v_max = float(np.max(vocal_wav))
-                v_min = float(np.min(vocal_wav))
-                vocal_peak = max(abs(v_max), abs(v_min))
-                if vocal_peak > 0.0:
-                    scale = np.float32(vocal_peak / full_peak)
-                    full_wav *= scale
-        # 释放大数组引用
-        del vocal_wav
-            
-    check_cancelled()
-    save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'), sample_rate=24000)
-    logger.info(f'已生成 {os.path.join(folder, "audio_tts.wav")}')
-    
-    with open(transcript_path, 'w', encoding='utf-8') as f:
-        json.dump(transcript, f, indent=2, ensure_ascii=False)
-
-    instruments_path = os.path.join(folder, 'audio_instruments.wav')
-    if os.path.exists(instruments_path):
-        check_cancelled()
-        instruments_wav, _ = librosa.load(instruments_path, sr=24000)
-        instruments_wav = instruments_wav.astype(np.float32, copy=False)
-        
-        len_full = len(full_wav)
-        len_inst = len(instruments_wav)
-        
-        if len_full > len_inst:
-            instruments_wav = np.pad(instruments_wav, (0, len_full - len_inst), mode='constant')
-        elif len_inst > len_full:
-            full_wav = np.pad(full_wav, (0, len_inst - len_full), mode='constant')
-            
-        # audio_tts.wav 已经写入，这里允许原地相加以避免额外分配
-        full_wav += instruments_wav
-        del instruments_wav
-        check_cancelled()
-        save_wav_norm(full_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
-        logger.info(f'已生成 {os.path.join(folder, "audio_combined.wav")}')
-    else:
-        logger.warning("未找到乐器音频，仅保存TTS作为combined。")
-        check_cancelled()
-        save_wav_norm(full_wav, os.path.join(folder, 'audio_combined.wav'), sample_rate=24000)
+    # 清理历史遗留/多余的 wavs（例如之前 split_sentences 数量不同导致的尾部残留）
+    try:
+        expected = int(total_segments)
+        for name in os.listdir(output_folder):
+            if not name.endswith(".wav"):
+                continue
+            stem = name[:-4]
+            # Keep segment wavs like 0000.wav; remove other temp artifacts.
+            try:
+                idx = int(stem)
+            except ValueError:
+                # e.g. *_adjusted.wav or other unknown wavs
+                os.remove(os.path.join(output_folder, name))
+                continue
+            if idx < 0 or idx >= expected:
+                os.remove(os.path.join(output_folder, name))
+    except Exception:
+        # Best-effort cleanup only.
+        pass
 
     # Write a small marker so we can distinguish "valid result" from stale/partial artifacts.
     try:
@@ -1933,6 +1861,7 @@ def generate_wavs(
         state = {
             "tts_method": tts_method,
             "speaker_ref_seconds": max_ref_seconds,
+            "segments": int(total_segments),
             "created_at": time.time(),
         }
         with open(state_path, "w", encoding="utf-8") as f:
@@ -1946,16 +1875,14 @@ def generate_all_wavs_under_folder(
     root_folder: str,
     tts_method: str = "bytedance",
     qwen_tts_batch_size: int = 1,
-    adaptive_segment_stretch: bool = False,
 ) -> str:
     count = 0
     for root, _dirs, files in os.walk(root_folder):
         check_cancelled()
         if 'translation.json' not in files:
             continue
-        combined_path = os.path.join(root, 'audio_combined.wav')
         done_path = os.path.join(root, ".tts_done.json")
-        if os.path.exists(combined_path) and is_valid_wav(combined_path) and os.path.exists(done_path):
+        if os.path.exists(done_path):
             try:
                 with open(done_path, "r", encoding="utf-8") as f:
                     st = json.load(f)
@@ -1963,7 +1890,8 @@ def generate_all_wavs_under_folder(
                     # If translation.json is newer than marker, re-run to reflect changes.
                     tr_mtime = os.path.getmtime(os.path.join(root, "translation.json"))
                     done_mtime = os.path.getmtime(done_path)
-                    if done_mtime >= tr_mtime:
+                    first_wav = os.path.join(root, "wavs", "0000.wav")
+                    if done_mtime >= tr_mtime and os.path.exists(first_wav) and is_valid_wav(first_wav):
                         continue
             except Exception:
                 # Treat as not done and re-generate.
@@ -1972,7 +1900,6 @@ def generate_all_wavs_under_folder(
             root,
             tts_method,
             qwen_tts_batch_size=qwen_tts_batch_size,
-            adaptive_segment_stretch=adaptive_segment_stretch,
         )
         count += 1
     msg = f"语音合成完成: {root_folder}（处理 {count} 个文件）"

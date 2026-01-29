@@ -85,8 +85,9 @@ def test_generate_all_wavs_requires_marker_not_just_audio_file(tmp_path: Path, m
         json.dumps([{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "translation": "好"}], ensure_ascii=False),
         encoding="utf-8",
     )
-    # Create a valid audio_combined.wav but no marker
-    _write_dummy_wav(folder / "audio_combined.wav", seconds=0.5)
+    # Create a valid per-segment wav but no marker
+    (folder / "wavs").mkdir(parents=True, exist_ok=True)
+    _write_dummy_wav(folder / "wavs" / "0000.wav", seconds=0.2)
 
     called = {"n": 0}
 
@@ -143,7 +144,7 @@ def test_generate_wavs_bytedance_produces_audio_combined_and_srt(tmp_path: Path,
     folder = tmp_path / "job"
     folder.mkdir(parents=True, exist_ok=True)
 
-    # Provide vocals/instruments so generate_wavs can do scaling/mixing.
+    # Provide vocals/instruments so the audio-build step can do scaling/mixing.
     _write_dummy_wav(folder / "audio_vocals.wav", seconds=4.0)
     _write_dummy_wav(folder / "audio_instruments.wav", seconds=4.0)
 
@@ -152,6 +153,7 @@ def test_generate_wavs_bytedance_produces_audio_combined_and_srt(tmp_path: Path,
         {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_00", "text": "world", "translation": "世界"},
     ]
     (folder / "translation.json").write_text(json.dumps(transcript, ensure_ascii=False, indent=2), encoding="utf-8")
+    orig_translation_json = (folder / "translation.json").read_text(encoding="utf-8")
 
     ss.generate_wavs(str(folder), tts_method="bytedance")
 
@@ -160,13 +162,18 @@ def test_generate_wavs_bytedance_produces_audio_combined_and_srt(tmp_path: Path,
     assert ss.is_valid_wav(str(folder / "wavs" / "0000.wav")) is True
     assert ss.is_valid_wav(str(folder / "wavs" / "0001.wav")) is True
 
+    assert (folder / ".tts_done.json").exists()
+    state = json.loads((folder / ".tts_done.json").read_text(encoding="utf-8"))
+    assert state.get("tts_method") == "bytedance"
+
+    # Build aligned voice + combined audio (video synthesis stage).
+    sv._ensure_audio_combined(str(folder), adaptive_segment_stretch=False)
     assert (folder / "audio_tts.wav").exists()
     assert (folder / "audio_combined.wav").exists()
     assert ss.is_valid_wav(str(folder / "audio_combined.wav")) is True
 
-    assert (folder / ".tts_done.json").exists()
-    state = json.loads((folder / ".tts_done.json").read_text(encoding="utf-8"))
-    assert state.get("tts_method") == "bytedance"
+    # translation.json should not be modified by TTS/audio build.
+    assert (folder / "translation.json").read_text(encoding="utf-8") == orig_translation_json
 
     # translation.json should remain usable by the next module (video synthesis / SRT generation).
     translation = json.loads((folder / "translation.json").read_text(encoding="utf-8"))
@@ -191,6 +198,7 @@ def test_generate_wavs_qwen_path_smoke(tmp_path, monkeypatch):
     - We still exercise: worker IPC, per-segment wav writing, stitching, and output files.
     """
     import youdub.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_video as sv
 
     # Avoid depending on external time-stretch details in this test.
     def _adjust_audio_length_no_stretch(
@@ -241,10 +249,12 @@ def test_generate_wavs_qwen_path_smoke(tmp_path, monkeypatch):
 
     ss.generate_wavs(str(folder), tts_method="qwen")
 
-    assert (folder / "audio_tts.wav").exists()
-    assert (folder / "audio_combined.wav").exists()
     assert (folder / "wavs" / "0000.wav").exists()
     assert (folder / "wavs" / "0001.wav").exists()
+
+    sv._ensure_audio_combined(str(folder), adaptive_segment_stretch=False)
+    assert (folder / "audio_tts.wav").exists()
+    assert (folder / "audio_combined.wav").exists()
 
 
 def test_generate_wavs_qwen_icl_path_smoke(tmp_path, monkeypatch):
@@ -255,6 +265,7 @@ def test_generate_wavs_qwen_icl_path_smoke(tmp_path, monkeypatch):
     - Worker runs in stub mode (no qwen-tts import).
     """
     import youdub.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_video as sv
 
     # Avoid depending on external time-stretch details in this test.
     def _adjust_audio_length_no_stretch(
@@ -308,10 +319,12 @@ def test_generate_wavs_qwen_icl_path_smoke(tmp_path, monkeypatch):
 
     assert (folder / ".qwen_speaker_anchor.wav").exists()
     assert (folder / ".qwen_icl_ref" / "0000.wav").exists()
-    assert (folder / "audio_tts.wav").exists()
-    assert (folder / "audio_combined.wav").exists()
     assert (folder / "wavs" / "0000.wav").exists()
     assert (folder / "wavs" / "0001.wav").exists()
+
+    sv._ensure_audio_combined(str(folder), adaptive_segment_stretch=False)
+    assert (folder / "audio_tts.wav").exists()
+    assert (folder / "audio_combined.wav").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -433,6 +446,7 @@ def test_generate_wavs_qwen_creates_missing_speaker_ref(tmp_path: Path, monkeypa
     import os
 
     import youdub.steps.synthesize_speech as ss
+    import youdub.steps.synthesize_video as sv
 
     # Avoid depending on external time-stretch details in this test.
     def _adjust_audio_length_no_stretch(
@@ -491,5 +505,7 @@ def test_generate_wavs_qwen_creates_missing_speaker_ref(tmp_path: Path, monkeypa
 
     assert (folder / "wavs" / "0000.wav").exists()
     assert (folder / "wavs" / "0001.wav").exists()
+
+    sv._ensure_audio_combined(str(folder), adaptive_segment_stretch=False)
     assert (folder / "audio_tts.wav").exists()
     assert (folder / "audio_combined.wav").exists()

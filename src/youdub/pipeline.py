@@ -168,17 +168,20 @@ class VideoPipeline:
                     folder, 
                     tts_method=tts_method,
                     qwen_tts_batch_size=qwen_tts_batch_size,
-                    adaptive_segment_stretch=tts_adaptive_segment_stretch,
                 )
 
-                _require_file(os.path.join(folder, "audio_combined.wav"), "配音合成(audio_combined.wav)", min_bytes=44)
+                _require_file(os.path.join(folder, ".tts_done.json"), "语音合成标记(.tts_done.json)", min_bytes=2)
+                _require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
 
                 check_cancelled()
+                # 当启用“按段自适应拉伸语音”时，忽略全局加速倍率（避免双重变速）。
+                effective_speed_up = 1.0 if tts_adaptive_segment_stretch else speed_up
                 synthesize_all_video_under_folder(
                     folder,
                     subtitles=subtitles,
                     bilingual_subtitle=bilingual_subtitle,
-                    speed_up=speed_up,
+                    adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
+                    speed_up=effective_speed_up,
                     fps=fps,
                     resolution=target_resolution,
                     use_nvenc=use_nvenc,
@@ -349,56 +352,103 @@ class VideoPipeline:
         url = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
         urls = [_ for _ in url.split("\n") if _]
 
+        info_list = list(download.get_info_list_from_url(urls, num_videos, settings=self.settings))
+
+        def _valid_audio_file(path: str, min_bytes: int = 44) -> bool:
+            try:
+                return os.path.exists(path) and os.path.getsize(path) >= int(min_bytes)
+            except OSError:
+                return False
+
+        def _valid_transcript(path: str) -> bool:
+            try:
+                if not os.path.exists(path) or os.path.getsize(path) < 2:
+                    return False
+            except OSError:
+                return False
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                return isinstance(obj, list)
+            except Exception:
+                return False
+
+        # 若目标目录里“人声/伴奏 + transcript.json”都已存在，则不需要预热 Demucs/ASR。
+        need_demucs_warmup = False
+        need_asr_warmup = False
+        for info in info_list:
+            check_cancelled()
+            folder = download.get_target_folder(info, root_folder)
+            if not folder:
+                need_demucs_warmup = True
+                need_asr_warmup = True
+                break
+            if not os.path.exists(folder):
+                need_demucs_warmup = True
+                need_asr_warmup = True
+                break
+
+            vocals_ok = _valid_audio_file(os.path.join(folder, "audio_vocals.wav"))
+            inst_ok = _valid_audio_file(os.path.join(folder, "audio_instruments.wav"))
+            if not (vocals_ok and inst_ok):
+                need_demucs_warmup = True
+
+            if not _valid_transcript(os.path.join(folder, "transcript.json")):
+                need_asr_warmup = True
+
+            if need_demucs_warmup and need_asr_warmup:
+                break
+
         # Warm-up models best-effort. Keep it sequential so Ctrl+C can stop cleanly.
-        check_cancelled()
-        try:
-            separate_vocals.init_demucs(self.settings, self.model_manager)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"Demucs 预热失败（忽略）: {exc}")
+        if need_demucs_warmup:
+            check_cancelled()
+            try:
+                separate_vocals.init_demucs(self.settings, self.model_manager)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(f"Demucs 预热失败（忽略）: {exc}")
         check_cancelled()
         try:
             synthesize_speech.init_TTS(self.settings, self.model_manager)
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning(f"TTS 预热失败（忽略）: {exc}")
-        check_cancelled()
-        try:
-            # Preload ASR model best-effort to reduce first-request latency.
-            # Respect explicit ASR device selection from UI; for "auto" keep legacy behavior.
-            if asr_method == "qwen":
-                resolved = wd
-                if resolved == "auto":
-                    resolved = "cuda" if torch.cuda.is_available() else "cpu"
-                transcribe.load_qwen_asr_model(
-                    qwen_asr_model_dir or "",
-                    device=resolved,
-                    settings=self.settings,
-                    model_manager=self.model_manager,
-                    max_inference_batch_size=1,
-                )
-            else:
-                if wd == "cpu":
-                    transcribe.load_asr_model(
-                        whisper_cpu_model or whisper_model,
-                        device="cpu",
+        if need_asr_warmup:
+            check_cancelled()
+            try:
+                # Preload ASR model best-effort to reduce first-request latency.
+                # Respect explicit ASR device selection from UI; for "auto" keep legacy behavior.
+                if asr_method == "qwen":
+                    resolved = wd
+                    if resolved == "auto":
+                        resolved = "cuda" if torch.cuda.is_available() else "cpu"
+                    transcribe.load_qwen_asr_model(
+                        qwen_asr_model_dir or "",
+                        device=resolved,
                         settings=self.settings,
                         model_manager=self.model_manager,
-                    )
-                elif wd == "cuda":
-                    transcribe.load_asr_model(
-                        whisper_model,
-                        device="cuda",
-                        settings=self.settings,
-                        model_manager=self.model_manager,
+                        max_inference_batch_size=1,
                     )
                 else:
-                    transcribe.init_asr(self.settings, self.model_manager)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"ASR 预热失败（忽略）: {exc}")
+                    if wd == "cpu":
+                        transcribe.load_asr_model(
+                            whisper_cpu_model or whisper_model,
+                            device="cpu",
+                            settings=self.settings,
+                            model_manager=self.model_manager,
+                        )
+                    elif wd == "cuda":
+                        transcribe.load_asr_model(
+                            whisper_model,
+                            device="cuda",
+                            settings=self.settings,
+                            model_manager=self.model_manager,
+                        )
+                    else:
+                        transcribe.init_asr(self.settings, self.model_manager)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning(f"ASR 预热失败（忽略）: {exc}")
 
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
-
-        info_list = list(download.get_info_list_from_url(urls, num_videos, settings=self.settings))
 
         if max_workers <= 1:
             for info in info_list:

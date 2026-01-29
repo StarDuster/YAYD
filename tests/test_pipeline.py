@@ -163,15 +163,19 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
     def _stub_tts_all(_folder: str, **_kwargs) -> str:
         calls.append("tts")
         assert (job / "translation.json").exists()
-        _write_dummy_wav(job / "audio_combined.wav", seconds=0.5)
+        (job / "wavs").mkdir(parents=True, exist_ok=True)
+        _write_dummy_wav(job / "wavs" / "0000.wav", seconds=0.2)
         (job / ".tts_done.json").write_text(json.dumps({"tts_method": "bytedance"}, ensure_ascii=False), encoding="utf-8")
         return "ok"
 
     def _stub_video_all(_folder: str, **_kwargs) -> str:
         calls.append("video")
         assert (job / "download.mp4").exists()
-        assert (job / "audio_combined.wav").exists()
         assert (job / "translation.json").exists()
+        assert (job / ".tts_done.json").exists()
+        assert (job / "wavs" / "0000.wav").exists()
+        # Simulate the real synthesize_video stage producing the final mixed audio.
+        _write_dummy_wav(job / "audio_combined.wav", seconds=0.5)
         (job / "video.mp4").write_bytes(b"0" * 2048)
         return "ok"
 
@@ -256,7 +260,15 @@ def test_pipeline_warmup_loads_cpu_model_when_whisper_device_cpu(tmp_path: Path,
     monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        pl.download,
+        "get_info_list_from_url",
+        lambda *_args, **_kwargs: [
+            {"title": "t", "uploader": "u", "upload_date": "20260101", "webpage_url": "x"}
+        ],
+    )
+    monkeypatch.setattr(pl.download, "get_target_folder", lambda *_args, **_kwargs: str(tmp_path / "job"))
+    monkeypatch.setattr(pl.VideoPipeline, "process_single", lambda *_args, **_kwargs: True)
 
     calls: list[tuple[str, str]] = []
 
@@ -276,7 +288,7 @@ def test_pipeline_warmup_loads_cpu_model_when_whisper_device_cpu(tmp_path: Path,
         whisper_model=str(gpu_dir),
         whisper_cpu_model=str(cpu_dir),
     )
-    assert "成功: 0" in out
+    assert "成功:" in out
     assert calls == [(str(cpu_dir), "cpu")]
 
 
@@ -298,7 +310,15 @@ def test_pipeline_warmup_loads_gpu_model_when_whisper_device_cuda(tmp_path: Path
     monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *args, **kwargs: None)
     monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        pl.download,
+        "get_info_list_from_url",
+        lambda *_args, **_kwargs: [
+            {"title": "t", "uploader": "u", "upload_date": "20260101", "webpage_url": "x"}
+        ],
+    )
+    monkeypatch.setattr(pl.download, "get_target_folder", lambda *_args, **_kwargs: str(tmp_path / "job"))
+    monkeypatch.setattr(pl.VideoPipeline, "process_single", lambda *_args, **_kwargs: True)
 
     calls: list[tuple[str, str]] = []
 
@@ -318,5 +338,45 @@ def test_pipeline_warmup_loads_gpu_model_when_whisper_device_cuda(tmp_path: Path
         whisper_model=str(gpu_dir),
         whisper_cpu_model=str(cpu_dir),
     )
-    assert "成功: 0" in out
+    assert "成功:" in out
     assert calls == [(str(gpu_dir), "cuda")]
+
+
+def test_pipeline_warmup_skips_demucs_and_asr_when_outputs_exist(tmp_path: Path, monkeypatch):
+    import youdub.pipeline as pl
+
+    whisper_dir = tmp_path / "whisper"
+    _touch_model_bin(whisper_dir)
+
+    settings = Settings(root_folder=tmp_path, whisper_model_path=whisper_dir)
+    manager = ModelManager(settings)
+
+    job = tmp_path / "job"
+    job.mkdir(parents=True, exist_ok=True)
+    _write_dummy_wav(job / "audio_vocals.wav", seconds=0.5)
+    _write_dummy_wav(job / "audio_instruments.wav", seconds=0.5)
+    (job / "transcript.json").write_text(json.dumps([], ensure_ascii=False), encoding="utf-8")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("warmup should be skipped when transcript/audio already exist")
+
+    monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: [{"upload_date": "20260101"}])
+    monkeypatch.setattr(pl.download, "get_target_folder", lambda *_args, **_kwargs: str(job))
+    monkeypatch.setattr(pl.separate_vocals, "init_demucs", _boom)
+    monkeypatch.setattr(pl.transcribe, "load_asr_model", _boom)
+    monkeypatch.setattr(pl.transcribe, "init_asr", _boom)
+    monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pl.VideoPipeline, "process_single", lambda *_args, **_kwargs: True)
+
+    pipe = pl.VideoPipeline(settings=settings, model_manager=manager)
+    out = pipe.run(
+        url="",
+        num_videos=1,
+        max_workers=1,
+        whisper_diarization=False,
+        auto_upload_video=False,
+        whisper_device="cpu",
+        whisper_model=str(whisper_dir),
+    )
+    assert "成功:" in out

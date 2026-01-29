@@ -293,27 +293,42 @@ def separate_all_audio_under_folder(
     if model_manager is None:
         model_manager = ModelManager(settings)
 
+    def _valid_audio_file(p: str) -> bool:
+        try:
+            return os.path.exists(p) and os.path.getsize(p) >= 44
+        except Exception:
+            return False
+
+    # 先扫描一遍：如果没有任何需要处理的文件，就不要加载 Demucs。
+    pending: list[str] = []
+    for subdir, _dirs, files in os.walk(root_folder):
+        check_cancelled()
+        if "download.mp4" not in files:
+            continue
+        vocal_output_path = os.path.join(subdir, "audio_vocals.wav")
+        instruments_output_path = os.path.join(subdir, "audio_instruments.wav")
+        if _valid_audio_file(vocal_output_path) and _valid_audio_file(instruments_output_path):
+            continue
+        pending.append(subdir)
+
+    if not pending:
+        msg = f"音频分离完成: {root_folder}（processed 0 files / 处理 0 个文件）"
+        logger.info(msg)
+        return msg
+
     _ensure_demucs_ready(settings, model_manager)
-    
     load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
 
     count = 0
-    for subdir, _dirs, files in os.walk(root_folder):
+    for subdir in pending:
         check_cancelled()
-        if 'download.mp4' not in files:
-            continue
-            
-        if 'audio.wav' not in files:
-            extract_audio_from_video(subdir)
-            
-        vocal_output_path = os.path.join(subdir, 'audio_vocals.wav')
-        instruments_output_path = os.path.join(subdir, 'audio_instruments.wav')
 
-        def _valid_audio_file(p: str) -> bool:
-            try:
-                return os.path.exists(p) and os.path.getsize(p) >= 44
-            except Exception:
-                return False
+        audio_wav = os.path.join(subdir, "audio.wav")
+        if not os.path.exists(audio_wav):
+            extract_audio_from_video(subdir)
+
+        vocal_output_path = os.path.join(subdir, "audio_vocals.wav")
+        instruments_output_path = os.path.join(subdir, "audio_instruments.wav")
 
         # Re-run separation if outputs are missing or look truncated/corrupted (common after interruptions).
         if not _valid_audio_file(vocal_output_path) or not _valid_audio_file(instruments_output_path):
