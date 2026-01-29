@@ -5,6 +5,7 @@ import time
 from typing import Any
 import re
 import math
+import wave
 
 import librosa
 import numpy as np
@@ -19,7 +20,60 @@ _AUDIO_SAMPLE_RATE = 24000
 # Example: min=0.65 => max speed-up ≈ 1/0.65 ≈ 1.54x (slightly lower than old 1/0.6 ≈ 1.67x).
 _AUDIO_MIN_SPEED_FACTOR = 0.65
 _AUDIO_MAX_STRETCH = 1.10
-_AUDIO_MAX_STRETCH_ADAPTIVE = 1.35
+_AUDIO_MAX_STRETCH_ADAPTIVE = 1.10
+
+# Adaptive (timeline-compacting) mode: cap the global video speed-up.
+# If the required speed-up is larger than this cap, we will keep video at this cap
+# and only then pad audio tail with silence (ffmpeg apad).
+_VIDEO_MAX_SPEED_UP_ADAPTIVE = 1.8
+
+# When compacting segments, we insert small pauses for natural phrasing.
+_ADAPTIVE_GAP_DEFAULT_S = 0.12
+_ADAPTIVE_GAP_CLAUSE_S = 0.18
+_ADAPTIVE_GAP_SENTENCE_S = 0.25
+_ADAPTIVE_TRIM_TOP_DB = 35.0
+
+
+def _wav_duration_seconds(path: str) -> float | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with wave.open(path, "rb") as wf:
+            sr = int(wf.getframerate() or 0)
+            n = int(wf.getnframes() or 0)
+        if sr <= 0:
+            return None
+        if n <= 0:
+            return 0.0
+        return float(n) / float(sr)
+    except Exception:
+        return None
+
+
+def _get_video_duration_seconds(video_path: str) -> float | None:
+    check_cancelled()
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        s = (r.stdout or "").strip()
+        if not s:
+            return None
+        v = float(s)
+        if v < 0:
+            return None
+        return v
+    except Exception as exc:
+        logger.warning(f"获取视频时长失败(将回退): {exc}")
+        return None
 
 
 def _ensure_audio_combined(
@@ -54,6 +108,7 @@ def _ensure_audio_combined(
     audio_tts_path = os.path.join(folder, "audio_tts.wav")
     audio_combined_path = os.path.join(folder, "audio_combined.wav")
     marker_path = os.path.join(folder, ".audio_done.json")
+    translation_adaptive_path = os.path.join(folder, "translation_adaptive.json")
 
     max_speed_factor = float(max_stretch_adaptive if adaptive_segment_stretch else max_stretch)
 
@@ -71,6 +126,8 @@ def _ensure_audio_combined(
                 return False
             if int(st.get("sample_rate")) != int(sample_rate):
                 return False
+            if bool(st.get("adaptive_segment_stretch")) and not os.path.exists(translation_adaptive_path):
+                return False
 
             need_mtime = os.path.getmtime(translation_path)
             if os.path.exists(tts_done_path):
@@ -79,6 +136,8 @@ def _ensure_audio_combined(
                 need_mtime = max(need_mtime, os.path.getmtime(instruments_path))
             if os.path.exists(vocals_path):
                 need_mtime = max(need_mtime, os.path.getmtime(vocals_path))
+            if adaptive_segment_stretch and os.path.exists(translation_adaptive_path):
+                need_mtime = max(need_mtime, os.path.getmtime(translation_adaptive_path))
             done_mtime = os.path.getmtime(marker_path)
             return done_mtime >= need_mtime
         except Exception:
@@ -92,71 +151,148 @@ def _ensure_audio_combined(
     if not isinstance(translation, list) or not translation:
         raise ValueError(f"translation.json 结构异常（应为非空 list）：{translation_path}")
 
-    # Build voice track aligned to original timestamps.
-    chunks: list[np.ndarray] = []
-    cur_samples = 0
     total_segments = len(translation)
-    for i, seg in enumerate(translation):
-        check_cancelled()
+
+    if adaptive_segment_stretch:
+        # Adaptive mode:
+        # - Keep TTS segments at (near) natural pace (no forced stretching to match original timestamps).
+        # - Compact the timeline by concatenating segments with small gaps (for natural phrasing).
+        # - Write a separate translation_adaptive.json to drive subtitles.
+        chunks: list[np.ndarray] = []
+        adaptive_translation: list[dict[str, Any]] = []
+        cur_samples = 0
+
+        def _gap_seconds_for_text(text: str) -> float:
+            s = (text or "").strip()
+            if not s:
+                return float(_ADAPTIVE_GAP_DEFAULT_S)
+            tail = s[-1]
+            if tail in {"。", "！", "？", ".", "!", "?"}:
+                return float(_ADAPTIVE_GAP_SENTENCE_S)
+            if tail in {"，", "、", ",", ";", "；", ":", "："}:
+                return float(_ADAPTIVE_GAP_CLAUSE_S)
+            return float(_ADAPTIVE_GAP_DEFAULT_S)
+
+        for i, seg in enumerate(translation):
+            check_cancelled()
+            seg_path = os.path.join(wavs_dir, f"{i:04d}.wav")
+
+            wav: np.ndarray
+            if os.path.exists(seg_path) and ss.is_valid_wav(seg_path):
+                wav, _ = librosa.load(seg_path, sr=sample_rate, mono=True)
+                wav = wav.astype(np.float32, copy=False)
+            else:
+                wav = np.zeros((0,), dtype=np.float32)
+
+            # Trim leading/trailing silence to reduce "dead air" (common in TTS).
+            if wav.size > 0:
+                try:
+                    wav_trim, _idx = librosa.effects.trim(wav, top_db=float(_ADAPTIVE_TRIM_TOP_DB))
+                    # If we trimmed to empty (e.g. the segment is pure silence due to TTS failure),
+                    # keep the original wav so we don't collapse the timeline and drop subtitles.
+                    if wav_trim is not None and wav_trim.size > 0:
+                        wav = wav_trim.astype(np.float32, copy=False)
+                except Exception:
+                    pass
+
+            start_s = float(cur_samples) / float(sample_rate)
+            end_s = start_s + (float(wav.shape[0]) / float(sample_rate) if wav.size > 0 else 0.0)
+            out_seg = dict(seg)
+            out_seg["start"] = round(start_s, 3)
+            out_seg["end"] = round(end_s, 3)
+            adaptive_translation.append(out_seg)
+
+            if wav.size > 0:
+                chunks.append(wav)
+                cur_samples += int(wav.shape[0])
+
+            if i != (total_segments - 1):
+                gap_s = _gap_seconds_for_text(str(seg.get("translation", "") or ""))
+                gap_samples = int(round(float(gap_s) * float(sample_rate)))
+                if gap_samples > 0:
+                    chunks.append(np.zeros((gap_samples,), dtype=np.float32))
+                    cur_samples += gap_samples
+
+            if (i + 1) % 50 == 0 or (i + 1) == total_segments:
+                logger.info(f"自适应合成音频进度: {i + 1}/{total_segments}")
+
+        if chunks:
+            voice = np.concatenate(chunks).astype(np.float32, copy=False)
+        else:
+            voice = np.zeros((0,), dtype=np.float32)
+        del chunks
+
+        # Persist adaptive subtitle timeline for video synthesis stage.
         try:
-            start_s = float(seg.get("start", 0.0) or 0.0)
-            end_s = float(seg.get("end", start_s) or start_s)
-        except Exception:
-            start_s, end_s = 0.0, 0.0
-        if end_s < start_s:
-            end_s = start_s
-
-        start_samples = int(round(start_s * sample_rate))
-        end_samples = int(round(end_s * sample_rate))
-        if end_samples < start_samples:
-            end_samples = start_samples
-
-        if start_samples > cur_samples:
-            gap = start_samples - cur_samples
-            if gap > 0:
-                chunks.append(np.zeros((gap,), dtype=np.float32))
-                cur_samples += gap
-        elif start_samples < cur_samples:
-            # Overlap/out-of-order timestamps; best-effort: clamp to current cursor.
-            start_samples = cur_samples
-            end_samples = max(end_samples, start_samples)
-
-        desired_samples = max(0, end_samples - start_samples)
-        if desired_samples <= 0:
-            continue
-
-        seg_path = os.path.join(wavs_dir, f"{i:04d}.wav")
-        if not (os.path.exists(seg_path) and ss.is_valid_wav(seg_path)):
-            chunks.append(np.zeros((desired_samples,), dtype=np.float32))
-            cur_samples += desired_samples
-            continue
-
-        desired_len = float(desired_samples) / float(sample_rate)
-        wav_adj, _actual_len = ss.adjust_audio_length(
-            seg_path,
-            desired_len,
-            sample_rate=sample_rate,
-            min_speed_factor=float(min_speed_factor),
-            max_speed_factor=float(max_speed_factor),
-        )
-        wav_adj = wav_adj.astype(np.float32, copy=False)
-
-        if wav_adj.shape[0] < desired_samples:
-            wav_adj = np.pad(wav_adj, (0, desired_samples - wav_adj.shape[0]), mode="constant")
-        elif wav_adj.shape[0] > desired_samples:
-            wav_adj = wav_adj[:desired_samples]
-
-        chunks.append(wav_adj)
-        cur_samples += desired_samples
-
-        if (i + 1) % 50 == 0 or (i + 1) == total_segments:
-            logger.info(f"对齐音频进度: {i + 1}/{total_segments}")
-
-    if chunks:
-        voice = np.concatenate(chunks).astype(np.float32, copy=False)
+            with open(translation_adaptive_path, "w", encoding="utf-8") as f:
+                json.dump(adaptive_translation, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f"写入 translation_adaptive.json 失败(将继续): {exc}")
     else:
-        voice = np.zeros((0,), dtype=np.float32)
-    del chunks
+        # Normal mode: align to original timestamps and only do bounded per-segment stretching.
+        chunks = []
+        cur_samples = 0
+        for i, seg in enumerate(translation):
+            check_cancelled()
+            try:
+                start_s = float(seg.get("start", 0.0) or 0.0)
+                end_s = float(seg.get("end", start_s) or start_s)
+            except Exception:
+                start_s, end_s = 0.0, 0.0
+            if end_s < start_s:
+                end_s = start_s
+
+            start_samples = int(round(start_s * sample_rate))
+            end_samples = int(round(end_s * sample_rate))
+            if end_samples < start_samples:
+                end_samples = start_samples
+
+            if start_samples > cur_samples:
+                gap = start_samples - cur_samples
+                if gap > 0:
+                    chunks.append(np.zeros((gap,), dtype=np.float32))
+                    cur_samples += gap
+            elif start_samples < cur_samples:
+                # Overlap/out-of-order timestamps; best-effort: clamp to current cursor.
+                start_samples = cur_samples
+                end_samples = max(end_samples, start_samples)
+
+            desired_samples = max(0, end_samples - start_samples)
+            if desired_samples <= 0:
+                continue
+
+            seg_path = os.path.join(wavs_dir, f"{i:04d}.wav")
+            if not (os.path.exists(seg_path) and ss.is_valid_wav(seg_path)):
+                chunks.append(np.zeros((desired_samples,), dtype=np.float32))
+                cur_samples += desired_samples
+                continue
+
+            desired_len = float(desired_samples) / float(sample_rate)
+            wav_adj, _actual_len = ss.adjust_audio_length(
+                seg_path,
+                desired_len,
+                sample_rate=sample_rate,
+                min_speed_factor=float(min_speed_factor),
+                max_speed_factor=float(max_speed_factor),
+            )
+            wav_adj = wav_adj.astype(np.float32, copy=False)
+
+            if wav_adj.shape[0] < desired_samples:
+                wav_adj = np.pad(wav_adj, (0, desired_samples - wav_adj.shape[0]), mode="constant")
+            elif wav_adj.shape[0] > desired_samples:
+                wav_adj = wav_adj[:desired_samples]
+
+            chunks.append(wav_adj)
+            cur_samples += desired_samples
+
+            if (i + 1) % 50 == 0 or (i + 1) == total_segments:
+                logger.info(f"对齐音频进度: {i + 1}/{total_segments}")
+
+        if chunks:
+            voice = np.concatenate(chunks).astype(np.float32, copy=False)
+        else:
+            voice = np.zeros((0,), dtype=np.float32)
+        del chunks
 
     # Match voice loudness to original vocals peak (best-effort).
     if os.path.exists(vocals_path) and voice.size > 0:
@@ -184,12 +320,21 @@ def _ensure_audio_combined(
         inst, _ = librosa.load(instruments_path, sr=sample_rate, mono=True)
         inst = inst.astype(np.float32, copy=False)
 
-        if voice.shape[0] > inst.shape[0]:
-            inst = np.pad(inst, (0, voice.shape[0] - inst.shape[0]), mode="constant")
-        elif inst.shape[0] > voice.shape[0]:
-            voice = np.pad(voice, (0, inst.shape[0] - voice.shape[0]), mode="constant")
-
-        voice += inst
+        if adaptive_segment_stretch:
+            # Adaptive mode wants a shorter output; never extend due to instruments tail.
+            target = int(voice.shape[0])
+            if inst.shape[0] < target:
+                inst = np.pad(inst, (0, target - inst.shape[0]), mode="constant")
+            elif inst.shape[0] > target:
+                inst = inst[:target]
+            voice = (voice + inst).astype(np.float32, copy=False)
+        else:
+            # Normal mode keeps the original timeline; preserve instruments tail.
+            if voice.shape[0] > inst.shape[0]:
+                inst = np.pad(inst, (0, voice.shape[0] - inst.shape[0]), mode="constant")
+            elif inst.shape[0] > voice.shape[0]:
+                voice = np.pad(voice, (0, inst.shape[0] - voice.shape[0]), mode="constant")
+            voice = (voice + inst).astype(np.float32, copy=False)
         del inst
         check_cancelled()
         save_wav_norm(voice.astype(np.float32, copy=False), audio_combined_path, sample_rate=sample_rate)
@@ -205,6 +350,8 @@ def _ensure_audio_combined(
             "max_speed_factor": float(max_speed_factor),
             "sample_rate": int(sample_rate),
             "segments": int(total_segments),
+            "audio_samples": int(voice.shape[0]),
+            "audio_seconds": float(voice.shape[0]) / float(sample_rate) if int(sample_rate) > 0 else None,
             "created_at": time.time(),
         }
         with open(marker_path, "w", encoding="utf-8") as f:
@@ -816,7 +963,15 @@ def synthesize_video(
     # Ensure audio_combined.wav exists (built from wavs/*.wav).
     input_audio = _ensure_audio_combined(folder, adaptive_segment_stretch=adaptive_segment_stretch)
     
-    with open(translation_path, 'r', encoding='utf-8') as f:
+    # Subtitles timeline:
+    # - normal mode: translation.json (original timestamps)
+    # - adaptive mode: translation_adaptive.json (compact timeline aligned to TTS concatenation)
+    translation_for_subtitles_path = translation_path
+    if adaptive_segment_stretch:
+        cand = os.path.join(folder, "translation_adaptive.json")
+        if os.path.exists(cand):
+            translation_for_subtitles_path = cand
+    with open(translation_for_subtitles_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
 
     check_cancelled()
@@ -832,8 +987,35 @@ def synthesize_video(
     outline = int(round(font_size / 12))
     outline = max(2, outline)
     
-    video_speed_filter = f"setpts=PTS/{speed_up}"
-    audio_speed_filter = f"atempo={speed_up}"
+    # Video/audio speed strategy:
+    # - normal mode: apply user speed_up to both video and audio (atempo)
+    # - adaptive mode: ignore user speed_up; compute a global video speed so video duration matches audio.
+    used_speed_up = float(speed_up)
+    audio_filter_extra = ""
+    if adaptive_segment_stretch:
+        used_speed_up = 1.0  # ignore UI speed_up to avoid double speed changes
+        v_dur = _get_video_duration_seconds(input_video)
+        a_dur = _wav_duration_seconds(input_audio)
+        if (v_dur is not None) and (a_dur is not None) and (a_dur > 0):
+            req = float(v_dur) / float(a_dur)
+            cap = float(_VIDEO_MAX_SPEED_UP_ADAPTIVE)
+            if req > cap:
+                used_speed_up = cap
+                # If we hit the cap, video will still be longer than audio. Only then, pad audio tail with silence.
+                out_dur = float(v_dur) / float(used_speed_up) if used_speed_up > 0 else float(v_dur)
+                audio_filter_extra = f",apad=pad_dur={out_dur:.3f},atrim=duration={out_dur:.3f}"
+                logger.info(
+                    f"自适应缩放触顶：需要加速 {req:.2f}x > 上限 {cap:.2f}x，将补齐尾部静音至 {out_dur:.2f}s"
+                )
+            else:
+                used_speed_up = req
+            logger.info(f"自适应缩放：video_dur={v_dur:.2f}s audio_dur={a_dur:.2f}s speed_up={used_speed_up:.3f}")
+        else:
+            logger.warning("自适应缩放：无法获取音频/视频时长，将回退为不缩放")
+            used_speed_up = 1.0
+
+    video_speed_filter = f"setpts=PTS/{used_speed_up}"
+    audio_speed_filter = f"atempo={used_speed_up}" if not adaptive_segment_stretch else f"anull{audio_filter_extra}"
     
     if subtitles:
         if bilingual_subtitle:
@@ -841,7 +1023,7 @@ def synthesize_video(
             generate_bilingual_ass(
                 translation,
                 ass_path,
-                speed_up=speed_up,
+                speed_up=used_speed_up if not adaptive_segment_stretch else 1.0,
                 play_res_x=width,
                 play_res_y=height,
                 font_name="Arial",
@@ -856,7 +1038,7 @@ def synthesize_video(
             subtitle_filter = f"ass=filename='{ass_path_filter}':original_size={res_string}"
         else:
             srt_path = os.path.join(folder, "subtitles.srt")
-            generate_srt(translation, srt_path, speed_up=speed_up)
+            generate_srt(translation, srt_path, speed_up=used_speed_up if not adaptive_segment_stretch else 1.0)
 
             srt_path_filter = srt_path.replace("\\", "/")
             if os.name == "nt" and ":" in srt_path_filter:
