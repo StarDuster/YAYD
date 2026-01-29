@@ -33,6 +33,53 @@ def ensure_torchaudio_backend_compat() -> None:
     except Exception:
         return
 
+    # torchaudio>=2.9 removed `torchaudio.info`, but pyannote.audio still calls it.
+    # Provide a best-effort implementation backed by soundfile (already a project dependency).
+    if not hasattr(torchaudio, "info"):
+        try:
+            import soundfile as _sf  # type: ignore
+        except Exception:
+            _sf = None
+
+        try:
+            from torchaudio.backend.common import AudioMetaData as _AudioMetaData  # type: ignore
+        except Exception:
+            from typing import NamedTuple
+
+            class _AudioMetaData(NamedTuple):
+                sample_rate: int
+                num_frames: int
+                num_channels: int
+                bits_per_sample: int
+                encoding: str
+
+        def _guess_bits_per_sample(subtype: str | None) -> int:
+            if not subtype:
+                return 0
+            m = re.search(r"(\d+)", str(subtype))
+            return int(m.group(1)) if m else 0
+
+        def _info(uri, *_, **__):  # type: ignore[no-untyped-def]
+            if _sf is None:
+                raise RuntimeError("torchaudio.info 不可用且未安装 soundfile，无法读取音频元信息。")
+            try:
+                si = _sf.info(uri)
+            except Exception as exc:
+                raise RuntimeError(f"无法读取音频元信息: {exc}") from exc
+
+            return _AudioMetaData(
+                int(getattr(si, "samplerate", 0) or 0),
+                int(getattr(si, "frames", 0) or 0),
+                int(getattr(si, "channels", 0) or 0),
+                _guess_bits_per_sample(getattr(si, "subtype", None)),
+                str(getattr(si, "subtype", "") or getattr(si, "format", "") or ""),
+            )
+
+        try:
+            setattr(torchaudio, "info", _info)
+        except Exception:
+            pass
+
     # torchaudio>=2.x may remove the `torchaudio.backend` package entirely.
     # Some downstream libs/checkpoints still import it (e.g. during torch.load/unpickling),
     # which would crash diarization. Provide a minimal module tree for compatibility.
