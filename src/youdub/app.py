@@ -541,6 +541,8 @@ def run_pipeline(
     auto_upload_video,
 ):
     try:
+        # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
+        effective_speed_up = 1.0 if tts_adaptive_segment_stretch else speed_up
         with _temp_env(
             {
                 "TRANSLATION_STRATEGY": translation_strategy,
@@ -574,7 +576,7 @@ def run_pipeline(
                 tts_adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
                 subtitles=subtitles,
                 bilingual_subtitle=bool(bilingual_subtitle),
-                speed_up=speed_up,
+                speed_up=effective_speed_up,
                 fps=fps,
                 target_resolution=target_resolution,
                 use_nvenc=use_nvenc,
@@ -590,9 +592,22 @@ def show_model_status():
     return model_manager.describe_status()
 
 
-def download_models(hf_token: str):
-    """下载所有需要的离线模型。"""
+# 可下载的模型选项
+_MODEL_DOWNLOAD_CHOICES = [
+    ("Demucs (人声分离)", "demucs"),
+    ("Whisper ASR (语音识别)", "whisper"),
+    ("Pyannote (说话人分离)", "pyannote"),
+    ("Qwen3-ASR (语音识别)", "qwen_asr"),
+    ("Qwen3-TTS (语音合成)", "qwen_tts"),
+]
+
+
+def download_models(selected_models: list[str], hf_token: str):
+    """下载选中的离线模型。"""
     import torch
+
+    if not selected_models:
+        return "请至少选择一个模型进行下载。"
 
     try:
         from huggingface_hub import snapshot_download
@@ -613,6 +628,14 @@ def download_models(hf_token: str):
             "repo_id": "pyannote/segmentation-3.0",
             "revision": "4ca4d5a8d2ab82ddfbea8aa3b29c15431671239c",
         },
+        "qwen_asr": {
+            "repo_id": "Qwen/Qwen3-ASR-1.7B",
+            "revision": None,  # 使用最新版本
+        },
+        "qwen_tts": {
+            "repo_id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            "revision": None,  # 使用最新版本
+        },
     }
 
     # 临时清除离线模式环境变量
@@ -629,69 +652,126 @@ def download_models(hf_token: str):
     try:
         logger.info("开始下载离线模型...")
         logger.info(f"目标目录: {settings.root_folder}")
+        logger.info(f"选中的模型: {', '.join(selected_models)}")
+
+        step = 0
 
         # 1. Demucs
-        logger.info("\n=== 1. Demucs 模型 ===")
-        try:
-            from demucs_infer.pretrained import get_model
+        if "demucs" in selected_models:
+            step += 1
+            logger.info(f"\n=== {step}. Demucs 模型 ===")
+            try:
+                from demucs_infer.pretrained import get_model
 
-            demucs_dir = settings.resolve_path(settings.demucs_model_dir)
-            if demucs_dir:
-                demucs_dir.mkdir(parents=True, exist_ok=True)
-                torch.hub.set_dir(str(demucs_dir))
-                logger.info(f"设置 torch hub 目录: {demucs_dir}")
+                demucs_dir = settings.resolve_path(settings.demucs_model_dir)
+                if demucs_dir:
+                    demucs_dir.mkdir(parents=True, exist_ok=True)
+                    torch.hub.set_dir(str(demucs_dir))
+                    logger.info(f"设置 torch hub 目录: {demucs_dir}")
 
-            model_name = settings.demucs_model_name
-            logger.info(f"下载 Demucs 模型: {model_name} ...")
-            get_model(model_name)
-            logger.info("Demucs 模型下载完成。")
-        except Exception as e:
-            logger.error(f"Demucs 下载失败: {e}")
+                model_name = settings.demucs_model_name
+                logger.info(f"下载 Demucs 模型: {model_name} ...")
+                get_model(model_name)
+                logger.info("Demucs 模型下载完成。")
+            except Exception as e:
+                logger.error(f"Demucs 下载失败: {e}")
 
         # 2. Whisper
-        logger.info("\n=== 2. Whisper 模型 ===")
-        wx_conf = MODELS_TO_DOWNLOAD["whisper"]
-        wx_path = settings.resolve_path(settings.whisper_model_path)
-        logger.info(f"下载 Whisper 模型 ({wx_conf['revision'][:7]}) -> {wx_path} ...")
-        try:
-            snapshot_download(
-                repo_id=wx_conf["repo_id"],
-                revision=wx_conf["revision"],
-                local_dir=wx_path,
-                local_dir_use_symlinks=False,
-                resume_download=True,
-            )
-            logger.info("Whisper 模型下载完成。")
-        except Exception as e:
-            logger.error(f"Whisper 下载失败: {e}")
+        if "whisper" in selected_models:
+            step += 1
+            logger.info(f"\n=== {step}. Whisper 模型 ===")
+            wx_conf = MODELS_TO_DOWNLOAD["whisper"]
+            wx_path = settings.resolve_path(settings.whisper_model_path)
+            logger.info(f"下载 Whisper 模型 ({wx_conf['revision'][:7]}) -> {wx_path} ...")
+            try:
+                snapshot_download(
+                    repo_id=wx_conf["repo_id"],
+                    revision=wx_conf["revision"],
+                    local_dir=wx_path,
+                    local_dir_use_symlinks=False,
+                    resume_download=True,
+                )
+                logger.info("Whisper 模型下载完成。")
+            except Exception as e:
+                logger.error(f"Whisper 下载失败: {e}")
 
         # 3. Pyannote 说话人分离
-        logger.info("\n=== 3. Pyannote 说话人分离 ===")
-        if not hf_token:
-            logger.warning("未提供 HF_TOKEN，跳过 Pyannote 模型下载（需要同意协议并设置 token）")
-        else:
-            diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
-            old_hf_home = os.environ.get("HF_HOME")
-            os.environ["HF_HOME"] = str(diar_dir)
-
-            for key in ["diarization", "segmentation"]:
-                conf = MODELS_TO_DOWNLOAD[key]
-                logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
-                try:
-                    snapshot_download(
-                        repo_id=conf["repo_id"],
-                        revision=conf["revision"],
-                        token=hf_token,
-                        resume_download=True,
-                    )
-                    logger.info(f"{conf['repo_id']} 下载完成。")
-                except Exception as e:
-                    logger.error(f"下载失败 {conf['repo_id']}: {e}")
-
-            if old_hf_home is not None:
-                os.environ["HF_HOME"] = old_hf_home
+        if "pyannote" in selected_models:
+            step += 1
+            logger.info(f"\n=== {step}. Pyannote 说话人分离 ===")
+            if not hf_token:
+                logger.warning("未提供 HF_TOKEN，跳过 Pyannote 模型下载（需要同意协议并设置 token）")
             else:
-                os.environ.pop("HF_HOME", None)
+                diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
+                old_hf_home = os.environ.get("HF_HOME")
+                os.environ["HF_HOME"] = str(diar_dir)
+
+                for key in ["diarization", "segmentation"]:
+                    conf = MODELS_TO_DOWNLOAD[key]
+                    logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
+                    try:
+                        snapshot_download(
+                            repo_id=conf["repo_id"],
+                            revision=conf["revision"],
+                            token=hf_token,
+                            resume_download=True,
+                        )
+                        logger.info(f"{conf['repo_id']} 下载完成。")
+                    except Exception as e:
+                        logger.error(f"下载失败 {conf['repo_id']}: {e}")
+
+                if old_hf_home is not None:
+                    os.environ["HF_HOME"] = old_hf_home
+                else:
+                    os.environ.pop("HF_HOME", None)
+
+        # 4. Qwen3-ASR
+        if "qwen_asr" in selected_models:
+            step += 1
+            logger.info(f"\n=== {step}. Qwen3-ASR 模型 ===")
+            qwen_asr_conf = MODELS_TO_DOWNLOAD["qwen_asr"]
+            qwen_asr_path = settings.resolve_path(settings.qwen_asr_model_path)
+            rev_info = f"({qwen_asr_conf['revision'][:7]})" if qwen_asr_conf['revision'] else "(latest)"
+            logger.info(f"下载 Qwen3-ASR {rev_info} -> {qwen_asr_path} ...")
+            try:
+                download_kwargs = {
+                    "repo_id": qwen_asr_conf["repo_id"],
+                    "local_dir": qwen_asr_path,
+                    "local_dir_use_symlinks": False,
+                    "resume_download": True,
+                }
+                if qwen_asr_conf["revision"]:
+                    download_kwargs["revision"] = qwen_asr_conf["revision"]
+                if hf_token:
+                    download_kwargs["token"] = hf_token
+                snapshot_download(**download_kwargs)
+                logger.info("Qwen3-ASR 模型下载完成。")
+            except Exception as e:
+                logger.error(f"Qwen3-ASR 下载失败: {e}")
+
+        # 5. Qwen3-TTS
+        if "qwen_tts" in selected_models:
+            step += 1
+            logger.info(f"\n=== {step}. Qwen3-TTS 模型 ===")
+            qwen_tts_conf = MODELS_TO_DOWNLOAD["qwen_tts"]
+            qwen_tts_path = settings.resolve_path(settings.qwen_tts_model_path)
+            rev_info = f"({qwen_tts_conf['revision'][:7]})" if qwen_tts_conf['revision'] else "(latest)"
+            logger.info(f"下载 Qwen3-TTS {rev_info} -> {qwen_tts_path} ...")
+            try:
+                download_kwargs = {
+                    "repo_id": qwen_tts_conf["repo_id"],
+                    "local_dir": qwen_tts_path,
+                    "local_dir_use_symlinks": False,
+                    "resume_download": True,
+                }
+                if qwen_tts_conf["revision"]:
+                    download_kwargs["revision"] = qwen_tts_conf["revision"]
+                if hf_token:
+                    download_kwargs["token"] = hf_token
+                snapshot_download(**download_kwargs)
+                logger.info("Qwen3-TTS 模型下载完成。")
+            except Exception as e:
+                logger.error(f"Qwen3-TTS 下载失败: {e}")
 
         logger.info("\n下载流程已结束。")
         return model_manager.describe_status()
@@ -705,121 +785,250 @@ def download_models(hf_token: str):
                 os.environ.pop(var, None)
 
 
-do_everything_interface = gr.Interface(
-    fn=_streamify(run_pipeline),
-    inputs=[
-        gr.Textbox(label="根目录（下载/输出）", value=str(settings.root_folder)),
-        gr.Textbox(
+def _pipeline_asr_visibility(asr_method):
+    """全自动页面：根据 ASR 方法返回各组件的可见性。"""
+    is_whisper = asr_method == "whisper"
+    is_qwen = asr_method == "qwen"
+    return (
+        gr.update(visible=is_qwen),   # qwen_asr_model_dir
+        gr.update(visible=is_whisper),  # whisper_model
+        gr.update(visible=is_whisper),  # whisper_device
+        gr.update(visible=is_whisper),  # whisper_cpu_model
+        gr.update(visible=is_whisper),  # whisper_batch_size
+        gr.update(visible=is_qwen),   # qwen_threads
+        gr.update(visible=is_qwen),   # qwen_vad
+        gr.update(visible=is_whisper),  # diarization
+        gr.update(visible=is_whisper),  # min_speakers
+        gr.update(visible=is_whisper),  # max_speakers
+    )
+
+with gr.Blocks(title="全自动") as do_everything_interface:
+    gr.Markdown("## 全自动")
+    with gr.Column():
+        # 基础设置
+        root_folder_input = gr.Textbox(label="根目录（下载/输出）", value=str(settings.root_folder))
+        url_input = gr.Textbox(
             label="视频链接",
             placeholder="支持：视频 / 播放列表 / 频道链接",
             value="https://www.youtube.com/watch?v=4_SH2nfbQZ8",
-        ),
-        gr.Slider(minimum=1, maximum=500, step=1, label="下载视频数量", value=20),
-        gr.Radio(
-            _RESOLUTION_CHOICES,
-            label="下载分辨率",
-            value="1080p",
-        ),
-        gr.Radio(
+        )
+        num_videos_input = gr.Slider(minimum=1, maximum=500, step=1, label="下载视频数量", value=20)
+        resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="下载分辨率", value="1080p")
+
+        # Demucs 设置
+        gr.Markdown("### 人声分离")
+        demucs_model_input = gr.Radio(
             ["htdemucs", "htdemucs_ft", "htdemucs_6s", "hdemucs_mmi", "mdx", "mdx_extra", "mdx_q", "mdx_extra_q", "SIG"],
             label="Demucs 模型",
             value=settings.demucs_model_name,
-        ),
-        gr.Radio(_DEVICE_CHOICES, label="Demucs 运行设备", value=settings.demucs_device),
-        gr.Slider(minimum=0, maximum=10, step=1, label="随机移位次数", value=settings.demucs_shifts),
-        gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method),
-        gr.Textbox(label="Qwen3-ASR 模型路径", value=str(settings.qwen_asr_model_path or "")),
-        gr.Textbox(label="Whisper 模型路径", value=str(settings.whisper_model_path)),
-        gr.Radio(_DEVICE_CHOICES, label="Whisper 运行设备", value=settings.whisper_device),
-        gr.Textbox(label="Whisper CPU 模型路径（可选）", value=str(settings.whisper_cpu_model_path or "")),
-        gr.Slider(minimum=1, maximum=128, step=1, label="Whisper 批大小", value=settings.whisper_batch_size),
-        gr.Slider(minimum=1, maximum=16, step=1, label="Qwen3-ASR 并发线程数", value=settings.qwen_asr_num_threads),
-        gr.Slider(minimum=30, maximum=180, step=10, label="Qwen3-ASR VAD分段时长(秒)", value=settings.qwen_asr_vad_segment_threshold),
-        gr.Checkbox(label="说话人分离", value=True),
-        gr.Number(label="最少说话人数（可选）", value=None, step=1, precision=0),
-        gr.Number(label="最多说话人数（可选）", value=None, step=1, precision=0),
-        gr.Dropdown(
+        )
+        demucs_device_input = gr.Radio(_DEVICE_CHOICES, label="Demucs 运行设备", value=settings.demucs_device)
+        demucs_shifts_input = gr.Slider(minimum=0, maximum=10, step=1, label="随机移位次数", value=settings.demucs_shifts)
+
+        # ASR 设置
+        gr.Markdown("### 语音识别")
+        pipeline_asr_method_input = gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method)
+
+        # Qwen ASR 设置
+        pipeline_qwen_asr_model_dir = gr.Textbox(
+            label="Qwen3-ASR 模型路径",
+            value=str(settings.qwen_asr_model_path or ""),
+            visible=(settings.asr_method == "qwen"),
+        )
+        pipeline_qwen_asr_threads = gr.Slider(
+            minimum=1, maximum=16, step=1,
+            label="Qwen3-ASR 并发线程数",
+            value=settings.qwen_asr_num_threads,
+            visible=(settings.asr_method == "qwen"),
+        )
+        pipeline_qwen_asr_vad = gr.Slider(
+            minimum=30, maximum=180, step=10,
+            label="Qwen3-ASR VAD分段时长(秒)",
+            value=settings.qwen_asr_vad_segment_threshold,
+            visible=(settings.asr_method == "qwen"),
+        )
+
+        # Whisper 设置
+        pipeline_whisper_model = gr.Textbox(
+            label="Whisper 模型路径",
+            value=str(settings.whisper_model_path),
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_whisper_device = gr.Radio(
+            _DEVICE_CHOICES,
+            label="Whisper 运行设备",
+            value=settings.whisper_device,
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_whisper_cpu_model = gr.Textbox(
+            label="Whisper CPU 模型路径（可选）",
+            value=str(settings.whisper_cpu_model_path or ""),
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_whisper_batch_size = gr.Slider(
+            minimum=1, maximum=128, step=1,
+            label="Whisper 批大小",
+            value=settings.whisper_batch_size,
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_diarization = gr.Checkbox(
+            label="说话人分离",
+            value=True,
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_min_speakers = gr.Number(
+            label="最少说话人数（可选）",
+            value=None, step=1, precision=0,
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_max_speakers = gr.Number(
+            label="最多说话人数（可选）",
+            value=None, step=1, precision=0,
+            visible=(settings.asr_method == "whisper"),
+        )
+
+        # 翻译设置
+        gr.Markdown("### 翻译")
+        translation_target_language_input = gr.Dropdown(
             _TARGET_LANGUAGE_CHOICES,
             label="翻译目标语言",
             value=settings.translation_target_language,
-        ),
-        gr.Dropdown(
-            _TRANSLATION_STRATEGY_CHOICES,
-            label="翻译策略",
-            value="guide_parallel",
-        ),
-        gr.Slider(minimum=1, maximum=32, step=1, label="翻译最大并发数", value=4),
-        gr.Slider(minimum=1, maximum=64, step=1, label="翻译分块大小", value=8),
-        gr.Slider(minimum=800, maximum=5000, step=100, label="翻译引导信息最大字符数", value=2500),
-        gr.Dropdown(
-            _TTS_METHOD_CHOICES,
-            label="配音方式",
-            value=settings.tts_method,
-        ),
-        gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size),
-        gr.Checkbox(label="字幕", value=True),
-        gr.Checkbox(label="双语字幕", value=False),
-        gr.Checkbox(
+        )
+        translation_strategy_input = gr.Dropdown(_TRANSLATION_STRATEGY_CHOICES, label="翻译策略", value="guide_parallel")
+        translation_max_concurrency_input = gr.Slider(minimum=1, maximum=32, step=1, label="翻译最大并发数", value=4)
+        translation_chunk_size_input = gr.Slider(minimum=1, maximum=64, step=1, label="翻译分块大小", value=8)
+        translation_guide_max_chars_input = gr.Slider(minimum=800, maximum=5000, step=100, label="翻译引导信息最大字符数", value=2500)
+
+        # TTS 设置
+        gr.Markdown("### 配音")
+        tts_method_input = gr.Dropdown(_TTS_METHOD_CHOICES, label="配音方式", value=settings.tts_method)
+        qwen_tts_batch_size_input = gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size)
+
+        # 视频合成设置
+        gr.Markdown("### 视频合成")
+        subtitles_input = gr.Checkbox(label="字幕", value=True)
+        bilingual_subtitle_input = gr.Checkbox(label="双语字幕", value=False)
+        adaptive_stretch_input = gr.Checkbox(
             label="按段自适应拉伸语音(减少无声)",
             value=False,
             elem_id="adaptive-stretch-checkbox",
             info="启用后下方的加速倍率无效",
-        ),
-        gr.Slider(
-            minimum=0.5,
-            maximum=2,
-            step=0.05,
+        )
+        speed_up_input = gr.Slider(
+            minimum=0.5, maximum=1.8, step=0.05,
             label="加速倍率",
             value=DEFAULT_SPEED_UP,
             elem_id="speed-up-slider",
-        ),
-        gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30),
-        gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU"),
-        gr.Radio(
-            _RESOLUTION_CHOICES,
-            label="输出分辨率",
-            value="1080p",
-        ),
-        gr.Slider(minimum=1, maximum=100, step=1, label="最大并发任务数", value=1),
-        gr.Slider(minimum=1, maximum=10, step=1, label="最大重试次数", value=3),
-        gr.Checkbox(label="自动上传到 B 站", value=False),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="全自动",
-    flagging_mode="never",
-    submit_btn="开始全流程",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        )
+        fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
+        use_nvenc_input = gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU")
+        target_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="输出分辨率", value="1080p")
 
-youtube_interface = gr.Interface(
-    fn=_streamify(download_from_url),
-    inputs=[
-        gr.Textbox(
+        # 其他设置
+        gr.Markdown("### 其他")
+        max_workers_input = gr.Slider(minimum=1, maximum=100, step=1, label="最大并发任务数", value=1)
+        max_retries_input = gr.Slider(minimum=1, maximum=10, step=1, label="最大重试次数", value=3)
+        auto_upload_input = gr.Checkbox(label="自动上传到 B 站", value=False)
+
+        pipeline_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            pipeline_submit_btn = gr.Button("开始全流程", variant="primary")
+            pipeline_stop_btn = gr.Button("停止", variant="stop")
+            pipeline_clear_btn = gr.ClearButton([pipeline_output], value="清空")
+
+    # 动态切换 ASR 设置可见性
+    pipeline_asr_method_input.change(
+        fn=_pipeline_asr_visibility,
+        inputs=[pipeline_asr_method_input],
+        outputs=[
+            pipeline_qwen_asr_model_dir,
+            pipeline_whisper_model,
+            pipeline_whisper_device,
+            pipeline_whisper_cpu_model,
+            pipeline_whisper_batch_size,
+            pipeline_qwen_asr_threads,
+            pipeline_qwen_asr_vad,
+            pipeline_diarization,
+            pipeline_min_speakers,
+            pipeline_max_speakers,
+        ],
+    )
+
+    # 提交按钮
+    _pipeline_event = pipeline_submit_btn.click(
+        fn=_streamify(run_pipeline),
+        inputs=[
+            root_folder_input,
+            url_input,
+            num_videos_input,
+            resolution_input,
+            demucs_model_input,
+            demucs_device_input,
+            demucs_shifts_input,
+            pipeline_asr_method_input,
+            pipeline_qwen_asr_model_dir,
+            pipeline_whisper_model,
+            pipeline_whisper_device,
+            pipeline_whisper_cpu_model,
+            pipeline_whisper_batch_size,
+            pipeline_qwen_asr_threads,
+            pipeline_qwen_asr_vad,
+            pipeline_diarization,
+            pipeline_min_speakers,
+            pipeline_max_speakers,
+            translation_target_language_input,
+            translation_strategy_input,
+            translation_max_concurrency_input,
+            translation_chunk_size_input,
+            translation_guide_max_chars_input,
+            tts_method_input,
+            qwen_tts_batch_size_input,
+            subtitles_input,
+            bilingual_subtitle_input,
+            adaptive_stretch_input,
+            speed_up_input,
+            fps_input,
+            use_nvenc_input,
+            target_resolution_input,
+            max_workers_input,
+            max_retries_input,
+            auto_upload_input,
+        ],
+        outputs=pipeline_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    pipeline_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_pipeline_event])
+
+with gr.Blocks(title="下载视频") as youtube_interface:
+    gr.Markdown("## 下载视频")
+    with gr.Column():
+        youtube_url_input = gr.Textbox(
             label="视频链接",
             placeholder="支持：视频 / 播放列表 / 频道链接",
             value="https://www.bilibili.com/list/1263732318",
-        ),
-        gr.Textbox(label="输出目录", value=str(settings.root_folder)),
-        gr.Radio(
-            _RESOLUTION_CHOICES,
-            label="下载分辨率",
-            value="1080p",
-        ),
-        gr.Slider(minimum=1, maximum=100, step=1, label="下载视频数量", value=5),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="下载视频",
-    flagging_mode="never",
-    submit_btn="开始下载",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        )
+        youtube_folder_input = gr.Textbox(label="输出目录", value=str(settings.root_folder))
+        youtube_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="下载分辨率", value="1080p")
+        youtube_num_input = gr.Slider(minimum=1, maximum=100, step=1, label="下载视频数量", value=5)
 
-demucs_interface = gr.Interface(
-    fn=_streamify(lambda folder, model, device, progress, shifts: _safe_run(
+        youtube_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            youtube_submit_btn = gr.Button("开始下载", variant="primary")
+            youtube_stop_btn = gr.Button("停止", variant="stop")
+            youtube_clear_btn = gr.ClearButton([youtube_output], value="清空")
+
+    _youtube_event = youtube_submit_btn.click(
+        fn=_streamify(download_from_url),
+        inputs=[youtube_url_input, youtube_folder_input, youtube_resolution_input, youtube_num_input],
+        outputs=youtube_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    youtube_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_youtube_event])
+
+def _demucs_wrapper(folder, model, device, progress, shifts):
+    return _safe_run(
         [model_manager._demucs_requirement().name],  # type: ignore[attr-defined]
         separate_all_audio_under_folder,
         folder,
@@ -829,26 +1038,36 @@ demucs_interface = gr.Interface(
         shifts=shifts,
         settings=settings,
         model_manager=model_manager,
-    )),
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-        gr.Radio(
+    )
+
+
+with gr.Blocks(title="人声分离") as demucs_interface:
+    gr.Markdown("## 人声分离")
+    with gr.Column():
+        demucs_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+        demucs_model_input = gr.Radio(
             ["htdemucs", "htdemucs_ft", "htdemucs_6s", "hdemucs_mmi", "mdx", "mdx_extra", "mdx_q", "mdx_extra_q", "SIG"],
             label="Demucs 模型",
             value=settings.demucs_model_name,
-        ),
-        gr.Radio(_DEVICE_CHOICES, label="运行设备", value=settings.demucs_device),
-        gr.Checkbox(label="在控制台显示进度条", value=True),
-        gr.Slider(minimum=0, maximum=10, step=1, label="随机移位次数", value=settings.demucs_shifts),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="人声分离",
-    flagging_mode="never",
-    submit_btn="开始分离",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        )
+        demucs_device_input = gr.Radio(_DEVICE_CHOICES, label="运行设备", value=settings.demucs_device)
+        demucs_progress_input = gr.Checkbox(label="在控制台显示进度条", value=True)
+        demucs_shifts_input = gr.Slider(minimum=0, maximum=10, step=1, label="随机移位次数", value=settings.demucs_shifts)
+
+        demucs_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            demucs_submit_btn = gr.Button("开始分离", variant="primary")
+            demucs_stop_btn = gr.Button("停止", variant="stop")
+            demucs_clear_btn = gr.ClearButton([demucs_output], value="清空")
+
+    _demucs_event = demucs_submit_btn.click(
+        fn=_streamify(_demucs_wrapper),
+        inputs=[demucs_folder_input, demucs_model_input, demucs_device_input, demucs_progress_input, demucs_shifts_input],
+        outputs=demucs_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    demucs_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_demucs_event])
 
 def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device, batch_size, qwen_threads, qwen_vad, diarization, min_speakers, max_speakers):
     # Determine required models based on ASR method
@@ -876,30 +1095,133 @@ def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device
         qwen_asr_vad_segment_threshold=qwen_vad,
     )
 
-whisper_inference = gr.Interface(
-    fn=_streamify(_run_transcribe),
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-        gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method),
-        gr.Textbox(label="Qwen3-ASR 模型路径", value=str(settings.qwen_asr_model_path or "")),
-        gr.Textbox(label="Whisper 模型路径", value=str(settings.whisper_model_path)),
-        gr.Textbox(label="Whisper CPU 模型路径（可选）", value=str(settings.whisper_cpu_model_path or "")),
-        gr.Radio(_DEVICE_CHOICES, label="Whisper 运行设备", value=settings.whisper_device),
-        gr.Slider(minimum=1, maximum=128, step=1, label="Whisper 批大小", value=settings.whisper_batch_size),
-        gr.Slider(minimum=1, maximum=16, step=1, label="Qwen3-ASR 并发线程数", value=settings.qwen_asr_num_threads),
-        gr.Slider(minimum=30, maximum=180, step=10, label="Qwen3-ASR VAD分段时长(秒)", value=settings.qwen_asr_vad_segment_threshold),
-        gr.Checkbox(label="说话人分离", value=True),
-        gr.Number(label="最少说话人数（可选）", value=None, step=1, precision=0),
-        gr.Number(label="最多说话人数（可选）", value=None, step=1, precision=0),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="语音识别",
-    flagging_mode="never",
-    submit_btn="开始识别",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+def _asr_visibility(asr_method):
+    """根据 ASR 方法返回各组件的可见性。"""
+    is_whisper = asr_method == "whisper"
+    is_qwen = asr_method == "qwen"
+    return (
+        gr.update(visible=is_qwen),   # qwen_model_dir
+        gr.update(visible=is_whisper),  # whisper_model
+        gr.update(visible=is_whisper),  # whisper_cpu_model
+        gr.update(visible=is_whisper),  # whisper_device
+        gr.update(visible=is_whisper),  # whisper_batch_size
+        gr.update(visible=is_qwen),   # qwen_threads
+        gr.update(visible=is_qwen),   # qwen_vad
+        gr.update(visible=is_whisper),  # diarization
+        gr.update(visible=is_whisper),  # min_speakers
+        gr.update(visible=is_whisper),  # max_speakers
+    )
+
+with gr.Blocks(title="语音识别") as whisper_inference:
+    gr.Markdown("## 语音识别")
+    with gr.Column():
+        folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+        asr_method_input = gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method)
+
+        # Qwen ASR 设置
+        qwen_model_dir_input = gr.Textbox(
+            label="Qwen3-ASR 模型路径",
+            value=str(settings.qwen_asr_model_path or ""),
+            visible=(settings.asr_method == "qwen"),
+        )
+        qwen_threads_input = gr.Slider(
+            minimum=1, maximum=16, step=1,
+            label="Qwen3-ASR 并发线程数",
+            value=settings.qwen_asr_num_threads,
+            visible=(settings.asr_method == "qwen"),
+        )
+        qwen_vad_input = gr.Slider(
+            minimum=30, maximum=180, step=10,
+            label="Qwen3-ASR VAD分段时长(秒)",
+            value=settings.qwen_asr_vad_segment_threshold,
+            visible=(settings.asr_method == "qwen"),
+        )
+
+        # Whisper 设置
+        whisper_model_input = gr.Textbox(
+            label="Whisper 模型路径",
+            value=str(settings.whisper_model_path),
+            visible=(settings.asr_method == "whisper"),
+        )
+        whisper_cpu_model_input = gr.Textbox(
+            label="Whisper CPU 模型路径（可选）",
+            value=str(settings.whisper_cpu_model_path or ""),
+            visible=(settings.asr_method == "whisper"),
+        )
+        whisper_device_input = gr.Radio(
+            _DEVICE_CHOICES,
+            label="Whisper 运行设备",
+            value=settings.whisper_device,
+            visible=(settings.asr_method == "whisper"),
+        )
+        whisper_batch_size_input = gr.Slider(
+            minimum=1, maximum=128, step=1,
+            label="Whisper 批大小",
+            value=settings.whisper_batch_size,
+            visible=(settings.asr_method == "whisper"),
+        )
+        diarization_input = gr.Checkbox(
+            label="说话人分离",
+            value=True,
+            visible=(settings.asr_method == "whisper"),
+        )
+        min_speakers_input = gr.Number(
+            label="最少说话人数（可选）",
+            value=None, step=1, precision=0,
+            visible=(settings.asr_method == "whisper"),
+        )
+        max_speakers_input = gr.Number(
+            label="最多说话人数（可选）",
+            value=None, step=1, precision=0,
+            visible=(settings.asr_method == "whisper"),
+        )
+
+        output_box = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            submit_btn = gr.Button("开始识别", variant="primary")
+            stop_btn = gr.Button("停止", variant="stop")
+            clear_btn = gr.ClearButton([output_box], value="清空")
+
+    # 动态切换可见性
+    asr_method_input.change(
+        fn=_asr_visibility,
+        inputs=[asr_method_input],
+        outputs=[
+            qwen_model_dir_input,
+            whisper_model_input,
+            whisper_cpu_model_input,
+            whisper_device_input,
+            whisper_batch_size_input,
+            qwen_threads_input,
+            qwen_vad_input,
+            diarization_input,
+            min_speakers_input,
+            max_speakers_input,
+        ],
+    )
+
+    # 提交按钮
+    _transcribe_event = submit_btn.click(
+        fn=_streamify(_run_transcribe),
+        inputs=[
+            folder_input,
+            asr_method_input,
+            qwen_model_dir_input,
+            whisper_model_input,
+            whisper_cpu_model_input,
+            whisper_device_input,
+            whisper_batch_size_input,
+            qwen_threads_input,
+            qwen_vad_input,
+            diarization_input,
+            min_speakers_input,
+            max_speakers_input,
+        ],
+        outputs=output_box,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_transcribe_event])
 
 
 def run_translation(
@@ -921,28 +1243,41 @@ def run_translation(
         return translate_all_transcript_under_folder(folder, target_language, settings=settings)
 
 
-translation_interface = gr.Interface(
-    fn=_streamify(run_translation),
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-        gr.Dropdown(
+with gr.Blocks(title="字幕翻译") as translation_interface:
+    gr.Markdown("## 字幕翻译")
+    with gr.Column():
+        translation_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+        translation_language_input = gr.Dropdown(
             _TARGET_LANGUAGE_CHOICES,
             label="目标语言",
             value=settings.translation_target_language,
-        ),
-        gr.Dropdown(_TRANSLATION_STRATEGY_CHOICES, label="翻译策略", value="guide_parallel"),
-        gr.Slider(minimum=1, maximum=32, step=1, label="翻译最大并发数", value=4),
-        gr.Slider(minimum=1, maximum=64, step=1, label="翻译分块大小", value=8),
-        gr.Slider(minimum=800, maximum=5000, step=100, label="翻译引导信息最大字符数", value=2500),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="字幕翻译",
-    flagging_mode="never",
-    submit_btn="开始翻译",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        )
+        translation_strategy_dropdown = gr.Dropdown(_TRANSLATION_STRATEGY_CHOICES, label="翻译策略", value="guide_parallel")
+        translation_concurrency_input = gr.Slider(minimum=1, maximum=32, step=1, label="翻译最大并发数", value=4)
+        translation_chunk_input = gr.Slider(minimum=1, maximum=64, step=1, label="翻译分块大小", value=8)
+        translation_guide_chars_input = gr.Slider(minimum=800, maximum=5000, step=100, label="翻译引导信息最大字符数", value=2500)
+
+        translation_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            translation_submit_btn = gr.Button("开始翻译", variant="primary")
+            translation_stop_btn = gr.Button("停止", variant="stop")
+            translation_clear_btn = gr.ClearButton([translation_output], value="清空")
+
+    _translation_event = translation_submit_btn.click(
+        fn=_streamify(run_translation),
+        inputs=[
+            translation_folder_input,
+            translation_language_input,
+            translation_strategy_dropdown,
+            translation_concurrency_input,
+            translation_chunk_input,
+            translation_guide_chars_input,
+        ],
+        outputs=translation_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    translation_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_translation_event])
 
 
 def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
@@ -967,25 +1302,27 @@ def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
     )
 
 
-tts_interface = gr.Interface(
-    fn=_streamify(_tts_wrapper),
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-        gr.Dropdown(
-            _TTS_METHOD_CHOICES,
-            label="配音方式",
-            value=settings.tts_method,
-        ),
-        gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="语音合成",
-    flagging_mode="never",
-    submit_btn="开始配音",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+with gr.Blocks(title="语音合成") as tts_interface:
+    gr.Markdown("## 语音合成")
+    with gr.Column():
+        tts_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+        tts_method_dropdown = gr.Dropdown(_TTS_METHOD_CHOICES, label="配音方式", value=settings.tts_method)
+        tts_batch_size_input = gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size)
+
+        tts_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            tts_submit_btn = gr.Button("开始配音", variant="primary")
+            tts_stop_btn = gr.Button("停止", variant="stop")
+            tts_clear_btn = gr.ClearButton([tts_output], value="清空")
+
+    _tts_event = tts_submit_btn.click(
+        fn=_streamify(_tts_wrapper),
+        inputs=[tts_folder_input, tts_method_dropdown, tts_batch_size_input],
+        outputs=tts_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    tts_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_tts_event])
 
 def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_stretch, speed_up, fps, resolution, use_nvenc):
     # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
@@ -994,6 +1331,7 @@ def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_st
         folder,
         subtitles=subtitles,
         bilingual_subtitle=bilingual_subtitle,
+        adaptive_segment_stretch=bool(adaptive_stretch),
         speed_up=effective_speed_up,
         fps=fps,
         resolution=resolution,
@@ -1001,70 +1339,93 @@ def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_st
     )
 
 
-synthesize_video_interface = gr.Interface(
-    fn=_streamify(_synthesize_video_wrapper),
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-        gr.Checkbox(label="字幕", value=True),
-        gr.Checkbox(label="双语字幕", value=False),
-        gr.Checkbox(
+with gr.Blocks(title="视频合成") as synthesize_video_interface:
+    gr.Markdown("## 视频合成")
+    with gr.Column():
+        synth_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+        synth_subtitles_input = gr.Checkbox(label="字幕", value=True)
+        synth_bilingual_input = gr.Checkbox(label="双语字幕", value=False)
+        synth_adaptive_input = gr.Checkbox(
             label="按段自适应拉伸语音(减少无声)",
             value=False,
             elem_id="adaptive-stretch-checkbox-synthesize",
             info="启用后下方的加速倍率无效",
-        ),
-        gr.Slider(
+        )
+        synth_speed_input = gr.Slider(
             minimum=0.5,
-            maximum=2,
+            maximum=1.8,
             step=0.05,
             label="加速倍率",
             value=DEFAULT_SPEED_UP,
             elem_id="speed-up-slider-synthesize",
-        ),
-        gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30),
-        gr.Radio(
-            _RESOLUTION_CHOICES,
-            label="输出分辨率",
-            value="1080p",
-        ),
-        gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU"),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="视频合成",
-    flagging_mode="never",
-    submit_btn="开始合成",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        )
+        synth_fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
+        synth_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="输出分辨率", value="1080p")
+        synth_nvenc_input = gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU")
 
-generate_info_interface = gr.Interface(
-    fn=generate_all_info_under_folder_stream,
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="生成信息",
-    flagging_mode="never",
-    submit_btn="开始生成",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        synth_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
 
-upload_bilibili_interface = gr.Interface(
-    fn=_streamify(upload_all_videos_under_folder),
-    inputs=[
-        gr.Textbox(label="目录", value=str(settings.root_folder)),
-    ],
-    outputs=gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"]),
-    title="上传 B 站",
-    flagging_mode="never",
-    submit_btn="开始上传",
-    stop_btn="停止",
-    clear_btn="清空",
-    **_INTERFACE_STREAM_KWARGS,
-)
+        with gr.Row():
+            synth_submit_btn = gr.Button("开始合成", variant="primary")
+            synth_stop_btn = gr.Button("停止", variant="stop")
+            synth_clear_btn = gr.ClearButton([synth_output], value="清空")
+
+    _synth_event = synth_submit_btn.click(
+        fn=_streamify(_synthesize_video_wrapper),
+        inputs=[
+            synth_folder_input,
+            synth_subtitles_input,
+            synth_bilingual_input,
+            synth_adaptive_input,
+            synth_speed_input,
+            synth_fps_input,
+            synth_resolution_input,
+            synth_nvenc_input,
+        ],
+        outputs=synth_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    synth_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_synth_event])
+
+with gr.Blocks(title="生成信息") as generate_info_interface:
+    gr.Markdown("## 生成信息")
+    with gr.Column():
+        info_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+
+        info_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            info_submit_btn = gr.Button("开始生成", variant="primary")
+            info_stop_btn = gr.Button("停止", variant="stop")
+            info_clear_btn = gr.ClearButton([info_output], value="清空")
+
+    _info_event = info_submit_btn.click(
+        fn=generate_all_info_under_folder_stream,
+        inputs=[info_folder_input],
+        outputs=info_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    info_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_info_event])
+
+with gr.Blocks(title="上传 B 站") as upload_bilibili_interface:
+    gr.Markdown("## 上传 B 站")
+    with gr.Column():
+        upload_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
+
+        upload_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
+
+        with gr.Row():
+            upload_submit_btn = gr.Button("开始上传", variant="primary")
+            upload_stop_btn = gr.Button("停止", variant="stop")
+            upload_clear_btn = gr.ClearButton([upload_output], value="清空")
+
+    _upload_event = upload_submit_btn.click(
+        fn=_streamify(upload_all_videos_under_folder),
+        inputs=[upload_folder_input],
+        outputs=upload_output,
+        **_INTERFACE_STREAM_KWARGS,
+    )
+    upload_stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[_upload_event])
 
 with gr.Blocks(title="模型检查") as model_status_interface:
     gr.Markdown("## 模型检查")
@@ -1077,8 +1438,13 @@ with gr.Blocks(title="模型检查") as model_status_interface:
 
     gr.Markdown("---")
     gr.Markdown("### 模型下载")
-    gr.Markdown("下载 Demucs、Whisper 和 Pyannote 说话人分离模型到本地。Pyannote 需要 HF_TOKEN（需先在 HuggingFace 同意协议）。")
+    gr.Markdown("选择要下载的模型。Pyannote 需要 HF_TOKEN（需先在 HuggingFace 同意协议）。")
 
+    model_select_input = gr.CheckboxGroup(
+        choices=_MODEL_DOWNLOAD_CHOICES,
+        label="选择要下载的模型",
+        value=["demucs", "whisper", "pyannote"],  # 默认选中基础模型
+    )
     hf_token_input = gr.Textbox(
         label="HF_TOKEN（Hugging Face Token）",
         placeholder="hf_xxx...",
@@ -1096,7 +1462,7 @@ with gr.Blocks(title="模型检查") as model_status_interface:
 
     download_btn.click(
         fn=_streamify(download_models),
-        inputs=[hf_token_input],
+        inputs=[model_select_input, hf_token_input],
         outputs=output_box,
         **_INTERFACE_STREAM_KWARGS,
     )
