@@ -165,14 +165,15 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
         assert (job / "translation.json").exists()
         (job / "wavs").mkdir(parents=True, exist_ok=True)
         _write_dummy_wav(job / "wavs" / "0000.wav", seconds=0.2)
-        (job / ".tts_done.json").write_text(json.dumps({"tts_method": "bytedance"}, ensure_ascii=False), encoding="utf-8")
+        # Marker now lives in wavs/
+        (job / "wavs" / ".tts_done.json").write_text(json.dumps({"tts_method": "bytedance"}, ensure_ascii=False), encoding="utf-8")
         return "ok"
 
     def _stub_video_all(_folder: str, **_kwargs) -> str:
         calls.append("video")
         assert (job / "download.mp4").exists()
         assert (job / "translation.json").exists()
-        assert (job / ".tts_done.json").exists()
+        assert (job / "wavs" / ".tts_done.json").exists()
         assert (job / "wavs" / "0000.wav").exists()
         # Simulate the real synthesize_video stage producing the final mixed audio.
         _write_dummy_wav(job / "audio_combined.wav", seconds=0.5)

@@ -1656,8 +1656,9 @@ def generate_wavs(
         pass
 
     # Write a small marker so we can distinguish "valid result" from stale/partial artifacts.
+    # NOTE: marker lives inside wavs/ so deleting that folder also removes the marker.
     try:
-        state_path = os.path.join(folder, ".tts_done.json")
+        state_path = os.path.join(folder, "wavs", ".tts_done.json")
         state = {
             "tts_method": tts_method,
             "speaker_ref_seconds": max_ref_seconds,
@@ -1681,7 +1682,7 @@ def generate_all_wavs_under_folder(
         check_cancelled()
         if 'translation.json' not in files:
             continue
-        done_path = os.path.join(root, ".tts_done.json")
+        done_path = os.path.join(root, "wavs", ".tts_done.json")
         if os.path.exists(done_path):
             try:
                 with open(done_path, "r", encoding="utf-8") as f:

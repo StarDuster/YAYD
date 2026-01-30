@@ -100,7 +100,7 @@ def _audio_combined_needs_rebuild(
         return True
 
     deps = [
-        os.path.join(folder, ".tts_done.json"),
+        os.path.join(folder, "wavs", ".tts_done.json"),
         os.path.join(folder, "audio_instruments.wav"),
     ]
     return _is_stale(audio_combined_path, deps)

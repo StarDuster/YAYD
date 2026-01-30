@@ -373,7 +373,7 @@ def _upload_video_with_biliup(
     # Read model information for description
     translation_model = summary.get("translation_model", "")
     tts_method = ""
-    tts_done_path = os.path.join(folder, ".tts_done.json")
+    tts_done_path = os.path.join(folder, "wavs", ".tts_done.json")
     if os.path.exists(tts_done_path):
         try:
             with open(tts_done_path, "r", encoding="utf-8") as f:

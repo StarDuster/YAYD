@@ -160,7 +160,7 @@ class VideoPipeline:
                     qwen_tts_batch_size=qwen_tts_batch_size,
                 )
 
-                _require_file(os.path.join(folder, ".tts_done.json"), "语音合成标记(.tts_done.json)", min_bytes=2)
+                _require_file(os.path.join(folder, "wavs", ".tts_done.json"), "语音合成标记(wavs/.tts_done.json)", min_bytes=2)
                 _require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
 
                 check_cancelled()

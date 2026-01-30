@@ -93,8 +93,10 @@ def test_generate_all_wavs_requires_marker_not_just_audio_file(tmp_path: Path, m
 
     def _fake_generate_wavs(_folder: str, _tts_method: str = "bytedance", **_kwargs) -> None:
         called["n"] += 1
-        # Simulate success marker creation
-        (Path(_folder) / ".tts_done.json").write_text(json.dumps({"tts_method": _tts_method}), encoding="utf-8")
+        # Simulate success marker creation (marker now lives in wavs/)
+        wavs_dir = Path(_folder) / "wavs"
+        wavs_dir.mkdir(parents=True, exist_ok=True)
+        (wavs_dir / ".tts_done.json").write_text(json.dumps({"tts_method": _tts_method}), encoding="utf-8")
 
     monkeypatch.setattr(ss, "generate_wavs", _fake_generate_wavs)
 
@@ -120,7 +122,8 @@ def test_generate_all_wavs_reruns_when_marker_exists_but_wavs_incomplete(tmp_pat
     _write_dummy_wav(folder / "wavs" / "0000.wav", seconds=0.2)
 
     # Create marker after translation.json so done_mtime >= tr_mtime.
-    (folder / ".tts_done.json").write_text(
+    # Marker now lives in wavs/
+    (folder / "wavs" / ".tts_done.json").write_text(
         json.dumps({"tts_method": "bytedance", "segments": 3}, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -133,7 +136,7 @@ def test_generate_all_wavs_reruns_when_marker_exists_but_wavs_incomplete(tmp_pat
         (job / "wavs").mkdir(parents=True, exist_ok=True)
         _write_dummy_wav(job / "wavs" / "0001.wav", seconds=0.2)
         _write_dummy_wav(job / "wavs" / "0002.wav", seconds=0.2)
-        (job / ".tts_done.json").write_text(
+        (job / "wavs" / ".tts_done.json").write_text(
             json.dumps({"tts_method": _tts_method, "segments": 3}, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -204,8 +207,8 @@ def test_generate_wavs_bytedance_produces_audio_combined_and_srt(tmp_path: Path,
     assert ss.is_valid_wav(str(folder / "wavs" / "0000.wav")) is True
     assert ss.is_valid_wav(str(folder / "wavs" / "0001.wav")) is True
 
-    assert (folder / ".tts_done.json").exists()
-    state = json.loads((folder / ".tts_done.json").read_text(encoding="utf-8"))
+    assert (folder / "wavs" / ".tts_done.json").exists()
+    state = json.loads((folder / "wavs" / ".tts_done.json").read_text(encoding="utf-8"))
     assert state.get("tts_method") == "bytedance"
 
     # Build aligned voice + combined audio (video synthesis stage).
