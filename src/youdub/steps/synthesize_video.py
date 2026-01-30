@@ -10,7 +10,7 @@ import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..utils import save_wav, save_wav_norm
+from ..utils import save_wav, save_wav_norm, valid_file
 
 
 _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
@@ -27,13 +27,6 @@ _VIDEO_META_VERSION = 2
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
 _VIDEO_AUDIO_BITRATE = "128k"
-
-
-def _valid_file(path: str, *, min_bytes: int = 1) -> bool:
-    try:
-        return os.path.exists(path) and os.path.getsize(path) >= int(min_bytes)
-    except Exception:
-        return False
 
 
 def _mtime(path: str) -> float | None:
@@ -140,7 +133,7 @@ def _audio_combined_needs_rebuild(
     sample_rate: int = 24000,
 ) -> bool:
     audio_combined_path = os.path.join(folder, "audio_combined.wav")
-    if not _valid_file(audio_combined_path, min_bytes=44):
+    if not valid_file(audio_combined_path, min_bytes=44):
         return True
 
     meta = _read_audio_combined_meta(folder)
@@ -176,7 +169,7 @@ def _video_up_to_date(
     sample_rate: int = 24000,
 ) -> bool:
     output_video = os.path.join(folder, "video.mp4")
-    if not _valid_file(output_video, min_bytes=1024):
+    if not valid_file(output_video, min_bytes=1024):
         return False
 
     # If audio needs rebuild (e.g. old mixing semantics), video is also stale.

@@ -12,6 +12,7 @@ from loguru import logger
 from .config import Settings
 from .models import ModelCheckError, ModelManager
 from .interrupts import check_cancelled, sleep_with_cancel
+from .utils import require_file, valid_file
 from .steps import (
     download,
     generate_all_info_under_folder,
@@ -79,15 +80,6 @@ class VideoPipeline:
         for retry in range(max_retries):
             check_cancelled()
             try:
-                def _require_file(path: str, desc: str, min_bytes: int = 1) -> None:
-                    if not os.path.exists(path):
-                        raise FileNotFoundError(f"缺少{desc}: {path}")
-                    try:
-                        if os.path.getsize(path) < min_bytes:
-                            raise FileNotFoundError(f"{desc}文件过小/疑似损坏: {path}")
-                    except OSError:
-                        raise FileNotFoundError(f"无法读取{desc}: {path}") from None
-
                 check_cancelled()
                 folder = download.download_single_video(info, root_folder, resolution, settings=self.settings)
                 if folder is None:
@@ -96,7 +88,7 @@ class VideoPipeline:
 
                 logger.info(f"开始处理: {folder}")
 
-                _require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
+                require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
 
                 check_cancelled()
                 try:
@@ -116,8 +108,8 @@ class VideoPipeline:
                     except Exception:
                         pass
 
-                _require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
-                _require_file(os.path.join(folder, "audio_instruments.wav"), "伴奏轨(audio_instruments.wav)", min_bytes=44)
+                require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
+                require_file(os.path.join(folder, "audio_instruments.wav"), "伴奏轨(audio_instruments.wav)", min_bytes=44)
 
                 asr_device = whisper_device or device
                 check_cancelled()
@@ -144,14 +136,14 @@ class VideoPipeline:
                     except Exception:
                         pass
 
-                _require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
+                require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
 
                 check_cancelled()
                 translate.translate_all_transcript_under_folder(
                     folder, target_language=translation_target_language, settings=self.settings
                 )
 
-                _require_file(os.path.join(folder, "translation.json"), "翻译结果(translation.json)", min_bytes=2)
+                require_file(os.path.join(folder, "translation.json"), "翻译结果(translation.json)", min_bytes=2)
 
                 check_cancelled()
                 synthesize_speech.generate_all_wavs_under_folder(
@@ -160,8 +152,8 @@ class VideoPipeline:
                     qwen_tts_batch_size=qwen_tts_batch_size,
                 )
 
-                _require_file(os.path.join(folder, "wavs", ".tts_done.json"), "语音合成标记(wavs/.tts_done.json)", min_bytes=2)
-                _require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
+                require_file(os.path.join(folder, "wavs", ".tts_done.json"), "语音合成标记(wavs/.tts_done.json)", min_bytes=2)
+                require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
 
                 check_cancelled()
                 # 当启用“按段自适应拉伸语音”时，忽略全局加速倍率（避免双重变速）。
@@ -177,7 +169,7 @@ class VideoPipeline:
                     use_nvenc=use_nvenc,
                 )
 
-                _require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
+                require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
 
                 check_cancelled()
                 generate_all_info_under_folder(folder)
@@ -344,12 +336,6 @@ class VideoPipeline:
 
         info_list = list(download.get_info_list_from_url(urls, num_videos, settings=self.settings))
 
-        def _valid_audio_file(path: str, min_bytes: int = 44) -> bool:
-            try:
-                return os.path.exists(path) and os.path.getsize(path) >= int(min_bytes)
-            except OSError:
-                return False
-
         def _valid_transcript(path: str) -> bool:
             try:
                 if not os.path.exists(path) or os.path.getsize(path) < 2:
@@ -378,8 +364,8 @@ class VideoPipeline:
                 need_asr_warmup = True
                 break
 
-            vocals_ok = _valid_audio_file(os.path.join(folder, "audio_vocals.wav"))
-            inst_ok = _valid_audio_file(os.path.join(folder, "audio_instruments.wav"))
+            vocals_ok = valid_file(os.path.join(folder, "audio_vocals.wav"), min_bytes=44)
+            inst_ok = valid_file(os.path.join(folder, "audio_instruments.wav"), min_bytes=44)
             if not (vocals_ok and inst_ok):
                 need_demucs_warmup = True
 

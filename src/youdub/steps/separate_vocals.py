@@ -10,7 +10,7 @@ from loguru import logger
 from ..config import Settings
 from ..models import ModelManager
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..utils import save_wav
+from ..utils import save_wav, valid_file
 
 
 class DemucsDependencyError(RuntimeError):
@@ -293,11 +293,8 @@ def separate_all_audio_under_folder(
     if model_manager is None:
         model_manager = ModelManager(settings)
 
-    def _valid_audio_file(p: str) -> bool:
-        try:
-            return os.path.exists(p) and os.path.getsize(p) >= 44
-        except Exception:
-            return False
+    def _valid_audio(p: str) -> bool:
+        return valid_file(p, min_bytes=44)
 
     # 先扫描一遍：如果没有任何需要处理的文件，就不要加载 Demucs。
     pending: list[str] = []
@@ -307,7 +304,7 @@ def separate_all_audio_under_folder(
             continue
         vocal_output_path = os.path.join(subdir, "audio_vocals.wav")
         instruments_output_path = os.path.join(subdir, "audio_instruments.wav")
-        if _valid_audio_file(vocal_output_path) and _valid_audio_file(instruments_output_path):
+        if _valid_audio(vocal_output_path) and _valid_audio(instruments_output_path):
             continue
         pending.append(subdir)
 
@@ -331,9 +328,9 @@ def separate_all_audio_under_folder(
         instruments_output_path = os.path.join(subdir, "audio_instruments.wav")
 
         # Re-run separation if outputs are missing or look truncated/corrupted (common after interruptions).
-        if not _valid_audio_file(vocal_output_path) or not _valid_audio_file(instruments_output_path):
+        if not _valid_audio(vocal_output_path) or not _valid_audio(instruments_output_path):
             for p in (vocal_output_path, instruments_output_path):
-                if os.path.exists(p) and not _valid_audio_file(p):
+                if os.path.exists(p) and not _valid_audio(p):
                     try:
                         os.remove(p)
                     except Exception:

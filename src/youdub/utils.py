@@ -1,8 +1,28 @@
+import os
 import re
-import string
+
 import numpy as np
 from scipy.io import wavfile
 from loguru import logger
+
+
+def valid_file(path: str, *, min_bytes: int = 1) -> bool:
+    """检查文件是否存在且大小不小于 min_bytes。"""
+    try:
+        return os.path.exists(path) and os.path.getsize(path) >= int(min_bytes)
+    except Exception:
+        return False
+
+
+def require_file(path: str, desc: str, *, min_bytes: int = 1) -> None:
+    """检查文件是否存在且大小不小于 min_bytes，否则抛出 FileNotFoundError。"""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"缺少{desc}: {path}")
+    try:
+        if os.path.getsize(path) < min_bytes:
+            raise FileNotFoundError(f"{desc}文件过小/疑似损坏: {path}")
+    except OSError:
+        raise FileNotFoundError(f"无法读取{desc}: {path}") from None
 
 
 def _peak_abs(wav: np.ndarray) -> float:
@@ -197,13 +217,6 @@ def ensure_torchaudio_backend_compat() -> None:
             setattr(torchaudio, "list_audio_backends", _list_audio_backends)
         except Exception:
             pass
-
-
-def sanitize_filename(filename: str) -> str:
-    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    sanitized_filename = "".join(c for c in filename if c in valid_chars)
-    sanitized_filename = re.sub(" +", " ", sanitized_filename)
-    return sanitized_filename.strip()
 
 
 def save_wav(wav: np.ndarray, output_path: str, sample_rate: int = 24000) -> None:
