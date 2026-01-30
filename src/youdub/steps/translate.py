@@ -442,6 +442,109 @@ def _pack_source_text_chunks(
     return out
 
 
+def _normalize_ws(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _split_source_text_relaxed(text: str) -> list[str]:
+    """
+    A more aggressive splitter for subtitle alignment.
+
+    Why: ASR sometimes produces very long "sentences" without .!?; in bilingual subtitle mode,
+    we still want the source text to be split into smaller readable chunks rather than
+    repeating the full paragraph on every translated sentence.
+    """
+    s = _normalize_ws(text)
+    if not s:
+        return []
+
+    # English punctuation (comma/semicolon/colon) when followed by whitespace.
+    s = re.sub(r"([,;:])\s+(?=\S)", r"\1\n", s)
+    # Chinese comma/semicolon/colon (often no whitespace after).
+    s = re.sub(r"([，；：])([^，；：])", r"\1\n\2", s)
+    # Long dash variants commonly used as clause separator.
+    s = re.sub(r"([—–])\s+(?=\S)", r"\1\n", s)
+
+    out = [x.strip() for x in s.splitlines() if x.strip()]
+    return out or ([s] if s else [])
+
+
+def _merge_parts_to_count(parts: list[str], target_count: int) -> list[str]:
+    if target_count <= 0:
+        return []
+    cleaned = [p.strip() for p in parts if p and p.strip()]
+    if not cleaned:
+        return [""] * target_count
+    if len(cleaned) == target_count:
+        return cleaned
+    if len(cleaned) < target_count:
+        return cleaned + [""] * (target_count - len(cleaned))
+
+    n = len(cleaned)
+    out: list[str] = []
+    for i in range(target_count):
+        a = i * n // target_count
+        b = (i + 1) * n // target_count
+        out.append(" ".join(cleaned[a:b]).strip())
+    return out
+
+
+def _split_words_to_count(text: str, target_count: int) -> list[str]:
+    if target_count <= 0:
+        return []
+    s = _normalize_ws(text)
+    if not s:
+        return [""] * target_count
+    if target_count == 1:
+        return [s]
+
+    words = s.split(" ")
+    if not words:
+        return [""] * target_count
+
+    base = len(words) // target_count
+    rem = len(words) % target_count
+    out: list[str] = []
+    idx = 0
+    for i in range(target_count):
+        size = base + (1 if i < rem else 0)
+        if size <= 0:
+            out.append("")
+            continue
+        out.append(" ".join(words[idx : idx + size]).strip())
+        idx += size
+    return out
+
+
+def _map_source_text_to_translation_count(text: str, target_count: int) -> list[str]:
+    """
+    Best-effort mapping for bilingual subtitles.
+
+    Goal: produce exactly `target_count` source chunks with minimal duplication.
+    """
+    if target_count <= 0:
+        return []
+
+    src_text = _normalize_ws(text)
+    if not src_text:
+        return [""] * target_count
+
+    strict = [x.strip() for x in _split_source_text_into_sentences(src_text) if x and x.strip()]
+    if not strict:
+        strict = [src_text]
+
+    if len(strict) >= target_count:
+        return _merge_parts_to_count(strict, target_count)
+
+    # Not enough strict sentences: try a relaxed split first.
+    relaxed = [x.strip() for x in _split_source_text_relaxed(src_text) if x and x.strip()]
+    if relaxed and len(relaxed) >= target_count:
+        return _merge_parts_to_count(relaxed, target_count)
+
+    # Still not enough: fallback to word-chunking the full text to avoid repeating paragraphs.
+    return _split_words_to_count(src_text, target_count)
+
+
 def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output_data = []
     for item in translation:
@@ -450,36 +553,11 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = item['text']
         speaker = item['speaker']
         translation_text = item.get('translation', '')
-        sentences = split_text_into_sentences(translation_text)
-        src_sentences = _split_source_text_into_sentences(text)
+        sentences = [s.strip() for s in split_text_into_sentences(str(translation_text or "")) if str(s).strip()]
+        if not sentences:
+            sentences = [str(translation_text or "").strip()] if str(translation_text or "").strip() else [""]
 
-        # Determine how to map source sentences to translation sentences.
-        # Only attempt 1:1 mapping if counts are reasonably close; otherwise
-        # keep the full source text for each split translation sentence.
-        mapped_src: list[str] = []
-        if src_sentences and sentences:
-            len_src = len(src_sentences)
-            len_tr = len(sentences)
-            # Allow minor mismatch (±2 or within 30% difference)
-            if len_src == len_tr:
-                mapped_src = src_sentences
-            elif abs(len_src - len_tr) <= 2 or (min(len_src, len_tr) / max(len_src, len_tr) >= 0.7):
-                # Close enough: merge or duplicate to match
-                if len_src > len_tr:
-                    mapped_src = [
-                        src_sentences[i] if i < len_tr - 1 else " ".join(src_sentences[i:])
-                        for i in range(len_tr)
-                    ]
-                else:
-                    # len_src < len_tr but within tolerance: duplicate last src for extras
-                    mapped_src = [
-                        src_sentences[i] if i < len_src else src_sentences[-1]
-                        for i in range(len_tr)
-                    ]
-            else:
-                # Counts differ too much - don't attempt 1:1 mapping.
-                # Keep full original text for each split sentence.
-                mapped_src = [text] * len(sentences)
+        mapped_src = _map_source_text_to_translation_count(str(text or ""), len(sentences))
         
         if not translation_text or not sentences:
             # Handle empty translation

@@ -178,6 +178,42 @@ def test_translate_content_guide_parallel_returns_indexed_translations(monkeypat
 
 
 # --------------------------------------------------------------------------- #
+# Subtitle alignment (postprocess)
+# --------------------------------------------------------------------------- #
+
+
+def test_split_sentences_splits_source_text_when_translation_has_more_sentences():
+    from youdub.steps.translate import split_sentences
+
+    src = (
+        "This is a long run on sentence without punctuation but with enough words "
+        "to be split for subtitle alignment instead of being duplicated as a paragraph"
+    )
+    items = [
+        {
+            "start": 0.0,
+            "end": 9.0,
+            "text": src,
+            "speaker": "SPEAKER_00",
+            "translation": "你好。再见。谢谢。",
+        }
+    ]
+
+    out = split_sentences(items)
+    assert len(out) == 3
+
+    texts = [x["text"] for x in out]
+    # Avoid repeating the full paragraph on each translated sentence.
+    assert len(set(t for t in texts if t)) > 1
+    assert all(len(t) < len(src) for t in texts if t)
+    # Preserve word order when concatenated (best-effort chunking).
+    assert " ".join(texts).split() == src.split()
+    # Timeline boundary must be preserved.
+    assert out[0]["start"] == 0.0
+    assert out[-1]["end"] == 9.0
+
+
+# --------------------------------------------------------------------------- #
 # Translation schema validation
 # --------------------------------------------------------------------------- #
 
