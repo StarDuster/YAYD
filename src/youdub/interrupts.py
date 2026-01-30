@@ -10,6 +10,7 @@ from loguru import logger
 
 _CANCEL_EVENT = threading.Event()
 _CANCEL_REASON: str | None = None
+_SHUTDOWN_EVENT = threading.Event()  # App-level shutdown (Ctrl+C)
 _HANDLERS_INSTALLED = False
 _SIGINT_COUNT = 0
 
@@ -51,6 +52,17 @@ def reset_cancel() -> None:
     _CANCEL_EVENT.clear()
     _CANCEL_REASON = None
     _SIGINT_COUNT = 0
+
+
+def request_shutdown() -> None:
+    """Request app-level shutdown (e.g., Ctrl+C). Also cancels running tasks."""
+    _SHUTDOWN_EVENT.set()
+    request_cancel("shutdown")
+
+
+def shutdown_requested() -> bool:
+    """Check if app-level shutdown was requested (Ctrl+C)."""
+    return _SHUTDOWN_EVENT.is_set()
 
 
 def check_cancelled(reason: str | None = None) -> None:
@@ -133,7 +145,7 @@ def install_signal_handlers() -> None:
                     pass
                 os._exit(130)
 
-        request_cancel(name)
+        request_shutdown()
 
         prev = prev_int if signum == sigint else prev_term
         if callable(prev):

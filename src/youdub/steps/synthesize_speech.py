@@ -912,8 +912,10 @@ class _QwenTtsWorker:
         try:
             buf = getattr(self._proc.stdout, "buffer", None)
             if buf is not None and hasattr(buf, "peek"):
-                # peek() returns bytes already buffered (may be empty)
-                if buf.peek(1):
+                # NOTE:
+                # BufferedReader.peek(n>0) may block while trying to fill from the raw pipe.
+                # We only want to check *already buffered* bytes, so use peek(0) here.
+                if buf.peek(0):
                     return self._proc.stdout.readline()
         except Exception:
             pass

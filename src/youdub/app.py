@@ -14,7 +14,7 @@ from loguru import logger
 
 from youdub.config import Settings
 from youdub.pipeline import VideoPipeline
-from youdub.interrupts import cancel_requested, ignore_signals_during_shutdown, install_signal_handlers, request_cancel, reset_cancel
+from youdub.interrupts import ignore_signals_during_shutdown, install_signal_handlers, request_cancel, request_shutdown, reset_cancel, shutdown_requested
 from youdub.steps import (
     download_from_url,
     generate_all_info_under_folder_stream,
@@ -479,7 +479,6 @@ DEFAULT_USE_NVENC = _default_use_nvenc()
 def _request_stop():
     """Request cancellation of the current task."""
     request_cancel("用户请求停止")
-    return "已请求停止，请等待当前操作完成…"
 
 
 def _safe_run(names, func, *args, **kwargs):
@@ -1007,7 +1006,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
         outputs=pipeline_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    pipeline_stop_btn.click(fn=_request_stop, inputs=None, outputs=pipeline_output, cancels=[_pipeline_event])
+    pipeline_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 with gr.Blocks(title="下载视频") as youtube_interface:
     gr.Markdown("## 下载视频")
@@ -1034,7 +1033,7 @@ with gr.Blocks(title="下载视频") as youtube_interface:
         outputs=youtube_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    youtube_stop_btn.click(fn=_request_stop, inputs=None, outputs=youtube_output, cancels=[_youtube_event])
+    youtube_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 def _demucs_wrapper(folder, model, device, progress, shifts):
     return _safe_run(
@@ -1076,7 +1075,7 @@ with gr.Blocks(title="人声分离") as demucs_interface:
         outputs=demucs_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    demucs_stop_btn.click(fn=_request_stop, inputs=None, outputs=demucs_output, cancels=[_demucs_event])
+    demucs_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device, batch_size, qwen_threads, qwen_vad, diarization, min_speakers, max_speakers):
     # Determine required models based on ASR method
@@ -1230,7 +1229,7 @@ with gr.Blocks(title="语音识别") as whisper_inference:
         outputs=output_box,
         **_INTERFACE_STREAM_KWARGS,
     )
-    stop_btn.click(fn=_request_stop, inputs=None, outputs=output_box, cancels=[_transcribe_event])
+    stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 
 def run_translation(
@@ -1286,7 +1285,7 @@ with gr.Blocks(title="字幕翻译") as translation_interface:
         outputs=translation_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    translation_stop_btn.click(fn=_request_stop, inputs=None, outputs=translation_output, cancels=[_translation_event])
+    translation_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 
 def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
@@ -1331,7 +1330,7 @@ with gr.Blocks(title="语音合成") as tts_interface:
         outputs=tts_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    tts_stop_btn.click(fn=_request_stop, inputs=None, outputs=tts_output, cancels=[_tts_event])
+    tts_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_stretch, speed_up, fps, resolution, use_nvenc):
     # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
@@ -1394,7 +1393,7 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
         outputs=synth_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    synth_stop_btn.click(fn=_request_stop, inputs=None, outputs=synth_output, cancels=[_synth_event])
+    synth_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 with gr.Blocks(title="生成信息") as generate_info_interface:
     gr.Markdown("## 生成信息")
@@ -1414,7 +1413,7 @@ with gr.Blocks(title="生成信息") as generate_info_interface:
         outputs=info_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    info_stop_btn.click(fn=_request_stop, inputs=None, outputs=info_output, cancels=[_info_event])
+    info_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 with gr.Blocks(title="上传 B 站") as upload_bilibili_interface:
     gr.Markdown("## 上传 B 站")
@@ -1434,7 +1433,7 @@ with gr.Blocks(title="上传 B 站") as upload_bilibili_interface:
         outputs=upload_output,
         **_INTERFACE_STREAM_KWARGS,
     )
-    upload_stop_btn.click(fn=_request_stop, inputs=None, outputs=upload_output, cancels=[_upload_event])
+    upload_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 with gr.Blocks(title="模型检查") as model_status_interface:
     gr.Markdown("## 模型检查")
@@ -1521,10 +1520,10 @@ def main():
     try:
         app.launch(**launch_kwargs)
         if launch_kwargs.get("prevent_thread_lock"):
-            while not cancel_requested():
+            while not shutdown_requested():
                 time.sleep(0.2)
     except KeyboardInterrupt:
-        request_cancel("SIGINT")
+        request_shutdown()
         logger.info("收到 Ctrl+C，正在退出…")
     finally:
         # Avoid double Ctrl+C breaking shutdown and causing hard aborts.

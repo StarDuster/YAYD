@@ -293,6 +293,12 @@ def valid_translation(text: str, translation: str) -> tuple[bool, str]:
         # This seems aggressive for short texts.
         # But I will keep original logic for parity.
         return False, 'The translation is too long. Only translate the following sentence and give me the result.'
+    
+    # Check if translation is too short (content lost during translation)
+    # For longer texts (>100 chars), translation should be at least 15% of original length
+    # Chinese is typically shorter than English, but <15% indicates significant content loss
+    if len(text) > 100 and len(translation) < len(text) * 0.15:
+        return False, 'The translation is too short, content may be lost. Please translate the complete sentence.'
 
     forbidden = ['翻译', '这句', '\n', '简体中文', '中文', 'translate', 'Translate', 'translation', 'Translation']
     translation = translation.strip()
@@ -301,6 +307,93 @@ def valid_translation(text: str, translation: str) -> tuple[bool, str]:
             return False, f"Don't include `{word}` in the translation. Only translate the following sentence and give me the result."
 
     return True, translation_postprocess(translation)
+
+
+def _translate_single_text(
+    text: str,
+    history: list[dict],
+    backend: str,
+    fixed_message: list[dict],
+    attempt_limit: int = 30,
+    enable_fallback: bool = True
+) -> str:
+    """
+    翻译单段文本，支持重试和自动拆分降级策略。
+    """
+    
+    # 1. 尝试直接翻译
+    for attempt in range(attempt_limit):
+        check_cancelled()
+        # Keep history short to avoid token limit
+        current_history = history[-30:]
+        messages = fixed_message + current_history + [
+            {'role': 'user', 'content': f'Translate:"{text}"'}
+        ]
+        
+        try:
+            translation = _chat_completion_text(backend, messages).replace("\n", "")
+            logger.info(f'原文: {text}')
+            logger.info(f'译文: {translation}')
+            
+            is_valid, processed = valid_translation(text, translation)
+            if not is_valid:
+                raise _TranslationValidationError(processed)
+            
+            return processed
+
+        except _TranslationValidationError as exc:
+            logger.warning(f"翻译校验失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
+            
+            # 智能降级策略：如果是因为翻译太短（内容丢失），且允许 fallback，尝试拆分翻译
+            if enable_fallback and "too short" in str(exc) and attempt == attempt_limit - 1:
+                parts = _pack_source_text_chunks(_split_source_text_into_sentences(text))
+                if len(parts) > 1:
+                    logger.info(f"检测到内容丢失且重试无效，触发智能分段翻译策略 (分段数: {len(parts)})")
+                    full_translation_parts = []
+                    try:
+                        temp_history = history.copy() # 使用临时 history 以保持分段间的上下文
+                        for sub_text in parts:
+                            # 递归调用，但禁止再次 fallback 防止死循环
+                            sub_translation = _translate_single_text(
+                                sub_text, 
+                                temp_history, 
+                                backend, 
+                                fixed_message, 
+                                attempt_limit=10, # 分段翻译重试次数可以少一点
+                                enable_fallback=False
+                            )
+                            full_translation_parts.append(sub_translation)
+                            # 更新临时上下文，让后续分段知道前面翻译了什么
+                            temp_history.append({'role': 'user', 'content': f'Translate:"{sub_text}"'})
+                            temp_history.append({'role': 'assistant', 'content': sub_translation})
+                        
+                        combined_translation = "".join(full_translation_parts)
+                        logger.info(f"分段翻译合并成功: {combined_translation}")
+                        return combined_translation
+                    except Exception as fallback_exc:
+                        logger.error(f"智能分段翻译失败: {fallback_exc}，将返回最后一次尝试的不完整结果")
+                        # 如果分段翻译也挂了，就抛出最外层的异常或返回最后一次结果
+                        pass
+
+            sleep_with_cancel(0.5)
+            
+        except Exception as exc:
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                raise
+            sleep_with_cancel(delay)
+
+    # 如果所有尝试都失败，抛出异常或返回最后一次结果（由调用者决定是否捕获）
+    # 这里为了保持行为一致，如果还是失败，我们记录错误并返回最后一次的 translation (如果有) 
+    # 但在函数结构中很难获取最后一次 translation，所以重新抛出异常比较合适，
+    # 或者我们约定：如果重试耗尽，返回空字符串或抛出异常。
+    # 为了兼容旧逻辑（记录错误但继续），我们可以抛出一个特定的 MaxRetryError
+    msg = f"达到最大重试次数，翻译失败: {text[:50]}..."
+    logger.error(msg)
+    # 返回最后一次尝试的翻译结果（即使是不完整的），避免程序崩溃，并在日志中标记
+    if 'translation' in locals():
+        return translation
+    return ""
 
 
 def split_text_into_sentences(para: str) -> list[str]:
@@ -325,6 +418,30 @@ def _split_source_text_into_sentences(text: str) -> list[str]:
     return out or ([s] if s else [])
 
 
+def _pack_source_text_chunks(
+    sentences: list[str],
+    *,
+    max_chars: int = 220,
+    min_chars: int = 80,
+) -> list[str]:
+    """Pack sentence list into moderate-sized chunks for fallback translation."""
+    out: list[str] = []
+    buf = ""
+    for s in [x.strip() for x in sentences if x and x.strip()]:
+        if not buf:
+            buf = s
+            continue
+        # Keep chunks reasonably sized: merge short pieces, avoid over-long.
+        if len(buf) < min_chars or len(buf) + 1 + len(s) <= max_chars:
+            buf = f"{buf} {s}".strip()
+        else:
+            out.append(buf)
+            buf = s
+    if buf:
+        out.append(buf)
+    return out
+
+
 def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output_data = []
     for item in translation:
@@ -336,21 +453,33 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
         sentences = split_text_into_sentences(translation_text)
         src_sentences = _split_source_text_into_sentences(text)
 
+        # Determine how to map source sentences to translation sentences.
+        # Only attempt 1:1 mapping if counts are reasonably close; otherwise
+        # keep the full source text for each split translation sentence.
+        mapped_src: list[str] = []
         if src_sentences and sentences:
-            if len(src_sentences) == len(sentences):
+            len_src = len(src_sentences)
+            len_tr = len(sentences)
+            # Allow minor mismatch (±2 or within 30% difference)
+            if len_src == len_tr:
                 mapped_src = src_sentences
-            elif len(src_sentences) > len(sentences):
-                mapped_src = [
-                    src_sentences[i] if i < len(sentences) - 1 else " ".join(src_sentences[i:])
-                    for i in range(len(sentences))
-                ]
+            elif abs(len_src - len_tr) <= 2 or (min(len_src, len_tr) / max(len_src, len_tr) >= 0.7):
+                # Close enough: merge or duplicate to match
+                if len_src > len_tr:
+                    mapped_src = [
+                        src_sentences[i] if i < len_tr - 1 else " ".join(src_sentences[i:])
+                        for i in range(len_tr)
+                    ]
+                else:
+                    # len_src < len_tr but within tolerance: duplicate last src for extras
+                    mapped_src = [
+                        src_sentences[i] if i < len_src else src_sentences[-1]
+                        for i in range(len_tr)
+                    ]
             else:
-                mapped_src = [
-                    src_sentences[i] if i < len(src_sentences) else src_sentences[-1]
-                    for i in range(len(sentences))
-                ]
-        else:
-            mapped_src = []
+                # Counts differ too much - don't attempt 1:1 mapping.
+                # Keep full original text for each split sentence.
+                mapped_src = [text] * len(sentences)
         
         if not translation_text or not sentences:
             # Handle empty translation
@@ -502,12 +631,92 @@ def _build_translation_guide(
     return {"style": [], "glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
 
 
+def _build_global_glossary(
+    summary: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    target_language: str,
+    settings: Settings,
+) -> dict[str, Any]:
+    """
+    通过一次 LLM 调用获得全局术语表（glossary + dont_translate），用于后续所有翻译 prompt。
+    返回格式：{"glossary": {term: translation}, "dont_translate": [...], "notes": "..."}。
+    """
+    max_chars = max(800, _read_int_env("TRANSLATION_GLOSSARY_MAX_CHARS", 3000))
+    max_terms = max(10, min(_read_int_env("TRANSLATION_GLOSSARY_MAX_TERMS", 40), 120))
+
+    transcript_text = " ".join(cast(str, line.get("text", "")) for line in transcript).strip()
+    transcript_text = ensure_transcript_length(transcript_text, max_length=max_chars)
+
+    title = str(summary.get("title", "")).strip()
+    summary_text = str(summary.get("summary", "")).strip()
+
+    system = (
+        f"你是专业译者，目标语言：{target_language}。\n"
+        "请基于给定的视频信息与字幕样本，抽取一份“全局术语表”，用于后续字幕翻译保持一致。\n"
+        "必须只输出 JSON（不要任何额外文本）。\n"
+        'JSON 格式：{"glossary": {"term": "translation"}, "dont_translate": ["..."], "notes": "..."}\n'
+        f"- glossary：只收录重要专有名词/术语/人名/机构/产品名/库名/函数名等，最多 {max_terms} 条\n"
+        "- dont_translate：必须原样保留的 token（如代码/公式/缩写/产品名/专业术语）\n"
+        "- notes：额外注意事项（可为空字符串）\n"
+        "硬性要求：\n"
+        "- 将人工智能的“agent”翻译为“智能体”\n"
+        "- 强化学习中写作 `Q-Learning`（不要写 Queue Learning）\n"
+        "- 变压器指模型时保留 `Transformer`\n"
+        "- 数学公式写成 plain text，不要使用 LaTeX\n"
+    )
+    user = (
+        f'Title: "{title}"\n'
+        f"Summary: {summary_text}\n"
+        f"Transcript sample:\n{transcript_text}\n"
+    )
+
+    backend = _build_chat_backend(settings)
+    try:
+        content = _chat_completion_text(backend, [{"role": "system", "content": system}, {"role": "user", "content": user}])
+        obj = _extract_first_json_object(content)
+
+        # Allow model to wrap glossary in "terminology"/"translations" etc.
+        if isinstance(obj.get("terminology"), dict):
+            obj = cast(dict[str, Any], obj["terminology"])
+
+        glossary_raw = obj.get("glossary", obj)
+        glossary: dict[str, str] = {}
+        if isinstance(glossary_raw, dict):
+            for k, v in glossary_raw.items():
+                ks = str(k).strip()
+                vs = str(v).strip()
+                if ks and vs and ks not in {"dont_translate", "notes"}:
+                    glossary[ks] = vs
+
+        dont_raw = obj.get("dont_translate", [])
+        if isinstance(dont_raw, str):
+            dont_translate = [dont_raw.strip()] if dont_raw.strip() else []
+        elif isinstance(dont_raw, list):
+            dont_translate = [str(x).strip() for x in dont_raw if str(x).strip()]
+        else:
+            dont_translate = []
+
+        notes = str(obj.get("notes", "")).strip()
+
+        # Always enforce core term preferences even if the glossary omitted them.
+        glossary.setdefault("agent", "智能体")
+        glossary.setdefault("Agent", "智能体")
+        dont_translate = list(dict.fromkeys(dont_translate + ["Q-Learning", "Transformer"]))
+
+        return {"glossary": glossary, "dont_translate": dont_translate, "notes": notes}
+    except Exception as exc:
+        logger.warning(f"全局术语表生成失败，回退到最小术语表: {exc}")
+        return {"glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
+
+
 def _translate_single_with_guide(
     settings: Settings,
     info: str,
     guide: dict[str, Any],
     text: str,
     target_language: str,
+    attempt_limit: int = 30,
+    enable_fallback: bool = True,
 ) -> str:
     src = (text or "").strip()
     if not src:
@@ -526,13 +735,12 @@ def _translate_single_with_guide(
         "- 不要加引号\n"
         "- 不要换行\n"
         "- 不要解释\n"
-        "硬性要求：agent -> 智能体；强化学习中写 `Q-Learning`（不要写 Queue Learning）；"
-        "变压器指模型时保留 `Transformer`；数学公式用 plain text，不要 LaTeX。\n"
+        "- 必须完整翻译原文所有信息，不要漏译或省略\n"
     )
     user = src
 
     backend = _get_thread_backend(settings)
-    for attempt in range(30):
+    for attempt in range(attempt_limit):
         check_cancelled()
         try:
             cand = _chat_completion_text(backend, [{"role": "system", "content": system}, {"role": "user", "content": user}])
@@ -542,7 +750,27 @@ def _translate_single_with_guide(
                 raise _TranslationValidationError(processed)
             return processed
         except _TranslationValidationError as exc:
-            logger.warning(f"翻译校验失败 (尝试={attempt + 1}/30): {exc}")
+            logger.warning(f"翻译校验失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
+            if enable_fallback and "too short" in str(exc) and attempt == attempt_limit - 1:
+                parts = _pack_source_text_chunks(_split_source_text_into_sentences(src))
+                if len(parts) > 1:
+                    logger.info(f"检测到内容丢失且重试无效，触发智能分段翻译策略 (分段数: {len(parts)})")
+                    translated_parts: list[str] = []
+                    for p in parts:
+                        translated_parts.append(
+                            _translate_single_with_guide(
+                                settings,
+                                info,
+                                guide,
+                                p,
+                                target_language,
+                                attempt_limit=10,
+                                enable_fallback=False,
+                            )
+                        )
+                    combined = translation_postprocess("".join(translated_parts))
+                    # combined is already per-part validated; return directly.
+                    return combined
             sleep_with_cancel(0.5)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -583,6 +811,7 @@ def _translate_chunk_with_guide(
         "- 不要加引号\n"
         "- 不要换行\n"
         "- 不要解释\n"
+        "- 必须完整翻译原文所有信息，不要漏译或省略\n"
         "硬性要求：agent -> 智能体；强化学习中写 `Q-Learning`（不要写 Queue Learning）；"
         "变压器指模型时保留 `Transformer`；数学公式用 plain text，不要 LaTeX。\n"
     )
@@ -651,12 +880,35 @@ def _translate_content(
     strategy = _normalize_translation_strategy(os.getenv("TRANSLATION_STRATEGY"))
 
     info = f'This is a video called "{summary.get("title", "")}". {summary.get("summary", "")}.'
+    terminology = _build_global_glossary(summary, transcript, target_language, settings=cfg)
+    terminology_json = json.dumps(terminology, ensure_ascii=False)
 
     if strategy == "guide_parallel":
         max_workers = max(1, min(_read_int_env("TRANSLATION_MAX_CONCURRENCY", 4), 32))
         chunk_size = max(1, min(_read_int_env("TRANSLATION_CHUNK_SIZE", 8), 64))
 
         guide = _build_translation_guide(summary, transcript, target_language, settings=cfg)
+        # Merge global terminology into guide (guide wins on conflicts).
+        try:
+            g0 = cast(dict[str, str], terminology.get("glossary", {})) if isinstance(terminology.get("glossary"), dict) else {}
+            g1 = cast(dict[str, str], guide.get("glossary", {})) if isinstance(guide.get("glossary"), dict) else {}
+            merged_glossary = dict(g0)
+            merged_glossary.update(g1)
+            guide["glossary"] = merged_glossary
+
+            dt0 = terminology.get("dont_translate", [])
+            dt1 = guide.get("dont_translate", [])
+            dts: list[str] = []
+            for arr in (dt0, dt1):
+                if isinstance(arr, str) and arr.strip():
+                    dts.append(arr.strip())
+                elif isinstance(arr, list):
+                    dts.extend([str(x).strip() for x in arr if str(x).strip()])
+            guide["dont_translate"] = list(dict.fromkeys(dts))
+            if not str(guide.get("notes", "")).strip() and str(terminology.get("notes", "")).strip():
+                guide["notes"] = str(terminology.get("notes", "")).strip()
+        except Exception:
+            pass
 
         results: list[str] = [""] * len(transcript)
         chunks = [list(range(i, min(i + chunk_size, len(transcript)))) for i in range(0, len(transcript), chunk_size)]
@@ -687,7 +939,7 @@ def _translate_content(
     full_translation: list[str] = []
 
     fixed_message = [
-        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译正确和简洁。注意信达雅。只输出译文，不要包含“翻译”二字。'},
+        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.\n全局术语表（JSON）：{terminology_json}\n翻译要求：下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）。标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化。请严格参考全局术语表：glossary 中出现的术语优先按对应译法，dont_translate 中的 token 必须原样保留。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译完整，不要漏译或省略。注意信达雅。只输出译文，不要包含“翻译”二字。'},
         {'role': 'user', 'content': 'Translate:"Knowledge is power."'},
         {'role': 'assistant', 'content': '知识就是力量。'},
         {'role': 'user', 'content': 'Translate:"To be or not to be, that is the question."'},
@@ -698,35 +950,14 @@ def _translate_content(
     for line in transcript:
         check_cancelled()
         text = cast(str, line.get("text", ""))
-        translation = ""
-        
-        for attempt in range(30):
-            check_cancelled()
-            # Keep history short to avoid token limit
-            current_history = history[-30:]
-            messages = fixed_message + current_history + [
-                {'role': 'user', 'content': f'Translate:"{text}"'}
-            ]
-            
-            try:
-                translation = _chat_completion_text(backend, messages).replace("\n", "")
-                logger.info(f'原文: {text}')
-                logger.info(f'译文: {translation}')
-                
-                is_valid, processed = valid_translation(text, translation)
-                if not is_valid:
-                    raise _TranslationValidationError(processed)
-                
-                translation = processed
-                break
-            except _TranslationValidationError as exc:
-                logger.warning(f"翻译校验失败 (尝试={attempt + 1}/30): {exc}")
-                sleep_with_cancel(0.5)
-            except Exception as exc:
-                delay = _handle_sdk_exception(exc, attempt)
-                if delay is None:
-                    raise
-                sleep_with_cancel(delay)
+        translation = _translate_single_text(
+            text=text,
+            history=cast(list[dict], history),
+            backend=backend,
+            fixed_message=cast(list[dict], fixed_message),
+            attempt_limit=30,
+            enable_fallback=True,
+        )
         
         full_translation.append(translation)
         
