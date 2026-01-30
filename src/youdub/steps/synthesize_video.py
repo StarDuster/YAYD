@@ -1174,11 +1174,11 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    # Subtitle font size: readable across resolutions.
+    # Subtitle font size: readable across resolutions (1080p -> ~49).
     # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
     base_dim = min(width, height)
-    font_size = int(round(base_dim * 0.033))
-    font_size = max(16, min(font_size, 96))
+    font_size = int(round(base_dim * 0.045))
+    font_size = max(18, min(font_size, 120))
     outline = int(round(font_size / 12))
     outline = max(2, outline)
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(width, font_size, en_font_scale=0.75)
