@@ -523,6 +523,33 @@ def _ass_escape_text(text: str) -> str:
     return s
 
 
+def _calc_subtitle_wrap_chars(
+    width: int,
+    font_size: int,
+    *,
+    en_font_scale: float = 0.75,
+) -> tuple[int, int]:
+    """
+    Estimate wrap thresholds (character counts) based on output width and font size.
+
+    Goal: keep the subtitle text inside a "safe" width even for portrait videos.
+    This is a heuristic, not an exact text-measurement.
+    """
+    w = max(1, int(width))
+    fs = max(1, int(font_size))
+    # Horizontal safe margin: ~4% each side, at least 10px.
+    margin_x = max(10, int(round(w * 0.04)))
+    safe_w = max(1, w - 2 * margin_x)
+
+    # Empirical average glyph widths (Arial-ish + libass):
+    # - CJK: close to a square, slightly narrower than font size
+    # - Latin: narrower, plus spaces; tuned to match previous defaults on 16:9
+    max_chars_zh = max(1, int(safe_w / (float(fs) * 0.90)))
+    en_fs = max(1, int(round(float(fs) * float(en_font_scale))))
+    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.65)))
+    return max_chars_zh, max_chars_en
+
+
 def generate_bilingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
@@ -595,6 +622,8 @@ def generate_srt(
     speed_up: float = 1.0, 
     max_line_char: int = 55,
     bilingual_subtitle: bool = False,
+    max_chars_zh: int | None = None,
+    max_chars_en: int | None = None,
 ) -> None:
     # 默认行为：按译文标点再切一遍，避免单条字幕太长。
     # 双语模式：translation.json 已在翻译阶段做过按句切分并尽量对齐原文；这里不再二次切分，
@@ -602,13 +631,15 @@ def generate_srt(
     if not bilingual_subtitle:
         translation = split_text(translation)
 
+    if max_chars_zh is None:
+        max_chars_zh = int(max_line_char)
+    if max_chars_en is None:
+        # Keep roughly consistent with the old defaults: 55 (zh) vs 100 (en).
+        max_chars_en = max(1, int(round(float(max_line_char) * 1.8)))
+
     def _wrap_lines(s: str) -> list[str]:
-        s = str(s or "").strip()
-        if not s:
-            return []
-        lines_count = len(s) // (max_line_char + 1) + 1
-        avg_chars = min(max(1, round(len(s) / lines_count)), max_line_char)
-        return [s[j * avg_chars : (j + 1) * avg_chars] for j in range(lines_count)]
+        wrapped = wrap_text(s, max_chars_zh=int(max_chars_zh), max_chars_en=int(max_chars_en))
+        return [ln for ln in wrapped.splitlines() if ln.strip()]
 
     with open(srt_path, 'w', encoding='utf-8') as f:
         seq = 0
@@ -1112,23 +1143,12 @@ def synthesize_video(
         translation = _ensure_bilingual_source_text(
             folder, translation, adaptive_segment_stretch=adaptive_segment_stretch
         )
-        
-    srt_path = os.path.join(folder, 'subtitles.srt')
-    if subtitles:
-        # 自适应模式下，translation_adaptive.json 已经在输出时间轴，不应再做 speed_up 缩放。
-        subs_speed = 1.0 if adaptive_segment_stretch else speed_up
-        generate_srt(translation, srt_path, subs_speed, bilingual_subtitle=bilingual_subtitle)
 
     check_cancelled()
     aspect_ratio = get_aspect_ratio(input_video)
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    srt_path_filter = srt_path.replace('\\', '/')
-    
-    if os.name == 'nt' and ':' in srt_path_filter:
-        srt_path_filter = srt_path_filter.replace(':', '\\:')
-
     # Subtitle font size: readable across resolutions.
     # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
     base_dim = min(width, height)
@@ -1136,6 +1156,25 @@ def synthesize_video(
     font_size = max(16, min(font_size, 96))
     outline = int(round(font_size / 12))
     outline = max(2, outline)
+    max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(width, font_size, en_font_scale=0.75)
+
+    srt_path = os.path.join(folder, 'subtitles.srt')
+    if subtitles:
+        # 自适应模式下，translation_adaptive.json 已经在输出时间轴，不应再做 speed_up 缩放。
+        subs_speed = 1.0 if adaptive_segment_stretch else speed_up
+        generate_srt(
+            translation,
+            srt_path,
+            subs_speed,
+            bilingual_subtitle=bilingual_subtitle,
+            max_chars_zh=max_chars_zh,
+            max_chars_en=max_chars_en,
+        )
+
+    srt_path_filter = srt_path.replace('\\', '/')
+    
+    if os.name == 'nt' and ':' in srt_path_filter:
+        srt_path_filter = srt_path_filter.replace(':', '\\:')
 
     subtitle_filter = ""
     if subtitles:
@@ -1150,6 +1189,8 @@ def synthesize_video(
                 font_name="Arial",
                 font_size=font_size,
                 outline=outline,
+                max_chars_zh=max_chars_zh,
+                max_chars_en=max_chars_en,
             )
             ass_path_filter = ass_path.replace("\\", "/")
             if os.name == "nt" and ":" in ass_path_filter:
