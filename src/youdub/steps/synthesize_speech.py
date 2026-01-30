@@ -1249,6 +1249,37 @@ def init_TTS(settings: Settings | None = None, model_manager: ModelManager | Non
     return
 
 
+def _segment_wav_path(folder: str, idx: int) -> str:
+    # Keep consistent naming with generate_wavs(): str(i).zfill(4)
+    return os.path.join(folder, "wavs", f"{int(idx):04d}.wav")
+
+
+def _tts_segment_wavs_complete(folder: str, expected_segments: int) -> bool:
+    """
+    Whether we have a complete, valid set of per-segment wav files for stitching.
+
+    This guards against stale/partial artifacts when `.tts_done.json` exists but
+    `wavs/` was truncated (manual cleanup / interrupted runs / disk issues).
+    """
+    n = int(expected_segments)
+    if n <= 0:
+        return False
+    # Quick checks: first/last segment must exist and be valid.
+    first = _segment_wav_path(folder, 0)
+    last = _segment_wav_path(folder, n - 1)
+    if not (os.path.exists(first) and is_valid_wav(first)):
+        return False
+    if not (os.path.exists(last) and is_valid_wav(last)):
+        return False
+
+    # Full check (cheap header parse): ensure no holes/corrupted files.
+    for i in range(n):
+        p = _segment_wav_path(folder, i)
+        if not (os.path.exists(p) and is_valid_wav(p)):
+            return False
+    return True
+
+
 def generate_wavs(
     folder: str,
     tts_method: str = "bytedance",
@@ -1657,11 +1688,27 @@ def generate_all_wavs_under_folder(
                     st = json.load(f)
                 if st.get("tts_method") == tts_method:
                     # If translation.json is newer than marker, re-run to reflect changes.
-                    tr_mtime = os.path.getmtime(os.path.join(root, "translation.json"))
+                    tr_path = os.path.join(root, "translation.json")
+                    tr_mtime = os.path.getmtime(tr_path)
                     done_mtime = os.path.getmtime(done_path)
-                    first_wav = os.path.join(root, "wavs", "0000.wav")
-                    if done_mtime >= tr_mtime and os.path.exists(first_wav) and is_valid_wav(first_wav):
-                        continue
+                    if done_mtime >= tr_mtime:
+                        expected_segments: int | None = None
+                        try:
+                            with open(tr_path, "r", encoding="utf-8") as f:
+                                tr = json.load(f)
+                            if isinstance(tr, list):
+                                expected_segments = int(len(tr))
+                        except Exception:
+                            expected_segments = None
+
+                        if expected_segments is not None and _tts_segment_wavs_complete(root, expected_segments):
+                            continue
+
+                        # Marker exists but wavs are incomplete/corrupted -> resume generation.
+                        logger.info(
+                            f"TTS产物不完整，将继续生成: {root} "
+                            f"(expected_segments={expected_segments if expected_segments is not None else 'unknown'})"
+                        )
             except Exception:
                 # Treat as not done and re-generate.
                 pass

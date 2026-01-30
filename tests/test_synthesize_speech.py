@@ -102,6 +102,48 @@ def test_generate_all_wavs_requires_marker_not_just_audio_file(tmp_path: Path, m
     assert called["n"] == 1
 
 
+def test_generate_all_wavs_reruns_when_marker_exists_but_wavs_incomplete(tmp_path: Path, monkeypatch):
+    import youdub.steps.synthesize_speech as ss
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    transcript = [
+        {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "translation": "一"},
+        {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_00", "translation": "二"},
+        {"start": 2.0, "end": 3.0, "speaker": "SPEAKER_00", "translation": "三"},
+    ]
+    (folder / "translation.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+
+    # Create an incomplete wav cache (only 0000.wav exists).
+    (folder / "wavs").mkdir(parents=True, exist_ok=True)
+    _write_dummy_wav(folder / "wavs" / "0000.wav", seconds=0.2)
+
+    # Create marker after translation.json so done_mtime >= tr_mtime.
+    (folder / ".tts_done.json").write_text(
+        json.dumps({"tts_method": "bytedance", "segments": 3}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    called = {"n": 0}
+
+    def _fake_generate_wavs(_folder: str, _tts_method: str = "bytedance", **_kwargs) -> None:
+        called["n"] += 1
+        job = Path(_folder)
+        (job / "wavs").mkdir(parents=True, exist_ok=True)
+        _write_dummy_wav(job / "wavs" / "0001.wav", seconds=0.2)
+        _write_dummy_wav(job / "wavs" / "0002.wav", seconds=0.2)
+        (job / ".tts_done.json").write_text(
+            json.dumps({"tts_method": _tts_method, "segments": 3}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(ss, "generate_wavs", _fake_generate_wavs)
+
+    ss.generate_all_wavs_under_folder(str(tmp_path), tts_method="bytedance")
+    assert called["n"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # ByteDance TTS integration
 # --------------------------------------------------------------------------- #
