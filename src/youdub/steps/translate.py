@@ -249,7 +249,7 @@ def summarize(
 
 
 def translation_postprocess(result: str) -> str:
-    result = re.sub(r'\（[^)]*\）', '', result)
+    result = re.sub(r'\（[^）]*\）', '', result)
     result = result.replace('...', '，')
     result = re.sub(r'(?<=\d),(?=\d)', '', result)
     result = result.replace('²', '的平方').replace(
@@ -273,12 +273,8 @@ def valid_translation(text: str, translation: str) -> tuple[bool, str]:
         translation = translation.split('：“')[-1].split('”')[0]
         return True, translation_postprocess(translation)
 
-    if '翻译' in translation and '："' in translation and '"' in translation:
-        translation = translation.split('："')[-1].split('"')[0]
-        return True, translation_postprocess(translation)
-
     if '翻译' in translation and ':"' in translation and '"' in translation:
-        translation = translation.split('："')[-1].split('"')[0]
+        translation = translation.split(':"')[-1].split('"')[0]
         return True, translation_postprocess(translation)
 
     if len(text) <= 10:
