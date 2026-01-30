@@ -1125,13 +1125,13 @@ if __name__ == '__main__':
                     print(f'文本规范化: {ndone} 行已完成。',
                           file=sys.stderr, flush=True)
         else:
-            for l in istream:
+            for line in istream:
                 key, text = '', ''
                 if args.format == 'ark':  # KALDI archive, line format: "key text"
-                    cols = l.strip().split(maxsplit=1)
+                    cols = line.strip().split(maxsplit=1)
                     key, text = cols[0], cols[1] if len(cols) == 2 else ''
                 else:
-                    text = l.strip()
+                    text = line.strip()
 
                 if text:
                     text = normalizer(text)
