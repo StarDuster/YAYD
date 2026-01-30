@@ -550,6 +550,38 @@ def _calc_subtitle_wrap_chars(
     return max_chars_zh, max_chars_en
 
 
+def _first_sentence(text: str, *, max_chars: int = 220) -> str:
+    """
+    Return a short preview of source text for bilingual subtitles.
+    We intentionally keep ONLY one sentence to avoid dumping long paragraphs on screen.
+    """
+    raw = str(text or "").replace("\r", "").strip()
+    if not raw:
+        return ""
+
+    # Keep first non-empty line only.
+    first_line = ""
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if ln:
+            first_line = ln
+            break
+    if not first_line:
+        return ""
+
+    s = " ".join(first_line.split()).strip()
+    if not s:
+        return ""
+
+    # Sentence terminators. For '.' we require a following whitespace/end/quote/bracket to avoid decimals.
+    m = re.search(r'(?:[。！？!?]|\.)(?=(?:\s|$|["\')\]]))', s)
+    if m:
+        return s[: m.end()].strip()
+    if len(s) > int(max_chars):
+        return s[: int(max_chars)].rstrip()
+    return s
+
+
 def generate_bilingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
@@ -591,7 +623,7 @@ def generate_bilingual_ass(
     for seg in translation:
         check_cancelled()
         zh_raw = str(seg.get("translation") or "").strip()
-        en_raw = str(seg.get("text") or "").strip()
+        en_raw = _first_sentence(str(seg.get("text") or ""))
         if not zh_raw and not en_raw:
             continue
 
@@ -647,7 +679,7 @@ def generate_srt(
             start = format_timestamp(line['start'] / speed_up)
             end = format_timestamp(line['end'] / speed_up)
             tr_text = str(line.get('translation', '') or '').strip()
-            src_text = str(line.get('text', '') or '').strip()
+            src_text = _first_sentence(str(line.get("text", "") or "")) if bilingual_subtitle else str(line.get('text', '') or '').strip()
 
             if not tr_text and not (bilingual_subtitle and src_text):
                 continue
