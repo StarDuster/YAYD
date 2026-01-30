@@ -71,27 +71,46 @@ def generate_srt(
     translation: list[dict[str, Any]], 
     srt_path: str, 
     speed_up: float = 1.0, 
-    max_line_char: int = 30
+    max_line_char: int = 30,
+    bilingual_subtitle: bool = False,
 ) -> None:
-    translation = split_text(translation)
+    # 默认行为：按译文标点再切一遍，避免单条字幕太长。
+    # 双语模式：translation.json 已在翻译阶段做过按句切分并尽量对齐原文；这里不再二次切分，
+    # 否则会导致原文行重复（同一句英文被拆成多段译文时会重复显示）。
+    if not bilingual_subtitle:
+        translation = split_text(translation)
+
+    def _wrap_lines(s: str) -> list[str]:
+        s = str(s or "").strip()
+        if not s:
+            return []
+        lines_count = len(s) // (max_line_char + 1) + 1
+        avg_chars = min(max(1, round(len(s) / lines_count)), max_line_char)
+        return [s[j * avg_chars : (j + 1) * avg_chars] for j in range(lines_count)]
+
     with open(srt_path, 'w', encoding='utf-8') as f:
-        for i, line in enumerate(translation):
+        seq = 0
+        for line in translation:
             start = format_timestamp(line['start'] / speed_up)
             end = format_timestamp(line['end'] / speed_up)
-            text = line['translation']
+            tr_text = str(line.get('translation', '') or '').strip()
+            src_text = str(line.get('text', '') or '').strip()
 
-            if not text:
+            if not tr_text and not (bilingual_subtitle and src_text):
                 continue
                 
-            lines_count = len(text) // (max_line_char + 1) + 1
-            avg_chars = min(round(len(text) / lines_count), max_line_char)
-            
-            wrapped_text = '\n'.join([
-                text[j * avg_chars : (j + 1) * avg_chars]
-                for j in range(lines_count)
-            ])
-            
-            f.write(f'{i+1}\n')
+            lines: list[str] = []
+            if tr_text:
+                lines.extend(_wrap_lines(tr_text))
+            if bilingual_subtitle and src_text:
+                lines.extend(_wrap_lines(src_text))
+            if not lines:
+                continue
+
+            seq += 1
+            wrapped_text = '\n'.join(lines)
+
+            f.write(f'{seq}\n')
             f.write(f'{start} --> {end}\n')
             f.write(f'{wrapped_text}\n\n')
 
@@ -183,7 +202,6 @@ def _ensure_audio_combined(
     translation_path = os.path.join(folder, 'translation.json')
     translation_adaptive_path = os.path.join(folder, 'translation_adaptive.json')
     video_path = os.path.join(folder, 'download.mp4')
-    audio_vocals_path = os.path.join(folder, 'audio_vocals.wav')
     audio_instruments_path = os.path.join(folder, 'audio_instruments.wav')
     
     # 检查必要文件
@@ -319,35 +337,26 @@ def _ensure_audio_combined(
         save_wav(audio_tts, audio_tts_path, sample_rate=sample_rate)
         logger.info(f"已生成 audio_tts.wav: {audio_tts_path}")
     
-    # 混合TTS音频和背景音乐
+    # 混合 TTS 音频和背景伴奏（不混入原人声，避免回声/双声）
     check_cancelled()
-    if os.path.exists(audio_vocals_path) and os.path.exists(audio_instruments_path):
+    if os.path.exists(audio_instruments_path):
         try:
-            # 加载背景音乐
-            vocals, _ = librosa.load(audio_vocals_path, sr=sample_rate)
+            # 加载伴奏
             instruments, _ = librosa.load(audio_instruments_path, sr=sample_rate)
             
             # 对齐长度（以TTS音频为准）
             tts_len = len(audio_tts)
-            vocals_len = len(vocals)
             instruments_len = len(instruments)
             
-            # 如果背景音乐更长，裁剪；如果更短，循环填充（或补零）
-            if vocals_len < tts_len:
-                # 循环填充
-                repeat_count = (tts_len + vocals_len - 1) // vocals_len
-                vocals = np.tile(vocals, repeat_count)[:tts_len]
-            else:
-                vocals = vocals[:tts_len]
-            
+            # 如果伴奏更长，裁剪；如果更短，循环填充
             if instruments_len < tts_len:
                 repeat_count = (tts_len + instruments_len - 1) // instruments_len
                 instruments = np.tile(instruments, repeat_count)[:tts_len]
             else:
                 instruments = instruments[:tts_len]
             
-            # 混合：TTS + 背景音乐（降低背景音量）
-            audio_combined = audio_tts + 0.3 * vocals + 0.2 * instruments
+            # 混合：TTS + 伴奏（降低伴奏音量）
+            audio_combined = audio_tts + 0.2 * instruments
             
             # 归一化防止削波
             max_val = np.abs(audio_combined).max()
@@ -373,6 +382,7 @@ def synthesize_video(
     resolution: str = '1080p',
     use_nvenc: bool = False,
     adaptive_segment_stretch: bool = False,
+    bilingual_subtitle: bool = False,
 ) -> None:
     check_cancelled()
     output_video = os.path.join(folder, 'video.mp4')
@@ -388,6 +398,7 @@ def synthesize_video(
             pass
     
     translation_path = os.path.join(folder, 'translation.json')
+    translation_adaptive_path = os.path.join(folder, 'translation_adaptive.json')
     input_audio = os.path.join(folder, 'audio_combined.wav')
     input_video = os.path.join(folder, 'download.mp4')
     
@@ -401,16 +412,21 @@ def synthesize_video(
             speed_up=speed_up,
         )
     
-    missing = [p for p in (translation_path, input_audio, input_video) if not os.path.exists(p)]
+    # 字幕在自适应拉伸模式下应优先跟随 translation_adaptive.json（如果存在）
+    translation_path_to_use = translation_path
+    if adaptive_segment_stretch and os.path.exists(translation_adaptive_path):
+        translation_path_to_use = translation_adaptive_path
+
+    missing = [p for p in (translation_path_to_use, input_audio, input_video) if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(f"缺少合成视频所需文件：{missing}")
     
-    with open(translation_path, 'r', encoding='utf-8') as f:
+    with open(translation_path_to_use, 'r', encoding='utf-8') as f:
         translation = json.load(f)
         
     srt_path = os.path.join(folder, 'subtitles.srt')
     
-    generate_srt(translation, srt_path, speed_up)
+    generate_srt(translation, srt_path, speed_up, bilingual_subtitle=bilingual_subtitle)
 
     check_cancelled()
     aspect_ratio = get_aspect_ratio(input_video)
@@ -530,6 +546,7 @@ def synthesize_all_video_under_folder(
         synthesize_video(
             root,
             subtitles=subtitles,
+            bilingual_subtitle=bilingual_subtitle,
             speed_up=speed_up,
             fps=fps,
             resolution=resolution,

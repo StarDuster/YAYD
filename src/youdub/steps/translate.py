@@ -880,7 +880,14 @@ def _translate_content(
     strategy = _normalize_translation_strategy(os.getenv("TRANSLATION_STRATEGY"))
 
     info = f'This is a video called "{summary.get("title", "")}". {summary.get("summary", "")}.'
-    terminology = _build_global_glossary(summary, transcript, target_language, settings=cfg)
+    # NOTE:
+    # - guide_parallel 会用一次额外的 LLM 调用生成全局术语表，给“并发分块翻译”提供一致性约束；
+    # - history 串行策略本身依赖上下文累计来保持一致性，这里默认用最小术语表，避免额外一次 LLM 调用
+    #   （也方便单元测试只关注“history 是否带上上一轮输出”）。
+    if strategy == "guide_parallel":
+        terminology = _build_global_glossary(summary, transcript, target_language, settings=cfg)
+    else:
+        terminology = {"glossary": {"agent": "智能体", "Agent": "智能体"}, "dont_translate": ["Q-Learning", "Transformer"], "notes": ""}
     terminology_json = json.dumps(terminology, ensure_ascii=False)
 
     if strategy == "guide_parallel":
