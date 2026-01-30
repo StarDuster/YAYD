@@ -1104,16 +1104,83 @@ def synthesize_video(
         ]
     
     def _run_ffmpeg(cmd: list[str]) -> None:
-        proc = subprocess.Popen(cmd, start_new_session=True)  # noqa: S603
+        import sys
+        import select
+        import io
+
+        # Capture ffmpeg output and forward to sys.stderr so Gradio can display it
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )  # noqa: S603
         try:
+            # Non-blocking read from stderr (ffmpeg progress goes there)
+            if proc.stderr is not None:
+                import os
+                fd = proc.stderr.fileno()
+                try:
+                    import fcntl
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                except (ImportError, OSError):
+                    pass  # Windows or other platforms without fcntl
+
+            buf = b""
             while True:
                 check_cancelled()
                 rc = proc.poll()
+
+                # Read available stderr output
+                if proc.stderr is not None:
+                    try:
+                        chunk = proc.stderr.read(4096)
+                        if chunk:
+                            buf += chunk
+                            # Process complete lines
+                            while b"\n" in buf or b"\r" in buf:
+                                # Find the first line terminator
+                                idx_n = buf.find(b"\n")
+                                idx_r = buf.find(b"\r")
+                                if idx_n == -1:
+                                    idx = idx_r
+                                elif idx_r == -1:
+                                    idx = idx_n
+                                else:
+                                    idx = min(idx_n, idx_r)
+                                line = buf[:idx]
+                                buf = buf[idx + 1:]
+                                if line.strip():
+                                    try:
+                                        text = line.decode("utf-8", errors="replace").rstrip()
+                                        # Use \r prefix for progress lines (ffmpeg uses carriage return)
+                                        if idx_r != -1 and (idx_n == -1 or idx_r < idx_n):
+                                            sys.stderr.write("\r" + text + "\n")
+                                        else:
+                                            sys.stderr.write(text + "\n")
+                                        sys.stderr.flush()
+                                    except Exception:
+                                        pass
+                    except (BlockingIOError, IOError):
+                        pass  # No data available yet
+
                 if rc is not None:
+                    # Process remaining output
+                    if proc.stderr is not None:
+                        try:
+                            remaining = proc.stderr.read()
+                            if remaining:
+                                for line in remaining.decode("utf-8", errors="replace").splitlines():
+                                    if line.strip():
+                                        sys.stderr.write(line + "\n")
+                                sys.stderr.flush()
+                        except Exception:
+                            pass
                     if rc != 0:
                         raise subprocess.CalledProcessError(rc, cmd)
                     return
-                time.sleep(0.2)
+                time.sleep(0.1)
         except BaseException:
             try:
                 proc.terminate()
