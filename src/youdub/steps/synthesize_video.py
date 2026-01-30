@@ -10,13 +10,23 @@ import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..utils import save_wav
+from ..utils import save_wav, save_wav_norm
 
 
 _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # Bump when the mixing/output semantics change.
 # v2: audio_combined = audio_tts + instruments (NO original vocals mixed in)
-_AUDIO_COMBINED_MIX_VERSION = 2
+# v3: match TTS loudness to original vocals peak + normalize output;
+#     adaptive mode no longer phase-vocoder stretches TTS (avoid “回音/空洞”感)
+_AUDIO_COMBINED_MIX_VERSION = 3
+
+_VIDEO_META_NAME = ".video_synth.json"
+# Bump when the video output semantics/config keys change.
+_VIDEO_META_VERSION = 2
+
+# Video output audio encoding (keep high enough to avoid AAC artifacts).
+_VIDEO_AUDIO_SAMPLE_RATE = 48000
+_VIDEO_AUDIO_BITRATE = "128k"
 
 
 def _valid_file(path: str, *, min_bytes: int = 1) -> bool:
@@ -79,6 +89,50 @@ def _write_audio_combined_meta(
         logger.debug(f"写入 audio_combined 元数据失败: {e}")
 
 
+def _read_video_meta(folder: str) -> dict[str, Any] | None:
+    meta_path = os.path.join(folder, _VIDEO_META_NAME)
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else None
+    except Exception:
+        return None
+
+
+def _write_video_meta(
+    folder: str,
+    *,
+    subtitles: bool,
+    bilingual_subtitle: bool,
+    adaptive_segment_stretch: bool,
+    speed_up: float,
+    fps: int,
+    resolution: str,
+    use_nvenc: bool,
+) -> None:
+    meta_path = os.path.join(folder, _VIDEO_META_NAME)
+    payload: dict[str, Any] = {
+        "version": int(_VIDEO_META_VERSION),
+        "subtitles": bool(subtitles),
+        "bilingual_subtitle": bool(bilingual_subtitle),
+        "adaptive_segment_stretch": bool(adaptive_segment_stretch),
+        "speed_up": float(speed_up),
+        "fps": int(fps),
+        "resolution": str(resolution),
+        "use_nvenc": bool(use_nvenc),
+        "audio_sample_rate": int(_VIDEO_AUDIO_SAMPLE_RATE),
+        "audio_bitrate": str(_VIDEO_AUDIO_BITRATE),
+        "created_at": float(time.time()),
+    }
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.debug(f"写入 video 合成元数据失败: {e}")
+
+
 def _audio_combined_needs_rebuild(
     folder: str,
     *,
@@ -99,9 +153,12 @@ def _audio_combined_needs_rebuild(
     if int(meta.get("sample_rate") or 0) != int(sample_rate):
         return True
 
+    # audio_combined depends on: TTS wavs, translation timeline/text (pauses), instruments, and vocals (for loudness match)
     deps = [
+        os.path.join(folder, "translation.json"),
         os.path.join(folder, "wavs", ".tts_done.json"),
         os.path.join(folder, "audio_instruments.wav"),
+        os.path.join(folder, "audio_vocals.wav"),
     ]
     return _is_stale(audio_combined_path, deps)
 
@@ -110,7 +167,12 @@ def _video_up_to_date(
     folder: str,
     *,
     subtitles: bool,
+    bilingual_subtitle: bool,
     adaptive_segment_stretch: bool,
+    speed_up: float,
+    fps: int,
+    resolution: str,
+    use_nvenc: bool,
     sample_rate: int = 24000,
 ) -> bool:
     output_video = os.path.join(folder, "video.mp4")
@@ -123,7 +185,40 @@ def _video_up_to_date(
     ):
         return False
 
-    deps = [os.path.join(folder, "download.mp4"), os.path.join(folder, "audio_combined.wav")]
+    meta = _read_video_meta(folder)
+    if not meta:
+        return False
+    if int(meta.get("version") or 0) != int(_VIDEO_META_VERSION):
+        return False
+    if bool(meta.get("subtitles")) != bool(subtitles):
+        return False
+    if bool(meta.get("bilingual_subtitle")) != bool(bilingual_subtitle):
+        return False
+    if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
+        return False
+    try:
+        if abs(float(meta.get("speed_up")) - float(speed_up)) > 1e-6:
+            return False
+    except Exception:
+        return False
+    if int(meta.get("fps") or 0) != int(fps):
+        return False
+    if str(meta.get("resolution") or "") != str(resolution):
+        return False
+    if bool(meta.get("use_nvenc")) != bool(use_nvenc):
+        return False
+    if int(meta.get("audio_sample_rate") or 0) != int(_VIDEO_AUDIO_SAMPLE_RATE):
+        return False
+    if str(meta.get("audio_bitrate") or "") != str(_VIDEO_AUDIO_BITRATE):
+        return False
+
+    deps = [
+        os.path.join(folder, "download.mp4"),
+        os.path.join(folder, "audio_combined.wav"),
+        os.path.join(folder, _VIDEO_META_NAME),
+    ]
+    if adaptive_segment_stretch:
+        deps.append(os.path.join(folder, "adaptive_plan.json"))
     if subtitles:
         tr = "translation_adaptive.json" if adaptive_segment_stretch else "translation.json"
         deps.append(os.path.join(folder, tr))
@@ -135,76 +230,171 @@ def _is_cjk_char(ch: str) -> bool:
     return ("\u4e00" <= ch <= "\u9fff") or ("\u3400" <= ch <= "\u4dbf")
 
 
-def _count_cjk_chars(text: str) -> int:
-    s = (text or "").strip()
-    if not s:
-        return 0
-    return sum(1 for ch in s if _is_cjk_char(ch))
+def _read_transcript_segments(folder: str) -> list[tuple[float, float, str]]:
+    """Read transcript.json and return sorted (start,end,text) segments."""
+    transcript_path = os.path.join(folder, "transcript.json")
+    if not os.path.exists(transcript_path):
+        return []
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            raw = json.load(f) or []
+    except Exception:
+        return []
 
-
-_EN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
-
-
-def _count_en_words(text: str) -> int:
-    s = " ".join((text or "").split()).strip()
-    if not s:
-        return 0
-    return len(_EN_WORD_RE.findall(s))
-
-
-def _compute_global_x(
-    translation: list[dict[str, Any]],
-    *,
-    video_duration_s: float,
-    cn_chars_per_min: float = 220.0,
-    en_wpm: float = 130.0,
-    eps: float = 1e-6,
-) -> tuple[float, dict[str, float]]:
-    """Compute the global ratio X = A/B described in the plan.
-
-    - A: original total duration (video_duration_s)
-    - B: predicted Chinese speech duration (scaled from actual English speech duration)
-    """
-    # Counts from translation text.
-    cn_chars = 0
-    en_words = 0
-    for seg in translation:
-        cn_chars += _count_cjk_chars(str(seg.get("translation") or ""))
-        en_words += _count_en_words(str(seg.get("text") or ""))
-
-    cn_est_s = (float(cn_chars) / max(float(cn_chars_per_min), eps)) * 60.0
-    en_est_s = (float(en_words) / max(float(en_wpm), eps)) * 60.0
-
-    # Actual English speech duration (ignoring pauses) from ASR timestamps.
-    a_speech = 0.0
-    for seg in translation:
+    segs: list[tuple[float, float, str]] = []
+    if not isinstance(raw, list):
+        return segs
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
         try:
-            s0 = float(seg.get("start", 0.0) or 0.0)
-            s1 = float(seg.get("end", 0.0) or 0.0)
+            s0 = float(item.get("start", 0.0) or 0.0)
+            s1 = float(item.get("end", 0.0) or 0.0)
         except Exception:
             continue
-        if s1 > s0:
-            a_speech += (s1 - s0)
+        if s1 < s0:
+            s0, s1 = s1, s0
+        text = str(item.get("text", "") or "").strip()
+        if not text:
+            continue
+        segs.append((s0, s1, text))
+    segs.sort(key=lambda x: (x[0], x[1]))
+    return segs
 
-    # Predicted Chinese speech duration, mapped from actual speech duration.
-    ratio = cn_est_s / max(en_est_s, eps) if en_est_s > eps else 1.0
-    b_speech = a_speech * ratio
 
-    x = float(video_duration_s) / max(b_speech, eps) if video_duration_s > 0 else 1.0
-    if not np.isfinite(x) or x <= 0:
-        x = 1.0
+def _best_text_by_overlap(
+    segs: list[tuple[float, float, str]],
+    start: float,
+    end: float,
+    *,
+    cursor: int,
+) -> tuple[str, int]:
+    """Pick the best-matching transcript text for [start,end] and return (text,next_cursor)."""
+    if not segs:
+        return "", cursor
+    s0 = float(start)
+    s1 = float(end)
+    if s1 < s0:
+        s0, s1 = s1, s0
+    mid = (s0 + s1) / 2.0
 
-    stats = {
-        "cn_chars": float(cn_chars),
-        "en_words": float(en_words),
-        "cn_est_s": float(cn_est_s),
-        "en_est_s": float(en_est_s),
-        "a_speech": float(a_speech),
-        "b_speech": float(b_speech),
-        "x": float(x),
-        "video_duration_s": float(video_duration_s),
-    }
-    return x, stats
+    n = len(segs)
+    j = max(0, min(int(cursor), n - 1))
+    # Advance cursor so segs[j].end >= s0 when possible.
+    while j < n and segs[j][1] < s0:
+        j += 1
+    if j >= n:
+        j = n - 1
+
+    # Evaluate a small window around j.
+    best_text = ""
+    best_ov = 0.0
+    best_dist = float("inf")
+    for k in range(max(0, j - 4), min(n, j + 6)):
+        t0, t1, txt = segs[k]
+        ov = max(0.0, min(s1, t1) - max(s0, t0))
+        if ov > best_ov + 1e-9:
+            best_ov = ov
+            best_text = txt
+            best_dist = abs(((t0 + t1) / 2.0) - mid)
+            continue
+        if ov <= 0.0 and best_ov <= 0.0:
+            dist = abs(((t0 + t1) / 2.0) - mid)
+            if dist < best_dist:
+                best_dist = dist
+                best_text = txt
+
+    return best_text, j
+
+
+def _ensure_bilingual_source_text(
+    folder: str,
+    translation: list[dict[str, Any]],
+    *,
+    adaptive_segment_stretch: bool,
+) -> list[dict[str, Any]]:
+    """
+    Bilingual subtitle needs `text` (source) per segment.
+
+    Old translation.json might miss `text`. We best-effort backfill it from transcript.json
+    by time overlap, and write back translation.json so the fix persists.
+    """
+    if not translation:
+        return translation
+
+    def _missing_count(items: list[dict[str, Any]]) -> int:
+        c = 0
+        for it in items:
+            if not str(it.get("text", "") or "").strip():
+                c += 1
+        return c
+
+    # Prefer updating original translation.json (timestamps match transcript.json).
+    src_items: list[dict[str, Any]] | None = None
+    src_path: str | None = None
+    if adaptive_segment_stretch:
+        p = os.path.join(folder, "translation.json")
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    obj = json.load(f) or []
+                if isinstance(obj, list) and obj:
+                    src_items = [x for x in obj if isinstance(x, dict)]
+                    src_path = p
+            except Exception:
+                src_items = None
+                src_path = None
+    else:
+        src_items = translation
+        src_path = os.path.join(folder, "translation.json")
+
+    if not src_items:
+        return translation
+
+    missing_before = _missing_count(src_items)
+    if missing_before <= 0:
+        return translation
+
+    segs = _read_transcript_segments(folder)
+    if not segs:
+        logger.warning("双语字幕需要原文，但缺少 transcript.json 或内容为空；将只显示译文。")
+        return translation
+
+    filled = 0
+    cursor = 0
+    for it in src_items:
+        if str(it.get("text", "") or "").strip():
+            continue
+        try:
+            s0 = float(it.get("start", 0.0) or 0.0)
+            s1 = float(it.get("end", 0.0) or 0.0)
+        except Exception:
+            continue
+        txt, cursor = _best_text_by_overlap(segs, s0, s1, cursor=cursor)
+        if txt:
+            it["text"] = txt
+            filled += 1
+
+    if filled > 0 and src_path and src_items is not translation:
+        # Persist backfill for translation.json so future runs work without this step.
+        try:
+            with open(src_path, "w", encoding="utf-8") as f:
+                json.dump(src_items, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # If we patched translation.json (src_items != translation) in adaptive mode, copy text by index.
+    if adaptive_segment_stretch and src_items is not translation and len(src_items) == len(translation):
+        for i in range(len(translation)):
+            if not str(translation[i].get("text", "") or "").strip():
+                translation[i]["text"] = str(src_items[i].get("text", "") or "")
+
+    missing_after = _missing_count(translation)
+    if missing_after > 0:
+        logger.warning(
+            f"双语字幕原文缺失：已补齐 {filled} 条，但仍有 {missing_after} 条缺少原文，可能是旧文件格式或转写缺失。"
+        )
+    return translation
 
 
 def split_text(
@@ -514,15 +704,15 @@ def _get_video_duration(video_path: str) -> float:
 def _ensure_audio_combined(
     folder: str,
     adaptive_segment_stretch: bool = False,
-    speed_up: float = 1.0,
     sample_rate: int = 24000,
 ) -> None:
     """
     生成 audio_combined.wav 和 audio_tts.wav
     
     如果 adaptive_segment_stretch=True:
-        - 按原视频时间轴做全局缩放，每一段都放到它在缩放后应在的位置
-        - 如果这段TTS更短，就在段内补静音把时长补齐
+        - 不对 TTS 做相位声码器 time_stretch（避免“回音/空洞”感）
+        - 逐段拼接（可裁剪首尾静音）并插入短停顿，生成 translation_adaptive.json
+        - 同时生成 adaptive_plan.json，用于逐段拉伸/裁剪原视频并 concat
     否则:
         - 按顺序拼接TTS音频片段
     """
@@ -534,7 +724,6 @@ def _ensure_audio_combined(
     translation_path = os.path.join(folder, 'translation.json')
     translation_adaptive_path = os.path.join(folder, 'translation_adaptive.json')
     adaptive_plan_path = os.path.join(folder, "adaptive_plan.json")
-    video_path = os.path.join(folder, 'download.mp4')
     audio_instruments_path = os.path.join(folder, 'audio_instruments.wav')
     
     # 检查必要文件
@@ -553,7 +742,10 @@ def _ensure_audio_combined(
         raise ValueError(f"翻译文件为空: {translation_path}")
     
     # 获取所有wav文件
-    wav_files = sorted([f for f in os.listdir(wavs_folder) if f.endswith('.wav')])
+    # 优先只取纯数字命名的分段 wav（避免误把 *_adjusted.wav 等中间文件算进去）
+    wav_files = sorted([f for f in os.listdir(wavs_folder) if re.fullmatch(r"\d+\.wav", f)])
+    if not wav_files:
+        wav_files = sorted([f for f in os.listdir(wavs_folder) if f.endswith(".wav")])
     if not wav_files:
         raise ValueError(f"wavs 目录为空: {wavs_folder}")
     
@@ -565,33 +757,22 @@ def _ensure_audio_combined(
         )
     
     if adaptive_segment_stretch:
-        # 自适应模式（新算法）：
-        # - 计算全局比例 X（基于字数/语速 + 原视频时长）
-        # - 以 ASR 段 start 为锚点，生成 speech + pause 的输出时间轴
-        # - speech 段按规则决定：最多 1.2x 提速音频；仍过长则放慢视频（通过 target_duration 体现）
-        # - pause 段来自相邻 ASR 段 gap（>1s 标记为停顿片段），并插入 0.x 秒微停顿避免过密
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"自适应模式需要视频文件: {video_path}")
-        
-        video_duration_s = _get_video_duration(video_path)
-        if video_duration_s <= 0:
-            raise ValueError(f"无法获取视频时长: {video_path}")
+        # 自适应模式：保持 TTS 基本原速（仅做静音裁剪），通过“拉伸视频段”来匹配每段音频时长。
+        trim_top_db = 35.0
+        gap_default_s = 0.12
+        gap_clause_s = 0.18
+        gap_sentence_s = 0.25
 
-        # Compute global X.
-        x, x_stats = _compute_global_x(translation, video_duration_s=video_duration_s)
-        logger.info(
-            f"自适应缩放：X={x_stats['x']:.3f} "
-            f"(cn_chars={int(x_stats['cn_chars'])}, en_words={int(x_stats['en_words'])}, "
-            f"A_speech={x_stats['a_speech']:.1f}s, B_speech={x_stats['b_speech']:.1f}s, "
-            f"A_total={x_stats['video_duration_s']:.1f}s)"
-        )
-
-        # Planner knobs (per the plan).
-        pause_threshold_s = 1.0
-        inter_pause_s = 0.25
-        max_pause_s = 3.0
-        max_audio_speed = 1.2
-        eps = 1e-6
+        def _gap_seconds_for_text(text: str) -> float:
+            s = (text or "").strip()
+            if not s:
+                return float(gap_default_s)
+            tail = s[-1]
+            if tail in {"。", "！", "？", ".", "!", "?"}:
+                return float(gap_sentence_s)
+            if tail in {"，", "、", ",", ";", "；", ":", "："}:
+                return float(gap_clause_s)
+            return float(gap_default_s)
 
         audio_chunks: list[np.ndarray] = []
         adaptive_translation: list[dict[str, Any]] = []
@@ -617,55 +798,30 @@ def _ensure_audio_combined(
             if not os.path.exists(wav_path):
                 raise FileNotFoundError(f"TTS音频文件不存在: {wav_path}")
 
-            tts_audio, _ = librosa.load(wav_path, sr=sample_rate)
+            tts_audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
             tts_audio = tts_audio.astype(np.float32, copy=False)
-            d_tts = float(len(tts_audio)) / float(sample_rate)
+
+            # Trim leading/trailing silence to reduce dead air from TTS.
+            if tts_audio.size > 0:
+                try:
+                    trimmed, _idx = librosa.effects.trim(tts_audio, top_db=float(trim_top_db))
+                    if trimmed is not None and trimmed.size > 0:
+                        tts_audio = trimmed.astype(np.float32, copy=False)
+                except Exception:
+                    pass
 
             # Original segment duration from ASR timestamps.
             orig_start = float(seg.get("start", 0.0) or 0.0)
             orig_end = float(seg.get("end", 0.0) or 0.0)
             if orig_end < orig_start:
                 orig_start, orig_end = orig_end, orig_start
-            d_orig = max(0.0, orig_end - orig_start)
-            if d_orig <= 0:
-                # Degenerate segment; treat as minimal to avoid div-by-zero.
-                d_orig = 0.001
 
-            d_base = d_orig / max(float(x), eps)
+            # Output speech duration is exactly the (trimmed) TTS segment duration.
+            target_samples = int(tts_audio.shape[0])
+            target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
 
-            # Decide audio speed-up (<=1.2) and target duration.
-            if d_tts > d_base and d_tts > 0:
-                audio_speed = min(float(max_audio_speed), d_tts / max(d_base, eps))
-            else:
-                audio_speed = 1.0
-            target_duration = (d_tts / audio_speed) if d_tts > 0 else d_base
-            target_samples = int(round(target_duration * sample_rate))
-            if target_samples <= 0:
-                target_samples = 1
-            target_duration = float(target_samples) / float(sample_rate)
-
-            # Time-stretch audio if needed, then hard-fit to target_samples.
-            if audio_speed > 1.0001 and len(tts_audio) > 1:
-                try:
-                    stretched = librosa.effects.time_stretch(tts_audio, rate=audio_speed)
-                except Exception as e:
-                    # Fallback: simple resample by interpolation (may shift pitch).
-                    logger.warning(f"librosa time_stretch 失败，改用插值加速: seg={i}, speed={audio_speed:.3f}, err={e}")
-                    new_len = max(1, int(round(len(tts_audio) / audio_speed)))
-                    x_idx = np.linspace(0.0, float(len(tts_audio) - 1), num=new_len, dtype=np.float64)
-                    stretched = np.interp(x_idx, np.arange(len(tts_audio), dtype=np.float64), tts_audio).astype(
-                        np.float32
-                    )
-                tts_out = stretched.astype(np.float32, copy=False)
-            else:
-                tts_out = tts_audio
-
-            if len(tts_out) < target_samples:
-                tts_out = np.pad(tts_out, (0, target_samples - len(tts_out)), mode="constant")
-            elif len(tts_out) > target_samples:
-                tts_out = tts_out[:target_samples]
-
-            audio_chunks.append(tts_out.astype(np.float32, copy=False))
+            if target_samples > 0:
+                audio_chunks.append(tts_audio.astype(np.float32, copy=False))
 
             # Record adaptive translation (speech segments only).
             start_s = float(t_cursor_samples) / float(sample_rate)
@@ -683,7 +839,6 @@ def _ensure_audio_combined(
                     "src_start": round(orig_start, 6),
                     "src_end": round(orig_end, 6),
                     "target_duration": round(target_duration, 6),
-                    "audio_speed": round(float(audio_speed), 6),
                 }
             )
 
@@ -699,17 +854,12 @@ def _ensure_audio_combined(
                 if gap > 0:
                     pause_src_start = orig_end
                     pause_src_end = next_start
-                    pause_duration = max(float(inter_pause_s), gap / max(float(x), eps))
                 else:
                     # Overlap/adjacent: take a small tail slice from the previous segment as "pause" visuals.
                     tail = 0.08
                     pause_src_end = orig_end
                     pause_src_start = max(0.0, pause_src_end - tail)
-                    pause_duration = float(inter_pause_s)
-
-                pause_duration = min(float(max_pause_s), float(pause_duration)) if max_pause_s > 0 else float(
-                    pause_duration
-                )
+                pause_duration = _gap_seconds_for_text(str(seg.get("translation") or ""))
 
                 _append_silence(pause_duration)
                 adaptive_plan.append(
@@ -732,19 +882,15 @@ def _ensure_audio_combined(
         logger.info(f"已生成 translation_adaptive.json: {translation_adaptive_path}")
 
         # Save plan for video composition (speech + pause segments).
-        plan_payload = {"x_stats": x_stats, "segments": adaptive_plan}
+        plan_payload = {"segments": adaptive_plan}
         with open(adaptive_plan_path, "w", encoding="utf-8") as f:
             json.dump(plan_payload, f, ensure_ascii=False, indent=2)
         logger.info(f"已生成 adaptive_plan.json: {adaptive_plan_path}")
-
-        # Save audio_tts.wav.
-        save_wav(audio_tts, audio_tts_path, sample_rate=sample_rate)
-        logger.info(f"已生成 audio_tts.wav (自适应模式): {audio_tts_path}")
         
     else:
         # 非自适应模式：按顺序拼接
-        audio_segments = []
-        for i, wav_file in enumerate(wav_files[:len(translation)]):
+        audio_segments: list[np.ndarray] = []
+        for _i, wav_file in enumerate(wav_files[:len(translation)]):
             check_cancelled()
             wav_path = os.path.join(wavs_folder, wav_file)
             if not os.path.exists(wav_path):
@@ -752,8 +898,8 @@ def _ensure_audio_combined(
                 continue
             
             try:
-                audio, _ = librosa.load(wav_path, sr=sample_rate)
-                audio_segments.append(audio)
+                audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
+                audio_segments.append(audio.astype(np.float32, copy=False))
             except Exception as e:
                 logger.warning(f"加载TTS音频失败 {wav_path}: {e}")
                 continue
@@ -761,37 +907,52 @@ def _ensure_audio_combined(
         if not audio_segments:
             raise ValueError("没有有效的TTS音频片段")
         
-        audio_tts = np.concatenate(audio_segments)
-        save_wav(audio_tts, audio_tts_path, sample_rate=sample_rate)
-        logger.info(f"已生成 audio_tts.wav: {audio_tts_path}")
+        audio_tts = np.concatenate(audio_segments).astype(np.float32, copy=False)
+    
+    # 将 TTS 音量匹配到原始人声峰值（确保音量与原视频相近）
+    audio_vocals_path = os.path.join(folder, 'audio_vocals.wav')
+    if os.path.exists(audio_vocals_path) and len(audio_tts) > 0:
+        try:
+            check_cancelled()
+            vocal_wav, _ = librosa.load(audio_vocals_path, sr=sample_rate, mono=True)
+            tts_peak = max(abs(float(np.max(audio_tts))), abs(float(np.min(audio_tts))))
+            if tts_peak > 0.0 and len(vocal_wav) > 0:
+                vocal_peak = max(abs(float(np.max(vocal_wav))), abs(float(np.min(vocal_wav))))
+                if vocal_peak > 0.0:
+                    scale = vocal_peak / tts_peak
+                    audio_tts = (audio_tts * np.float32(scale)).astype(np.float32)
+                    logger.info(f"TTS 音量已匹配到原始人声峰值 (scale={scale:.3f})")
+        except Exception as e:
+            logger.warning(f"匹配音量失败（将跳过缩放）: {e}")
+
+    # 保存音量匹配后的音轨，便于排查/试听
+    check_cancelled()
+    save_wav(audio_tts.astype(np.float32, copy=False), audio_tts_path, sample_rate=sample_rate)
+    logger.info(f"已生成 audio_tts.wav: {audio_tts_path}")
     
     # 混合 TTS 音频和背景伴奏（不混入原人声，避免回声/双声）
     check_cancelled()
     if os.path.exists(audio_instruments_path):
         try:
             # 加载伴奏
-            instruments, _ = librosa.load(audio_instruments_path, sr=sample_rate)
+            instruments, _ = librosa.load(audio_instruments_path, sr=sample_rate, mono=True)
+            instruments = instruments.astype(np.float32, copy=False)
             
             # 对齐长度（以TTS音频为准）
             tts_len = len(audio_tts)
             instruments_len = len(instruments)
             
-            # 如果伴奏更长，裁剪；如果更短，循环填充
+            # 如果伴奏更长，裁剪；如果更短，补零
             if instruments_len < tts_len:
-                repeat_count = (tts_len + instruments_len - 1) // instruments_len
-                instruments = np.tile(instruments, repeat_count)[:tts_len]
+                instruments = np.pad(instruments, (0, tts_len - instruments_len), mode="constant")
             else:
                 instruments = instruments[:tts_len]
             
-            # 混合：TTS + 伴奏（降低伴奏音量）
-            audio_combined = audio_tts + 0.2 * instruments
+            # 混合：TTS + 伴奏（1:1 混合，与 origin/master 保持一致）
+            audio_combined = (audio_tts + instruments).astype(np.float32, copy=False)
             
-            # 归一化防止削波
-            max_val = np.abs(audio_combined).max()
-            if max_val > 1.0:
-                audio_combined = audio_combined / max_val * 0.95
-            
-            save_wav(audio_combined.astype(np.float32), audio_combined_path, sample_rate=sample_rate)
+            # 归一化到峰值，确保音量正常且不削波
+            save_wav_norm(audio_combined, audio_combined_path, sample_rate=sample_rate)
             _write_audio_combined_meta(
                 folder,
                 adaptive_segment_stretch=adaptive_segment_stretch,
@@ -800,15 +961,15 @@ def _ensure_audio_combined(
             logger.info(f"已生成 audio_combined.wav: {audio_combined_path}")
         except Exception as e:
             logger.warning(f"混合背景音乐失败，仅使用TTS音频: {e}")
-            save_wav(audio_tts, audio_combined_path, sample_rate=sample_rate)
+            save_wav_norm(audio_tts, audio_combined_path, sample_rate=sample_rate)
             _write_audio_combined_meta(
                 folder,
                 adaptive_segment_stretch=adaptive_segment_stretch,
                 sample_rate=sample_rate,
             )
     else:
-        # 没有背景音乐，直接使用TTS音频
-        save_wav(audio_tts, audio_combined_path, sample_rate=sample_rate)
+        # 没有背景音乐，直接使用TTS音频（归一化以确保音量正常）
+        save_wav_norm(audio_tts, audio_combined_path, sample_rate=sample_rate)
         _write_audio_combined_meta(
             folder,
             adaptive_segment_stretch=adaptive_segment_stretch,
@@ -830,12 +991,25 @@ def synthesize_video(
     check_cancelled()
     output_video = os.path.join(folder, "video.mp4")
 
+    # 缓存元数据中的“有效参数”（自适应模式下 speed_up/fps 不参与输出）
+    meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
+    meta_fps = 0 if adaptive_segment_stretch else int(fps)
+
     # NOTE:
     # 以前只要 video.mp4 存在就直接跳过，这会导致：
     # - 混音逻辑修复后仍复用旧的 audio_combined/video（用户听感依旧“回声/双声”）
     # - translation/音频更新后视频也不重建
     # 因此这里改为基于 mtime + 元数据判断是否需要重建。
-    if _video_up_to_date(folder, subtitles=subtitles, adaptive_segment_stretch=adaptive_segment_stretch):
+    if _video_up_to_date(
+        folder,
+        subtitles=subtitles,
+        bilingual_subtitle=bilingual_subtitle,
+        adaptive_segment_stretch=adaptive_segment_stretch,
+        speed_up=meta_speed_up,
+        fps=meta_fps,
+        resolution=resolution,
+        use_nvenc=use_nvenc,
+    ):
         logger.info(f"已合成视频: {folder}")
         return
     if os.path.exists(output_video):
@@ -862,7 +1036,7 @@ def synthesize_video(
         ):
             check_cancelled()
             logger.info("自适应模式所需文件不存在，正在生成 audio/translation_adaptive/plan ...")
-            _ensure_audio_combined(folder, adaptive_segment_stretch=True, speed_up=1.0)
+            _ensure_audio_combined(folder, adaptive_segment_stretch=True)
         # adaptive_plan.json 缺失时，可由 translation.json + translation_adaptive.json 重建（无需重跑TTS）。
         if not os.path.exists(adaptive_plan_path) and os.path.exists(translation_path) and os.path.exists(
             translation_adaptive_path
@@ -922,7 +1096,7 @@ def synthesize_video(
         if _audio_combined_needs_rebuild(folder, adaptive_segment_stretch=False) or not os.path.exists(input_audio):
             check_cancelled()
             logger.info("audio_combined.wav 不存在/已过期，正在生成...")
-            _ensure_audio_combined(folder, adaptive_segment_stretch=False, speed_up=speed_up)
+            _ensure_audio_combined(folder, adaptive_segment_stretch=False)
     
     # 字幕在自适应模式下应跟随 translation_adaptive.json。
     translation_path_to_use = translation_adaptive_path if adaptive_segment_stretch else translation_path
@@ -933,6 +1107,11 @@ def synthesize_video(
     
     with open(translation_path_to_use, 'r', encoding='utf-8') as f:
         translation = json.load(f)
+
+    if subtitles and bilingual_subtitle:
+        translation = _ensure_bilingual_source_text(
+            folder, translation, adaptive_segment_stretch=adaptive_segment_stretch
+        )
         
     srt_path = os.path.join(folder, 'subtitles.srt')
     if subtitles:
@@ -950,9 +1129,11 @@ def synthesize_video(
     if os.name == 'nt' and ':' in srt_path_filter:
         srt_path_filter = srt_path_filter.replace(':', '\\:')
 
-    # Subtitle font size: readable across resolutions (1080p -> ~49).
-    font_size = int(round(height * 0.045))
-    font_size = max(18, min(font_size, 120))
+    # Subtitle font size: readable across resolutions.
+    # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
+    base_dim = min(width, height)
+    font_size = int(round(base_dim * 0.033))
+    font_size = max(16, min(font_size, 96))
     outline = int(round(font_size / 12))
     outline = max(2, outline)
 
@@ -1029,10 +1210,10 @@ def synthesize_video(
         concat_in = "".join(v_labels)
         lines.append(f"{concat_in}concat=n={len(v_labels)}:v=1:a=0[vcat]")
 
+        post_filters: list[str] = [f"scale={width}:{height}"]
         if subtitles:
-            lines.append(f"[vcat]{subtitle_filter}[v]")
-        else:
-            lines.append("[vcat]null[v]")
+            post_filters.append(subtitle_filter)
+        lines.append(f"[vcat]{','.join(post_filters)}[v]")
 
         filter_script_path = os.path.join(folder, "ffmpeg_filter_complex.txt")
         with open(filter_script_path, "w", encoding="utf-8") as f:
@@ -1041,12 +1222,16 @@ def synthesize_video(
         # Legacy global speed-up path (video+audio).
         video_speed_filter = f"setpts=PTS/{speed_up}"
         audio_speed_filter = f"atempo={speed_up}"
+        v_filters: list[str] = [video_speed_filter, f"scale={width}:{height}"]
         if subtitles:
-            filter_complex = f"[0:v]{video_speed_filter},{subtitle_filter}[v];[1:a]{audio_speed_filter}[a]"
-        else:
-            filter_complex = f"[0:v]{video_speed_filter}[v];[1:a]{audio_speed_filter}[a]"
+            v_filters.append(subtitle_filter)
+        filter_complex = f"[0:v]{','.join(v_filters)}[v];[1:a]{audio_speed_filter}[a]"
         
     video_encoder = "h264_nvenc" if use_nvenc else "libx264"
+    # 音频编码参数：上采样到 48kHz 并使用较高码率以保证音质
+    audio_sample_rate = str(_VIDEO_AUDIO_SAMPLE_RATE)
+    audio_bitrate = str(_VIDEO_AUDIO_BITRATE)
+    
     if adaptive_segment_stretch:
         if not filter_script_path:
             raise RuntimeError("adaptive_segment_stretch=True 但未生成滤镜脚本")
@@ -1066,12 +1251,14 @@ def synthesize_video(
             # avoid enforcing a fixed FPS here (which can introduce dup/drop drift).
             "-vsync",
             "vfr",
-            "-s",
-            res_string,
             "-c:v",
             video_encoder,
             "-c:a",
             "aac",
+            "-ar",
+            audio_sample_rate,
+            "-b:a",
+            audio_bitrate,
             "-shortest",
             output_video,
             "-y",
@@ -1093,12 +1280,14 @@ def synthesize_video(
             "[a]",
             "-r",
             str(fps),
-            "-s",
-            res_string,
             "-c:v",
             video_encoder,
             "-c:a",
             "aac",
+            "-ar",
+            audio_sample_rate,
+            "-b:a",
+            audio_bitrate,
             output_video,
             "-y",
         ]
@@ -1199,6 +1388,16 @@ def synthesize_video(
     try:
         _run_ffmpeg(ffmpeg_command)
         sleep_with_cancel(1)
+        _write_video_meta(
+            folder,
+            subtitles=subtitles,
+            bilingual_subtitle=bilingual_subtitle,
+            adaptive_segment_stretch=adaptive_segment_stretch,
+            speed_up=meta_speed_up,
+            fps=meta_fps,
+            resolution=resolution,
+            use_nvenc=use_nvenc,
+        )
         logger.info(f"视频已生成: {output_video}")
     except subprocess.CalledProcessError as e:
         if use_nvenc:
@@ -1212,6 +1411,16 @@ def synthesize_video(
                 pass
             _run_ffmpeg(ffmpeg_command_fallback)
             sleep_with_cancel(1)
+            _write_video_meta(
+                folder,
+                subtitles=subtitles,
+                bilingual_subtitle=bilingual_subtitle,
+                adaptive_segment_stretch=adaptive_segment_stretch,
+                speed_up=meta_speed_up,
+                fps=meta_fps,
+                resolution=resolution,
+                use_nvenc=False,
+            )
             logger.info(f"视频已生成(回退libx264): {output_video}")
             return
 
@@ -1235,7 +1444,18 @@ def synthesize_all_video_under_folder(
         if 'download.mp4' not in files:
             continue
         # Use the same freshness logic as synthesize_video() to avoid stale reuse.
-        if _video_up_to_date(root, subtitles=subtitles, adaptive_segment_stretch=adaptive_segment_stretch):
+        meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
+        meta_fps = 0 if adaptive_segment_stretch else int(fps)
+        if _video_up_to_date(
+            root,
+            subtitles=subtitles,
+            bilingual_subtitle=bilingual_subtitle,
+            adaptive_segment_stretch=adaptive_segment_stretch,
+            speed_up=meta_speed_up,
+            fps=meta_fps,
+            resolution=resolution,
+            use_nvenc=use_nvenc,
+        ):
             continue
         synthesize_video(
             root,
