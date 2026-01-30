@@ -13,6 +13,123 @@ from ..interrupts import check_cancelled, sleep_with_cancel
 from ..utils import save_wav
 
 
+_AUDIO_COMBINED_META_NAME = ".audio_combined.json"
+# Bump when the mixing/output semantics change.
+# v2: audio_combined = audio_tts + instruments (NO original vocals mixed in)
+_AUDIO_COMBINED_MIX_VERSION = 2
+
+
+def _valid_file(path: str, *, min_bytes: int = 1) -> bool:
+    try:
+        return os.path.exists(path) and os.path.getsize(path) >= int(min_bytes)
+    except Exception:
+        return False
+
+
+def _mtime(path: str) -> float | None:
+    try:
+        return float(os.path.getmtime(path))
+    except Exception:
+        return None
+
+
+def _is_stale(target: str, deps: list[str]) -> bool:
+    t = _mtime(target)
+    if t is None:
+        return True
+    for p in deps:
+        mt = _mtime(p)
+        if mt is None:
+            continue
+        if mt > t:
+            return True
+    return False
+
+
+def _read_audio_combined_meta(folder: str) -> dict[str, Any] | None:
+    meta_path = os.path.join(folder, _AUDIO_COMBINED_META_NAME)
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else None
+    except Exception:
+        return None
+
+
+def _write_audio_combined_meta(
+    folder: str,
+    *,
+    adaptive_segment_stretch: bool,
+    sample_rate: int,
+) -> None:
+    meta_path = os.path.join(folder, _AUDIO_COMBINED_META_NAME)
+    payload: dict[str, Any] = {
+        "mix_version": int(_AUDIO_COMBINED_MIX_VERSION),
+        "adaptive_segment_stretch": bool(adaptive_segment_stretch),
+        "sample_rate": int(sample_rate),
+        "created_at": float(time.time()),
+    }
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Best-effort only; don't fail the pipeline due to metadata I/O.
+        logger.debug(f"写入 audio_combined 元数据失败: {e}")
+
+
+def _audio_combined_needs_rebuild(
+    folder: str,
+    *,
+    adaptive_segment_stretch: bool,
+    sample_rate: int = 24000,
+) -> bool:
+    audio_combined_path = os.path.join(folder, "audio_combined.wav")
+    if not _valid_file(audio_combined_path, min_bytes=44):
+        return True
+
+    meta = _read_audio_combined_meta(folder)
+    if not meta:
+        return True
+    if int(meta.get("mix_version") or 0) != int(_AUDIO_COMBINED_MIX_VERSION):
+        return True
+    if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
+        return True
+    if int(meta.get("sample_rate") or 0) != int(sample_rate):
+        return True
+
+    deps = [
+        os.path.join(folder, ".tts_done.json"),
+        os.path.join(folder, "audio_instruments.wav"),
+    ]
+    return _is_stale(audio_combined_path, deps)
+
+
+def _video_up_to_date(
+    folder: str,
+    *,
+    subtitles: bool,
+    adaptive_segment_stretch: bool,
+    sample_rate: int = 24000,
+) -> bool:
+    output_video = os.path.join(folder, "video.mp4")
+    if not _valid_file(output_video, min_bytes=1024):
+        return False
+
+    # If audio needs rebuild (e.g. old mixing semantics), video is also stale.
+    if _audio_combined_needs_rebuild(
+        folder, adaptive_segment_stretch=adaptive_segment_stretch, sample_rate=sample_rate
+    ):
+        return False
+
+    deps = [os.path.join(folder, "download.mp4"), os.path.join(folder, "audio_combined.wav")]
+    if subtitles:
+        tr = "translation_adaptive.json" if adaptive_segment_stretch else "translation.json"
+        deps.append(os.path.join(folder, tr))
+    return not _is_stale(output_video, deps)
+
+
 def _is_cjk_char(ch: str) -> bool:
     # CJK Unified Ideographs + Extension A (covers most Chinese/Japanese Kanji).
     return ("\u4e00" <= ch <= "\u9fff") or ("\u3400" <= ch <= "\u4dbf")
@@ -675,13 +792,28 @@ def _ensure_audio_combined(
                 audio_combined = audio_combined / max_val * 0.95
             
             save_wav(audio_combined.astype(np.float32), audio_combined_path, sample_rate=sample_rate)
+            _write_audio_combined_meta(
+                folder,
+                adaptive_segment_stretch=adaptive_segment_stretch,
+                sample_rate=sample_rate,
+            )
             logger.info(f"已生成 audio_combined.wav: {audio_combined_path}")
         except Exception as e:
             logger.warning(f"混合背景音乐失败，仅使用TTS音频: {e}")
             save_wav(audio_tts, audio_combined_path, sample_rate=sample_rate)
+            _write_audio_combined_meta(
+                folder,
+                adaptive_segment_stretch=adaptive_segment_stretch,
+                sample_rate=sample_rate,
+            )
     else:
         # 没有背景音乐，直接使用TTS音频
         save_wav(audio_tts, audio_combined_path, sample_rate=sample_rate)
+        _write_audio_combined_meta(
+            folder,
+            adaptive_segment_stretch=adaptive_segment_stretch,
+            sample_rate=sample_rate,
+        )
         logger.info(f"已生成 audio_combined.wav (无背景音乐): {audio_combined_path}")
 
 
@@ -696,13 +828,22 @@ def synthesize_video(
     bilingual_subtitle: bool = False,
 ) -> None:
     check_cancelled()
-    output_video = os.path.join(folder, 'video.mp4')
+    output_video = os.path.join(folder, "video.mp4")
+
+    # NOTE:
+    # 以前只要 video.mp4 存在就直接跳过，这会导致：
+    # - 混音逻辑修复后仍复用旧的 audio_combined/video（用户听感依旧“回声/双声”）
+    # - translation/音频更新后视频也不重建
+    # 因此这里改为基于 mtime + 元数据判断是否需要重建。
+    if _video_up_to_date(folder, subtitles=subtitles, adaptive_segment_stretch=adaptive_segment_stretch):
+        logger.info(f"已合成视频: {folder}")
+        return
     if os.path.exists(output_video):
         try:
-            if os.path.getsize(output_video) >= 1024:
-                logger.info(f"已合成视频: {folder}")
-                return
-            logger.warning(f"video.mp4 疑似无效(过小)，将重新生成: {output_video}")
+            if os.path.getsize(output_video) < 1024:
+                logger.warning(f"video.mp4 疑似无效(过小)，将重新生成: {output_video}")
+            else:
+                logger.info(f"video.mp4 已存在但已过期，将重新生成: {output_video}")
             os.remove(output_video)
         except Exception:
             # Best-effort: proceed to re-generate
@@ -716,7 +857,9 @@ def synthesize_video(
     
     # 自适应模式下，除了 audio_combined.wav，还需要 translation_adaptive.json / adaptive_plan.json。
     if adaptive_segment_stretch:
-        if not (os.path.exists(input_audio) and os.path.exists(translation_adaptive_path)):
+        if _audio_combined_needs_rebuild(folder, adaptive_segment_stretch=True) or not (
+            os.path.exists(input_audio) and os.path.exists(translation_adaptive_path)
+        ):
             check_cancelled()
             logger.info("自适应模式所需文件不存在，正在生成 audio/translation_adaptive/plan ...")
             _ensure_audio_combined(folder, adaptive_segment_stretch=True, speed_up=1.0)
@@ -776,9 +919,9 @@ def synthesize_video(
                 logger.warning(f"重建 adaptive_plan.json 失败，将继续尝试直接合成视频: {e}")
     else:
         # 如果 audio_combined.wav 不存在，先生成它
-        if not os.path.exists(input_audio):
+        if _audio_combined_needs_rebuild(folder, adaptive_segment_stretch=False) or not os.path.exists(input_audio):
             check_cancelled()
-            logger.info("audio_combined.wav 不存在，正在生成...")
+            logger.info("audio_combined.wav 不存在/已过期，正在生成...")
             _ensure_audio_combined(folder, adaptive_segment_stretch=False, speed_up=speed_up)
     
     # 字幕在自适应模式下应跟随 translation_adaptive.json。
@@ -1024,13 +1167,9 @@ def synthesize_all_video_under_folder(
         check_cancelled()
         if 'download.mp4' not in files:
             continue
-        video_path = os.path.join(root, 'video.mp4')
-        try:
-            if os.path.exists(video_path) and os.path.getsize(video_path) >= 1024:
-                continue
-        except Exception:
-            # Treat as not present/invalid and re-synthesize.
-            pass
+        # Use the same freshness logic as synthesize_video() to avoid stale reuse.
+        if _video_up_to_date(root, subtitles=subtitles, adaptive_segment_stretch=adaptive_segment_stretch):
+            continue
         synthesize_video(
             root,
             subtitles=subtitles,
