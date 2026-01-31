@@ -31,3 +31,12 @@ def test_subtitle_style_params_1080p_not_tiny():
     # Portrait outputs should use the shorter edge as base_dim, thus same font size for 1080p.
     font_size2, *_rest = sv._calc_subtitle_style_params(1080, 1920)
     assert font_size2 == font_size
+
+
+def test_subtitle_style_params_4k_not_huge():
+    import youdub.steps.synthesize_video as sv
+
+    # Guard against regressions that make subtitles excessively large on 4K outputs.
+    # (e.g. accidentally using max(width,height) or an overly aggressive scale factor)
+    font_size, *_rest = sv._calc_subtitle_style_params(3840, 2160)
+    assert font_size < 100
