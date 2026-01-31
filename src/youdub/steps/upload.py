@@ -252,7 +252,13 @@ def _upload_video_with_biliapi(
     proxy: Optional[str],
     upload_cdn: Optional[str],
     cookie_path: Path,
-) -> bool:
+) -> tuple[bool, bool]:
+    """Upload video to Bilibili.
+
+    Returns:
+        (success, actually_uploaded): success 表示操作成功（包括跳过已上传的），
+        actually_uploaded 表示是否真正执行了上传（用于决定是否需要等待间隔）。
+    """
     check_cancelled()
 
     folder_path = Path(folder).expanduser()
@@ -266,27 +272,30 @@ def _upload_video_with_biliapi(
         try:
             submission_result = _read_json(submission_result_path)
             if _is_uploaded(submission_result):
-                logger.info("视频已上传")
-                return True
+                logger.info("视频已上传，跳过")
+                return (True, False)  # success but not actually uploaded
         except Exception:
             pass
 
     video_path = folder_path / "video.mp4"
-    cover_path = folder_path / "video.png"
+    # 封面优先级：download.webp > video.png
+    cover_path = folder_path / "download.webp"
+    if not cover_path.exists():
+        cover_path = folder_path / "video.png"
     if not video_path.exists():
         logger.warning(f"未找到视频文件: {video_path}")
-        return False
+        return (False, False)
 
     summary_path = folder_path / "summary.json"
     if not summary_path.exists():
         logger.warning(f"未找到摘要文件: {summary_path}")
-        return False
+        return (False, False)
     summary = _read_json(summary_path)
 
     info_path = folder_path / "download.info.json"
     if not info_path.exists():
         logger.warning(f"未找到信息文件: {info_path}")
-        return False
+        return (False, False)
     data = _read_json(info_path)
 
     summary_title = str(summary.get("title", "Untitled")).replace("视频标题：", "").strip()
@@ -360,10 +369,10 @@ def _upload_video_with_biliapi(
                 "请先安装 Node 依赖（cd scripts/biliapi && npm install），"
                 "再运行 `node scripts/biliapi/login.mjs` 登录生成 cookies.json，然后设置 BILI_COOKIE_PATH。"
             )
-            return False
+            return (False, False)
     except Exception as exc:  # noqa: BLE001
         logger.error(f"访问cookie文件失败 {cookie_path}: {exc}")
-        return False
+        return (False, False)
 
     tid = _bili_tid()
     source = webpage_url.strip()
@@ -401,7 +410,7 @@ def _upload_video_with_biliapi(
     result = _run_biliapi_upload(upload_payload)
     if result.get("ok") is not True:
         logger.error(f"biliAPI 上传失败: {result.get('error')}")
-        return False
+        return (False, False)
 
     # write a success marker compatible with pipeline._already_uploaded()
     marker_payload: dict[str, object] = {
@@ -421,7 +430,7 @@ def _upload_video_with_biliapi(
         json.dump(_success_marker(marker_payload), f, ensure_ascii=False, indent=4)
 
     logger.info("上传成功")
-    return True
+    return (True, True)
 
 
 def upload_video(folder: str) -> bool:
@@ -440,7 +449,8 @@ def upload_video(folder: str) -> bool:
             "请先运行 `node scripts/biliapi/login.mjs` 登录生成 cookies.json，再设置 BILI_COOKIE_PATH。"
         )
         return False
-    return _upload_video_with_biliapi(folder, proxy, upload_cdn, cookie_path)
+    success, _ = _upload_video_with_biliapi(folder, proxy, upload_cdn, cookie_path)
+    return success
 
 
 def upload_all_videos_under_folder(folder: str) -> str:
@@ -470,16 +480,18 @@ def upload_all_videos_under_folder(folder: str) -> str:
         )
 
     count = 0
-    first_upload = True
+    need_wait = False  # 只有真正上传后才需要等待
     for root, _, files in os.walk(folder):
         check_cancelled()
         if "video.mp4" in files:
-            if not first_upload and upload_interval > 0:
+            if need_wait and upload_interval > 0:
                 logger.info(f"等待 {upload_interval} 秒后上传下一个视频...")
                 sleep_with_cancel(upload_interval)
-            if _upload_video_with_biliapi(root, proxy, upload_cdn, cookie_path):
+            success, actually_uploaded = _upload_video_with_biliapi(root, proxy, upload_cdn, cookie_path)
+            if success:
                 count += 1
-                first_upload = False
+            # 只有真正执行了上传才需要等待间隔
+            need_wait = actually_uploaded
     return f"上传完成: {folder}（成功 {count} 个）"
 
 
