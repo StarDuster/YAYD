@@ -114,15 +114,16 @@ def download_single_video(
 
     resolution_val = resolution.replace('p', '')
     ydl_opts = {
-        'format': f'bestvideo[ext=mp4][height<={resolution_val}]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        # 优先 mp4，也支持 HLS (m3u8) 格式以绕过 SABR 限制
+        'format': f'bestvideo[height<={resolution_val}]+bestaudio/best[height<={resolution_val}]/best',
         'writeinfojson': True,
         'writethumbnail': True,
         'outtmpl': os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}', 'download.%(ext)s'),
         'merge_output_format': 'mp4',  # 确保合并后输出为 mp4
         'ignoreerrors': True,
         'remote_components': ['ejs:github'],
-        # web 支持 cookies，android/ios 不支持 cookies，排除受 SABR 影响的 web_safari
-        'extractor_args': {'youtube': {'player_client': ['web', 'android', 'ios']}},
+        # web_safari 有 HLS 格式可绕过 SABR 限制
+        'extractor_args': {'youtube': {'player_client': ['web_safari', 'web']}},
     }
     _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
 
@@ -154,8 +155,8 @@ def get_info_list_from_url(
         'playlistend': num_videos,
         'ignoreerrors': True,
         'remote_components': ['ejs:github'],
-        # web 支持 cookies，android/ios 不支持 cookies，排除受 SABR 影响的 web_safari
-        'extractor_args': {'youtube': {'player_client': ['web', 'android', 'ios']}},
+        # web_safari 有 HLS 格式可绕过 SABR 限制
+        'extractor_args': {'youtube': {'player_client': ['web_safari', 'web']}},
     }
     _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
 
