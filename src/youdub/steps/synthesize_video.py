@@ -615,26 +615,31 @@ def _calc_subtitle_style_params(
     Calculate subtitle style parameters based on output resolution.
 
     Returns: (font_size, outline, margin_v, max_chars_zh, max_chars_en)
+
+    Scaling logic:
+    - Use the shorter edge (height for landscape, width for portrait) as the base dimension.
+    - Apply a fixed percentage so the subtitle maintains consistent visual proportion across resolutions.
+    - 1080p landscape → ~49 (4.5% of 1080); 4K landscape → ~97; 720p landscape → ~32.
+    - Portrait uses a slightly smaller ratio (4.0%) since width is limited.
     """
     w = max(1, int(width))
     h = max(1, int(height))
 
-    # Subtitle font size: readable across resolutions.
-    # - Landscape: scale from height (1080p 16:9 -> ~49).
-    # - Portrait: scale from width, slightly smaller (1080x1920 -> ~33~36).
+    # Base dimension is always the shorter edge.
+    base_dim = min(w, h)
+
+    # Landscape: 4.5% of height; Portrait: 4.0% of width (slightly smaller to fit limited width).
     if w >= h:
-        base_dim = h
         font_scale = 0.045
     else:
-        base_dim = w
-        font_scale = 0.033 * 0.94
+        font_scale = 0.040
 
-    # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
     font_size = int(round(float(base_dim) * float(font_scale)))
     font_size = max(18, min(font_size, 120))
-    # Outline: keep strong contrast on complex backgrounds (49 -> 4, 36 -> 3).
+
+    # Outline: ~8% of font size for strong contrast (49 -> 4, 32 -> 3).
     outline = max(1, int(round(float(font_size) * 0.08)))
-    # Bottom margin: keep tight (49 -> 10) while avoiding clipping.
+    # Bottom margin: ~20% of font size, minimum 10.
     margin_v = max(10, int(round(float(font_size) * 0.20)))
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(
         int(w), int(font_size), en_font_scale=float(en_font_scale)
