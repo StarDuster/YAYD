@@ -195,13 +195,22 @@ ss-config.json
 debug_gemini_output.bin
 test_gemini.wav
 
-# Bilibili upload (biliup)
+# Bilibili upload
 cookies.json
 bili_cookies.json
 qrcode.png
 upload.log
 download.log
 ds_update.log
+
+# Node (biliAPI helper)
+scripts/biliapi/node_modules/
+scripts/biliapi/package-lock.json
+scripts/biliapi/pnpm-lock.yaml
+scripts/biliapi/yarn.lock
+
+# Temp folders (local)
+.tmp/
 
 # yt-dlp cookies (local secrets)
 cookies.txt

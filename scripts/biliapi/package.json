@@ -1,0 +1,12 @@
+{
+  "name": "youdub-biliapi-tools",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@renmu/bili-api": "^2.12.1",
+    "proxy-agent": "^6.5.0"
+  }
+}

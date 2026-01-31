@@ -198,11 +198,11 @@ YTDLP_COOKIES_FROM_BROWSER=
 YTDLP_COOKIES_FROM_BROWSER_PROFILE=
 
 # --- B站上传配置 (可选) ---
-# cookie 文件路径（由 biliup login 生成）
+# cookie 文件路径（由 `node scripts/biliapi/login.mjs` 生成）
 BILI_COOKIE_PATH=cookies.json
 # 上传代理（可选，如 socks5h://127.0.0.1:1080）
 BILI_PROXY=
-# 首选上传线路：bda / bda2 / tx / txa / bldsa（留空则自动选择）
+# 首选上传线路（留空则自动选择）。推荐：bda2 / auto
 BILI_UPLOAD_CDN=
 # 上传间隔（秒），避免触发限流
 BILI_UPLOAD_INTERVAL=60
@@ -266,15 +266,24 @@ YTDLP_COOKIES_FROM_BROWSER_PROFILE=Default
 
 ### B 站上传
 
-本项目使用 [biliup](https://github.com/biliup/biliup) 进行 B 站视频上传。
+本项目使用 [biliAPI](https://github.com/renmu123/biliAPI) 进行 B 站视频上传（Node.js）。
+
+#### 0. 安装 Node 依赖
+
+首次使用前需要先安装 Node 依赖：
+
+```bash
+cd scripts/biliapi
+npm install
+```
 
 #### 1. 登录获取 Cookie
 
-首次使用前需要登录 B 站账号生成 `cookies.json`：
+首次使用前需要扫码登录生成 `cookies.json`：
 
 ```bash
-# 扫码登录（推荐）
-uv run biliup login
+# 在项目根目录执行
+node scripts/biliapi/login.mjs
 
 # 登录成功后会在当前目录生成 cookies.json
 ```
@@ -294,8 +303,9 @@ BILI_COOKIE_PATH=cookies.json
 **注意事项**：
 - 每个视频文件夹需包含 `video.mp4`、`summary.json`、`download.info.json`
 - 上传成功后会生成 `bilibili.json` 标记，避免重复上传
-- 如遇 Cookie 过期，重新运行 `uv run biliup login` 刷新
+- 如遇 Cookie 过期，重新运行 `node scripts/biliapi/login.mjs` 刷新
 - 如需代理，设置 `BILI_PROXY=socks5h://127.0.0.1:1080`
+- 可选：指定上传线路 `BILI_UPLOAD_CDN=bda2`（不保证所有旧线路名都生效，建议先用 bda2/auto）
 
 ## 许可证
 

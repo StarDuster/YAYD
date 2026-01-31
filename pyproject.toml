@@ -64,7 +64,6 @@ dependencies = [
     "requests>=2.31.0,<3.0.0",
 
     # Bilibili upload
-    "biliup>=1.1.28",
 
     # PyTorch ecosystem (CUDA 12.8 on Linux via uv index)
     # Keep as a range so you can upgrade without editing this file again.
