@@ -817,8 +817,9 @@ with gr.Blocks(title="全自动") as do_everything_interface:
         root_folder_input = gr.Textbox(label="根目录（下载/输出）", value=str(settings.root_folder))
         url_input = gr.Textbox(
             label="视频链接",
-            placeholder="支持：视频 / 播放列表 / 频道链接",
+            placeholder="支持：视频 / 播放列表 / 频道链接（多个链接用换行或逗号分隔）",
             value="https://www.youtube.com/watch?v=4_SH2nfbQZ8",
+            lines=3,
         )
         num_videos_input = gr.Slider(minimum=1, maximum=500, step=1, label="下载视频数量", value=20)
         resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="下载分辨率", value="1080p")
@@ -1020,8 +1021,9 @@ with gr.Blocks(title="下载视频") as youtube_interface:
     with gr.Column():
         youtube_url_input = gr.Textbox(
             label="视频链接",
-            placeholder="支持：视频 / 播放列表 / 频道链接",
+            placeholder="支持：视频 / 播放列表 / 频道链接（多个链接用换行或逗号分隔）",
             value="https://www.bilibili.com/list/1263732318",
+            lines=3,
         )
         youtube_folder_input = gr.Textbox(label="输出目录", value=str(settings.root_folder))
         youtube_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="下载分辨率", value="1080p")

@@ -263,7 +263,9 @@ def download_from_url(
 ) -> None:
     """批量下载（供独立调用）。"""
     if isinstance(url, str):
-        url = [url]
+        # 支持换行、逗号、中文逗号分隔的多链接
+        url = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
+        url = [u for u in url.split("\n") if u]
 
     if settings is None:
         # Load once (from .env / env) and reuse for all downloads.
