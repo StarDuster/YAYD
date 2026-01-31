@@ -521,13 +521,22 @@ def format_timestamp_ass(seconds: float) -> str:
     return f"{hours}:{minutes:02}:{secs:02}.{cs:02}"
 
 
-def _wrap_cjk(text: str, max_chars: int) -> list[str]:
+def _wrap_cjk(text: str, max_chars: int, *, min_tail: int = 5) -> list[str]:
+    """Wrap CJK text by character count, avoiding very short tail lines.
+
+    If the last segment would be shorter than `min_tail`, merge it with the previous line.
+    """
     if max_chars <= 0:
         return [text]
     s = (text or "").strip()
     if not s:
         return []
-    return [s[i : i + max_chars] for i in range(0, len(s), max_chars)]
+    lines = [s[i : i + max_chars] for i in range(0, len(s), max_chars)]
+    # Merge short tail into previous line to avoid orphan punctuation.
+    if len(lines) >= 2 and len(lines[-1]) < min_tail:
+        lines[-2] = lines[-2] + lines[-1]
+        lines.pop()
+    return lines
 
 
 def _wrap_words(text: str, max_chars: int) -> list[str]:
