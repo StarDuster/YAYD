@@ -78,6 +78,39 @@ def sanitize_title(title: str) -> str:
     return title.strip()
 
 
+def _thumbnail_exists(folder: str) -> bool:
+    """检查缩略图是否已存在。"""
+    suffixes = ['.jpg', '.jpeg', '.png', '.webp']
+    for suffix in suffixes:
+        if os.path.exists(os.path.join(folder, f'download{suffix}')):
+            return True
+    return False
+
+
+def _download_thumbnail_only(
+    webpage_url: str,
+    output_folder: str,
+    settings: 'Settings | None' = None,
+) -> bool:
+    """单独下载缩略图（用于补下载）。"""
+    ydl_opts = {
+        'skip_download': True,
+        'writethumbnail': True,
+        'outtmpl': os.path.join(output_folder, 'download.%(ext)s'),
+        'ignoreerrors': True,
+        'quiet': True,
+    }
+    _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([webpage_url])
+        return _thumbnail_exists(output_folder)
+    except Exception as exc:
+        logger.debug(f"补下载缩略图失败: {webpage_url} - {exc}")
+        return False
+
+
 def get_target_folder(info: dict[str, Any], folder_path: str) -> str | None:
     """计算视频的目标目录。"""
     sanitized_title = sanitize_title(info.get('title', 'Unknown'))
@@ -163,6 +196,12 @@ def download_single_video(
             if os.path.getsize(download_mp4) >= 1024:
                 # 单测会用“伪 mp4”（仅写入若干字节）来模拟缓存命中，因此这里不要强依赖 ffprobe。
                 # 如果用户确实遇到损坏缓存，可手动删除 download.mp4 触发重新下载。
+                # 检查缩略图是否存在，不存在则补下载
+                if not _thumbnail_exists(output_folder):
+                    webpage_url = info.get('webpage_url')
+                    if webpage_url:
+                        logger.info(f"缩略图缺失，尝试补下载: {output_folder}")
+                        _download_thumbnail_only(webpage_url, output_folder, settings)
                 logger.info(f"已下载: {output_folder}")
                 return output_folder
             else:
