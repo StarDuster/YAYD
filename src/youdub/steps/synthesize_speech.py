@@ -23,6 +23,7 @@ from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
 from ..utils import (
     ensure_torchaudio_backend_compat,
+    prepare_speaker_ref_audio,
     read_speaker_ref_seconds,
     save_wav,
     save_wav_norm,
@@ -286,23 +287,64 @@ def _tts_text_for_attempt(raw_text: str, attempt: int) -> str:
 
 
 def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 24000) -> None:
+    """
+    Ensure speaker reference audio is at most max_seconds long and apply anti-pop processing.
+
+    This function:
+    1. Loads and truncates audio to max_seconds
+    2. Applies anti-pop processing (trim silence, soft clip, smooth transients)
+    3. Saves the processed audio
+    """
     if not path or not os.path.exists(path):
         return
     if max_seconds <= 0:
         return
 
     dur = wav_duration_seconds(path)
-    if dur is not None and dur <= max_seconds + 0.02:
+    needs_processing = dur is None or dur > max_seconds + 0.02
+
+    # Also check if the audio might have harsh transients (re-process if it does)
+    # This ensures existing audio files get the anti-pop treatment
+    if not needs_processing:
+        try:
+            wav_check, _ = librosa.load(path, sr=sample_rate)
+            if wav_check.size > 0:
+                diff = np.abs(np.diff(wav_check))
+                harsh_transients = int(np.sum(diff > 0.4))
+                if harsh_transients > 50:
+                    logger.info(f"检测到参考音频有 {harsh_transients} 个急剧变化点，将进行防爆音处理: {path}")
+                    needs_processing = True
+        except Exception:
+            pass
+
+    if not needs_processing:
         return
 
     try:
         wav, _sr = librosa.load(path, sr=sample_rate, duration=max_seconds)
         if wav.size <= 0:
             return
-        save_wav_norm(wav.astype(np.float32), path, sample_rate=sample_rate)
-        logger.info(f"已裁剪说话人参考音频至 {max_seconds:.1f}秒: {path}")
+
+        # Apply anti-pop processing
+        wav_processed = prepare_speaker_ref_audio(
+            wav,
+            sample_rate=sample_rate,
+            trim_silence=True,
+            trim_top_db=30.0,
+            apply_soft_clip=True,
+            clip_threshold=0.85,
+            apply_smooth=True,
+            smooth_max_diff=0.25,
+        )
+
+        if wav_processed.size <= 0:
+            wav_processed = wav.astype(np.float32)
+
+        # Save with normalization
+        save_wav_norm(wav_processed, path, sample_rate=sample_rate)
+        logger.info(f"已处理说话人参考音频(防爆音+裁剪至{max_seconds:.1f}秒): {path}")
     except Exception as exc:
-        logger.warning(f"裁剪说话人音频失败 {path}: {exc}")
+        logger.warning(f"处理说话人音频失败 {path}: {exc}")
 
 
 def preprocess_text(text: str) -> str:
@@ -725,9 +767,30 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
         if len(wav_data) < SAMPLE_RATE:  # Less than 1 second
             logger.warning(f"音频 {audio_path} 过短无法克隆 (< 1秒)")
             return False
+
+        # Apply anti-pop processing before uploading
+        wav_data = prepare_speaker_ref_audio(
+            wav_data,
+            sample_rate=SAMPLE_RATE,
+            trim_silence=True,
+            trim_top_db=30.0,
+            apply_soft_clip=True,
+            clip_threshold=0.85,
+            apply_smooth=True,
+            smooth_max_diff=0.25,
+        )
+
+        if len(wav_data) < SAMPLE_RATE:  # Check again after trimming
+            logger.warning(f"音频 {audio_path} 处理后过短无法克隆 (< 1秒)")
+            return False
         
         import io
         from scipy.io import wavfile
+
+        # Normalize to safe level for int16 conversion
+        peak = max(abs(float(np.max(wav_data))), abs(float(np.min(wav_data))))
+        if peak > 1e-6:
+            wav_data = wav_data * (0.95 / peak)
         
         wav_int16 = (wav_data * 32767).astype(np.int16)
         
@@ -1518,8 +1581,22 @@ def generate_wavs(
                 check_cancelled()
                 wav, _sr = librosa.load(vocals_path, sr=24000, mono=True, duration=max_ref_seconds)
                 if wav.size > 0:
-                    save_wav_norm(wav.astype(np.float32), spk_path, sample_rate=24000)
-                    logger.info(f"已生成缺失的说话人参考 ({max_ref_seconds:.1f}秒): {spk_path}")
+                    # Apply anti-pop processing before saving
+                    wav_processed = prepare_speaker_ref_audio(
+                        wav,
+                        sample_rate=24000,
+                        trim_silence=True,
+                        trim_top_db=30.0,
+                        apply_soft_clip=True,
+                        clip_threshold=0.85,
+                        apply_smooth=True,
+                        smooth_max_diff=0.25,
+                    )
+                    if wav_processed.size > 0:
+                        save_wav_norm(wav_processed, spk_path, sample_rate=24000)
+                    else:
+                        save_wav_norm(wav.astype(np.float32), spk_path, sample_rate=24000)
+                    logger.info(f"已生成缺失的说话人参考(防爆音处理) ({max_ref_seconds:.1f}秒): {spk_path}")
             except Exception as exc:
                 logger.warning(f"生成说话人参考音频失败 {spk}: {exc}")
 

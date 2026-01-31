@@ -269,6 +269,147 @@ def save_wav_norm(wav: np.ndarray, output_path: str, sample_rate: int = 24000) -
     wav_norm = wav * (32767 / max(0.01, peak))
     wavfile.write(output_path, sample_rate, wav_norm.astype(np.int16))
 
+
+def soft_clip(wav: np.ndarray, threshold: float = 0.9, knee: float = 0.1) -> np.ndarray:
+    """
+    Soft clipper to reduce harsh peaks without hard clipping.
+
+    Uses a smooth tanh-like curve to compress samples above the threshold.
+
+    Args:
+        wav: Input waveform (float, typically in [-1, 1])
+        threshold: Amplitude above which soft clipping starts (default 0.9)
+        knee: Softness of the knee (default 0.1)
+
+    Returns:
+        Soft-clipped waveform
+    """
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.size == 0:
+        return wav
+
+    th = float(max(0.1, min(threshold, 0.99)))
+    k = float(max(0.01, min(knee, 0.5)))
+
+    # Use tanh for smooth compression above threshold
+    out = np.copy(wav)
+    above_th = np.abs(wav) > th
+
+    if np.any(above_th):
+        # Map [th, 1] -> [0, ~1] then apply tanh, then map back
+        sign = np.sign(wav[above_th])
+        excess = np.abs(wav[above_th]) - th
+        # Soft compress the excess using tanh
+        compressed = th + k * np.tanh(excess / k)
+        out[above_th] = sign * compressed
+
+    return out
+
+
+def smooth_transients(wav: np.ndarray, max_diff: float = 0.3, alpha: float = 0.3) -> np.ndarray:
+    """
+    Smooth sudden transients (potential pops/clicks) in audio.
+
+    Applies exponential smoothing to samples that change too rapidly.
+
+    Args:
+        wav: Input waveform (float)
+        max_diff: Maximum allowed difference between consecutive samples (default 0.3)
+        alpha: Smoothing factor when transient detected (default 0.3, lower = smoother)
+
+    Returns:
+        Smoothed waveform
+    """
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.size <= 1:
+        return wav
+
+    out = np.copy(wav)
+    md = float(max(0.01, max_diff))
+    a = float(max(0.01, min(alpha, 1.0)))
+
+    for i in range(1, len(out)):
+        diff = out[i] - out[i - 1]
+        if abs(diff) > md:
+            # Exponential smoothing toward the new value
+            out[i] = out[i - 1] + a * diff
+
+    return out
+
+
+def prepare_speaker_ref_audio(
+    wav: np.ndarray,
+    sample_rate: int = 24000,
+    *,
+    trim_silence: bool = True,
+    trim_top_db: float = 30.0,
+    apply_soft_clip: bool = True,
+    clip_threshold: float = 0.85,
+    apply_smooth: bool = True,
+    smooth_max_diff: float = 0.25,
+) -> np.ndarray:
+    """
+    Prepare speaker reference audio for voice cloning with anti-pop processing.
+
+    Steps:
+    1. Trim leading/trailing silence (optional)
+    2. Apply soft clipper to reduce harsh peaks (optional)
+    3. Smooth rapid transients to reduce pops/clicks (optional)
+    4. Normalize to safe peak level
+
+    Args:
+        wav: Input waveform (float, mono)
+        sample_rate: Sample rate
+        trim_silence: Whether to trim silence
+        trim_top_db: Threshold for silence trimming
+        apply_soft_clip: Whether to apply soft clipping
+        clip_threshold: Soft clip threshold
+        apply_smooth: Whether to smooth transients
+        smooth_max_diff: Max diff for transient smoothing
+
+    Returns:
+        Processed waveform (float32)
+    """
+    import librosa
+
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.size == 0:
+        return wav
+
+    # Ensure mono
+    if wav.ndim > 1:
+        wav = wav.mean(axis=-1) if wav.shape[-1] <= 2 else wav[..., 0]
+    wav = wav.flatten().astype(np.float32)
+
+    # 1. Trim silence
+    if trim_silence:
+        try:
+            trimmed, _ = librosa.effects.trim(wav, top_db=float(trim_top_db))
+            if trimmed is not None and trimmed.size > 0:
+                wav = trimmed.astype(np.float32)
+        except Exception:
+            pass
+
+    # 2. Normalize to [-1, 1] before processing
+    peak = _peak_abs(wav)
+    if peak > 1e-6:
+        wav = wav / peak
+
+    # 3. Soft clip to reduce harsh peaks
+    if apply_soft_clip:
+        wav = soft_clip(wav, threshold=float(clip_threshold), knee=0.1)
+
+    # 4. Smooth rapid transients
+    if apply_smooth:
+        wav = smooth_transients(wav, max_diff=float(smooth_max_diff), alpha=0.3)
+
+    # 5. Final normalize to safe level (leave headroom)
+    peak = _peak_abs(wav)
+    if peak > 1e-6:
+        wav = wav * (0.95 / peak)
+
+    return wav.astype(np.float32)
+
 def normalize_wav(wav_path: str) -> None:
     try:
         sample_rate, wav = wavfile.read(wav_path)
