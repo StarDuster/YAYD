@@ -22,7 +22,10 @@ _AUDIO_COMBINED_MIX_VERSION = 3
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
-_VIDEO_META_VERSION = 2
+# v3: subtitles style/scale tweaks (font size, wrap, original_size for libass)
+# v4: make wrap heuristic more conservative; shrink default font size further
+# v5: shrink non-bilingual subtitle font size further (1080p -> ~26)
+_VIDEO_META_VERSION = 5
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -530,17 +533,17 @@ def _calc_subtitle_wrap_chars(
     """
     w = max(1, int(width))
     fs = max(1, int(font_size))
-    # Horizontal safe margin: ~3% each side, at least 10px.
-    # (Less conservative than before; avoids wrapping too aggressively on 16:9.)
-    margin_x = max(10, int(round(w * 0.03)))
+    # Horizontal safe margin: ~4% each side, at least 10px.
+    # Keep conservative to avoid clipping with libass metrics differences.
+    margin_x = max(10, int(round(w * 0.04)))
     safe_w = max(1, w - 2 * margin_x)
 
     # Empirical average glyph widths (Arial-ish + libass):
     # - CJK: close to a square, slightly narrower than font size
     # - Latin: narrower, plus spaces; tuned to match previous defaults on 16:9
-    max_chars_zh = max(1, int(safe_w / (float(fs) * 0.85)))
+    max_chars_zh = max(1, int(safe_w / (float(fs) * 0.90)))
     en_fs = max(1, int(round(float(fs) * float(en_font_scale))))
-    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.62)))
+    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.65)))
     return max_chars_zh, max_chars_en
 
 
@@ -1175,14 +1178,14 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    # Subtitle font size: readable across resolutions (1080p -> ~39).
+    # Subtitle font size: readable across resolutions (1080p -> ~26).
     # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
     base_dim = min(width, height)
-    font_size = int(round(base_dim * 0.036))
+    font_size = int(round(base_dim * 0.024))
     font_size = max(18, min(font_size, 120))
-    outline = max(2, int(round(font_size / 16)))
+    outline = max(2, int(round(font_size / 18)))
     # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
-    margin_v = max(12, int(round(font_size * 0.70)))
+    margin_v = max(12, int(round(font_size * 0.80)))
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(width, font_size, en_font_scale=0.75)
 
     srt_path = os.path.join(folder, 'subtitles.srt')
@@ -1226,7 +1229,10 @@ def synthesize_video(
             subtitle_filter = f"ass=filename='{ass_path_filter}':original_size={res_string}"
         else:
             subtitle_filter = (
-                f"subtitles='{srt_path_filter}':force_style="
+                # IMPORTANT:
+                # Set original_size so libass doesn't default to 384x288,
+                # which would scale FontSize up massively on 1080p/4K outputs.
+                f"subtitles='{srt_path_filter}':original_size={res_string}:force_style="
                 f"'FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,"
                 f"OutlineColour=&H000000,Outline={outline},WrapStyle=2,MarginV={margin_v}'"
             )
