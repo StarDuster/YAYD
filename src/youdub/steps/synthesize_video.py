@@ -25,7 +25,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v3: subtitles style/scale tweaks (font size, wrap, original_size for libass)
 # v4: make wrap heuristic more conservative; shrink default font size further
 # v5: shrink non-bilingual subtitle font size further (1080p -> ~26)
-_VIDEO_META_VERSION = 5
+# v6: shrink non-bilingual subtitle size further (1080p -> ~19) and reduce outline
+_VIDEO_META_VERSION = 6
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -1178,12 +1179,12 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    # Subtitle font size: readable across resolutions (1080p -> ~26).
+    # Subtitle font size: readable across resolutions (1080p -> ~19).
     # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
     base_dim = min(width, height)
-    font_size = int(round(base_dim * 0.024))
-    font_size = max(18, min(font_size, 120))
-    outline = max(2, int(round(font_size / 18)))
+    font_size = int(round(base_dim * 0.018))
+    font_size = max(16, min(font_size, 120))
+    outline = max(1, int(round(font_size / 20)))
     # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
     margin_v = max(12, int(round(font_size * 0.80)))
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(width, font_size, en_font_scale=0.75)
