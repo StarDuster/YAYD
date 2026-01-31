@@ -1,6 +1,7 @@
 import gc
 import os
 import subprocess
+import threading
 import time
 from typing import Any
 
@@ -17,6 +18,7 @@ class DemucsDependencyError(RuntimeError):
     pass
 
 
+_DEMUCS_LOCK = threading.Lock()
 _DEMUCS_MODEL: Any | None = None
 _DEMUCS_MODEL_NAME: str | None = None
 _DEMUCS_DEVICE: str | None = None
@@ -77,38 +79,44 @@ def load_model(
 
     target_device = _AUTO_DEVICE if device == "auto" else device
 
-    if _DEMUCS_MODEL is not None and _DEMUCS_MODEL_NAME == model_name and _DEMUCS_DEVICE == target_device:
-        return _DEMUCS_MODEL
+    with _DEMUCS_LOCK:
+        if _DEMUCS_MODEL is not None and _DEMUCS_MODEL_NAME == model_name and _DEMUCS_DEVICE == target_device:
+            return _DEMUCS_MODEL
 
-    unload_model()
+        _unload_model_unlocked()
 
-    get_model, _apply_model = _import_demucs_infer()
+        get_model, _apply_model = _import_demucs_infer()
 
-    logger.info(f"加载 Demucs 模型: {model_name}")
-    t_start = time.time()
-    model = get_model(model_name)
-    _DEMUCS_MODEL = model
-    _DEMUCS_MODEL_NAME = model_name
-    _DEMUCS_DEVICE = target_device
-    logger.info(f"Demucs 模型加载完成，耗时 {time.time() - t_start:.2f} 秒")
-    return model
+        logger.info(f"加载 Demucs 模型: {model_name}")
+        t_start = time.time()
+        model = get_model(model_name)
+        _DEMUCS_MODEL = model
+        _DEMUCS_MODEL_NAME = model_name
+        _DEMUCS_DEVICE = target_device
+        logger.info(f"Demucs 模型加载完成，耗时 {time.time() - t_start:.2f} 秒")
+        return model
 
 
-def unload_model() -> None:
+def _unload_model_unlocked() -> None:
+    """Internal unload without lock - caller must hold _DEMUCS_LOCK."""
     global _DEMUCS_MODEL, _DEMUCS_MODEL_NAME, _DEMUCS_DEVICE
     if _DEMUCS_MODEL is None:
         return
 
-    try:
-        del _DEMUCS_MODEL
-    finally:
-        _DEMUCS_MODEL = None
-        _DEMUCS_MODEL_NAME = None
-        _DEMUCS_DEVICE = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        logger.info("Demucs 模型已卸载")
+    old_model = _DEMUCS_MODEL
+    _DEMUCS_MODEL = None
+    _DEMUCS_MODEL_NAME = None
+    _DEMUCS_DEVICE = None
+    del old_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    logger.info("Demucs 模型已卸载")
+
+
+def unload_model() -> None:
+    with _DEMUCS_LOCK:
+        _unload_model_unlocked()
 
 
 def separate_audio(

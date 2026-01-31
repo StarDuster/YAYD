@@ -65,3 +65,41 @@ def test_separate_all_audio_under_folder_short_circuits_without_loading_model_wh
 
     msg = sv.separate_all_audio_under_folder(str(tmp_path))
     assert "processed 0 files" in msg
+
+
+def test_demucs_model_cache_globals_defined_and_load_model_does_not_nameerror(monkeypatch):
+    """Guard against regressions like `NameError: _DEMUCS_MODEL is not defined`."""
+    import youdub.steps.separate_vocals as sv
+
+    assert hasattr(sv, "_DEMUCS_MODEL")
+    assert hasattr(sv, "_DEMUCS_MODEL_NAME")
+    assert hasattr(sv, "_DEMUCS_DEVICE")
+
+    calls = {"get_model": 0}
+
+    def _fake_get_model(_name: str):
+        calls["get_model"] += 1
+        return object()
+
+    # Avoid importing / running the real demucs implementation in unit tests.
+    monkeypatch.setattr(
+        sv,
+        "_import_demucs_infer",
+        lambda: (_fake_get_model, lambda *_args, **_kwargs: None),
+    )
+
+    try:
+        m1 = sv.load_model("htdemucs_ft", device="cpu")
+        m2 = sv.load_model("htdemucs_ft", device="cpu")
+        assert m1 is m2
+        assert calls["get_model"] == 1
+
+        sv.unload_model()
+        assert sv._DEMUCS_MODEL is None
+        assert sv._DEMUCS_MODEL_NAME is None
+        assert sv._DEMUCS_DEVICE is None
+    finally:
+        # Ensure we don't leak module-level cache state to other tests.
+        setattr(sv, "_DEMUCS_MODEL", None)
+        setattr(sv, "_DEMUCS_MODEL_NAME", None)
+        setattr(sv, "_DEMUCS_DEVICE", None)
