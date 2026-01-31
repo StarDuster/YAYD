@@ -30,7 +30,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v6: shrink non-bilingual subtitle size further (1080p -> ~19) and reduce outline
 # v7: use ASS for monolingual subtitles too (ensures font size is respected via PlayRes)
 # v8: restore subtitle font scaling (1080p -> ~36) for readability
-_VIDEO_META_VERSION = 8
+# v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
+_VIDEO_META_VERSION = 9
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -612,17 +613,31 @@ def _calc_subtitle_style_params(
 
     Returns: (font_size, outline, margin_v, max_chars_zh, max_chars_en)
     """
-    # Subtitle font size: readable across resolutions (1080p -> ~36).
-    # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
-    base_dim = min(int(width), int(height))
+    w = max(1, int(width))
+    h = max(1, int(height))
+
+    # Subtitle font size: readable across resolutions.
+    # - Landscape: scale from height, with a mild boost for wider aspect ratios (1080p 16:9 -> ~42).
+    # - Portrait: scale from width, with a mild reduction for taller aspect ratios (1080x1920 -> ~33).
+    if w >= h:
+        aspect = float(w) / float(h)
+        aspect_bonus = min(0.35, max(0.0, (aspect - 1.0) * 0.20))
+        base_dim = h
+        scale = 1.0 + float(aspect_bonus)
+    else:
+        aspect = float(h) / float(w)
+        aspect_penalty = min(0.20, max(0.0, (aspect - 1.0) * 0.10))
+        base_dim = w
+        scale = 1.0 - float(aspect_penalty)
+
     # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
-    font_size = int(round(base_dim * 0.033))
+    font_size = int(round(float(base_dim) * 0.033 * float(scale)))
     font_size = max(18, min(font_size, 120))
     outline = max(1, int(round(font_size / 20)))
     # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
     margin_v = max(12, int(round(font_size * 0.80)))
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(
-        int(width), int(font_size), en_font_scale=float(en_font_scale)
+        int(w), int(font_size), en_font_scale=float(en_font_scale)
     )
     return int(font_size), int(outline), int(margin_v), int(max_chars_zh), int(max_chars_en)
 
