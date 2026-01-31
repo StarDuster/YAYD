@@ -1688,6 +1688,7 @@ def synthesize_all_video_under_folder(
     adaptive_segment_stretch: bool = False,
     bilingual_subtitle: bool = False,
     auto_upload_video: bool = False,
+    max_workers: int | None = None,
 ) -> str:
     # Collect targets first so we can optionally run them concurrently.
     targets: list[str] = []
@@ -1735,11 +1736,14 @@ def synthesize_all_video_under_folder(
     # - NVENC has a dedicated concurrency guard (_NVENC_SEMAPHORE).
     # - libx264 parallelism can easily saturate CPU and degrade overall throughput.
     parallel = bool(use_nvenc) and len(targets) > 1
-    max_workers = min(_NVENC_MAX_CONCURRENCY, len(targets)) if parallel else 1
+    if max_workers is None:
+        effective_workers = min(_NVENC_MAX_CONCURRENCY, len(targets)) if parallel else 1
+    else:
+        effective_workers = min(max(1, max_workers), _NVENC_MAX_CONCURRENCY, len(targets)) if parallel else 1
 
     if parallel:
         logger.info(
-            f"检测到多个视频且启用 NVENC，将并发合成视频: max_workers={max_workers}（NVENC并发上限={_NVENC_MAX_CONCURRENCY}）"
+            f"检测到多个视频且启用 NVENC，将并发合成视频: max_workers={effective_workers}（NVENC并发上限={_NVENC_MAX_CONCURRENCY}）"
         )
 
     def _run_one(root: str) -> None:
@@ -1754,7 +1758,7 @@ def synthesize_all_video_under_folder(
             adaptive_segment_stretch=adaptive_segment_stretch,
         )
 
-    if max_workers <= 1:
+    if effective_workers <= 1:
         for root in targets:
             check_cancelled()
             try:
@@ -1765,7 +1769,7 @@ def synthesize_all_video_under_folder(
                 failed.append(root)
                 logger.exception(f"视频合成失败（已跳过）: {root} ({exc})")
     else:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_root = {executor.submit(_run_one, root): root for root in targets}
             for future in as_completed(future_to_root):
                 check_cancelled()

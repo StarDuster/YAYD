@@ -1348,6 +1348,7 @@ def _synthesize_video_wrapper(
     fps,
     resolution,
     use_nvenc,
+    max_workers,
     auto_upload_video,
 ):
     # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
@@ -1362,6 +1363,7 @@ def _synthesize_video_wrapper(
         resolution=resolution,
         use_nvenc=use_nvenc,
         auto_upload_video=bool(auto_upload_video),
+        max_workers=int(max_workers),
     )
 
 
@@ -1388,6 +1390,14 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
         synth_fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
         synth_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="输出分辨率", value="1080p")
         synth_nvenc_input = gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU")
+        synth_max_workers_input = gr.Slider(
+            minimum=1,
+            maximum=8,
+            step=1,
+            label="NVENC 后台编码并发数",
+            value=1,
+            info="仅在启用 NVENC 且处理多个视频时生效",
+        )
         synth_auto_upload_input = gr.Checkbox(label="自动上传到 B 站", value=False)
 
         synth_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
@@ -1408,6 +1418,7 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             synth_fps_input,
             synth_resolution_input,
             synth_nvenc_input,
+            synth_max_workers_input,
             synth_auto_upload_input,
         ],
         outputs=synth_output,
