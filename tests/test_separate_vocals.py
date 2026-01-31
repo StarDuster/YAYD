@@ -67,39 +67,88 @@ def test_separate_all_audio_under_folder_short_circuits_without_loading_model_wh
     assert "processed 0 files" in msg
 
 
-def test_demucs_model_cache_globals_defined_and_load_model_does_not_nameerror(monkeypatch):
-    """Guard against regressions like `NameError: _DEMUCS_MODEL is not defined`."""
+def test_demucs_model_cache_is_thread_safe_against_unload_race(monkeypatch):
+    """
+    Guard against regressions like `NameError: _DEMUCS_MODEL is not defined` under concurrency.
+
+    Historical failure mode:
+    - unload() temporarily removed the global name (via `del _DEMUCS_MODEL`) without a lock
+    - another thread called load_model() at the wrong time -> NameError
+    """
+    import threading
+    import time
+
     import youdub.steps.separate_vocals as sv
 
-    assert hasattr(sv, "_DEMUCS_MODEL")
-    assert hasattr(sv, "_DEMUCS_MODEL_NAME")
-    assert hasattr(sv, "_DEMUCS_DEVICE")
-
+    # Avoid importing / running the real demucs implementation in unit tests.
     calls = {"get_model": 0}
 
     def _fake_get_model(_name: str):
         calls["get_model"] += 1
         return object()
 
-    # Avoid importing / running the real demucs implementation in unit tests.
     monkeypatch.setattr(
         sv,
         "_import_demucs_infer",
         lambda: (_fake_get_model, lambda *_args, **_kwargs: None),
     )
 
-    try:
-        m1 = sv.load_model("htdemucs_ft", device="cpu")
-        m2 = sv.load_model("htdemucs_ft", device="cpu")
-        assert m1 is m2
-        assert calls["get_model"] == 1
+    # Seed a cached model so unload_model() has something to "unload".
+    sv._DEMUCS_MODEL = object()  # noqa: SLF001
+    sv._DEMUCS_MODEL_NAME = "htdemucs_ft"  # noqa: SLF001
+    sv._DEMUCS_DEVICE = sv._AUTO_DEVICE  # noqa: SLF001
 
-        sv.unload_model()
-        assert sv._DEMUCS_MODEL is None
-        assert sv._DEMUCS_MODEL_NAME is None
-        assert sv._DEMUCS_DEVICE is None
+    deleted = threading.Event()
+    resume = threading.Event()
+    orig_unload = sv._unload_model_unlocked  # noqa: SLF001
+    armed = {"once": True}
+
+    def _patched_unload():  # noqa: ANN001
+        # First call: simulate the old bug window by removing the global name while holding the lock.
+        if armed["once"]:
+            armed["once"] = False
+            sv.__dict__.pop("_DEMUCS_MODEL", None)
+            deleted.set()
+            resume.wait(timeout=2)
+            # Restore a valid state before releasing the lock.
+            sv._DEMUCS_MODEL = None  # noqa: SLF001
+            sv._DEMUCS_MODEL_NAME = None  # noqa: SLF001
+            sv._DEMUCS_DEVICE = None  # noqa: SLF001
+            return
+        return orig_unload()
+
+    monkeypatch.setattr(sv, "_unload_model_unlocked", _patched_unload)
+
+    box: dict[str, object] = {}
+
+    def _call_load() -> None:
+        try:
+            box["model"] = sv.load_model("htdemucs_ft", device="auto")
+        except Exception as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    t_unload = threading.Thread(target=sv.unload_model, daemon=True)
+    t_unload.start()
+    assert deleted.wait(timeout=1.0)
+
+    t_load = threading.Thread(target=_call_load, daemon=True)
+    t_load.start()
+
+    # If load_model isn't protected by the same lock, it may crash immediately with NameError.
+    time.sleep(0.05)
+
+    try:
+        resume.set()
+        t_unload.join(timeout=2.0)
+        t_load.join(timeout=2.0)
+
+        assert "exc" not in box
+        assert "model" in box
     finally:
         # Ensure we don't leak module-level cache state to other tests.
-        setattr(sv, "_DEMUCS_MODEL", None)
-        setattr(sv, "_DEMUCS_MODEL_NAME", None)
-        setattr(sv, "_DEMUCS_DEVICE", None)
+        try:
+            sv._DEMUCS_MODEL = None  # noqa: SLF001
+            sv._DEMUCS_MODEL_NAME = None  # noqa: SLF001
+            sv._DEMUCS_DEVICE = None  # noqa: SLF001
+        except Exception:
+            pass
