@@ -347,6 +347,342 @@ def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 2
         logger.warning(f"处理说话人音频失败 {path}: {exc}")
 
 
+def _speaker_ref_multi_enabled() -> bool:
+    """
+    Enable multi-candidate speaker reference selection by default.
+
+    Set env `TTS_SPEAKER_REF_MULTI=0/false/no` to disable.
+    """
+    raw = os.getenv("TTS_SPEAKER_REF_MULTI")
+    if raw is None:
+        return True
+    return (raw.strip().lower() in {"1", "true", "yes", "y", "on"})
+
+
+def _speaker_ref_multi_params() -> tuple[int, float, float, float, float]:
+    """
+    Returns: (n_candidates, stride_seconds, silence_threshold, max_silence_ratio, transient_threshold)
+    """
+    n_candidates = _read_env_int("TTS_SPEAKER_REF_CANDIDATES", 5)
+    stride = _read_env_float("TTS_SPEAKER_REF_SCAN_STRIDE_SECONDS", 15.0)
+    silence_th = _read_env_float("TTS_SPEAKER_REF_SILENCE_THRESHOLD", 0.02)
+    max_silence_ratio = _read_env_float("TTS_SPEAKER_REF_MAX_SILENCE_RATIO", 0.75)
+    transient_th = _read_env_float("TTS_SPEAKER_REF_TRANSIENT_THRESHOLD", 0.4)
+
+    n_candidates = int(max(1, min(int(n_candidates), 20)))
+    stride = float(max(1.0, float(stride)))
+    silence_th = float(max(0.0, min(float(silence_th), 0.5)))
+    max_silence_ratio = float(max(0.0, min(float(max_silence_ratio), 0.99)))
+    transient_th = float(max(0.05, min(float(transient_th), 2.0)))
+    return n_candidates, stride, silence_th, max_silence_ratio, transient_th
+
+
+def _speaker_ref_quick_metrics(
+    wav: np.ndarray,
+    *,
+    silence_threshold: float,
+    transient_threshold: float,
+) -> dict:
+    """
+    Fast, reference-free speaker audio quality heuristics.
+
+    Returns dict with:
+      - peak, rms, silence_ratio, clip_ratio, transients
+    """
+    y = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if y.size <= 0:
+        return {
+            "peak": 0.0,
+            "rms": 0.0,
+            "silence_ratio": 1.0,
+            "clip_ratio": 0.0,
+            "transients": 0,
+        }
+
+    peak = float(max(abs(float(np.max(y))), abs(float(np.min(y)))))
+    if peak > 1e-6:
+        y = (y / np.float32(peak)).astype(np.float32, copy=False)
+    else:
+        peak = 0.0
+
+    rms = float(np.sqrt(float(np.mean(np.square(y), dtype=np.float64))))
+    silence_ratio = float(np.mean(np.abs(y) < float(silence_threshold)))
+    clip_ratio = float(np.mean(np.abs(y) >= 0.999))
+    if y.size >= 2:
+        diff = np.abs(np.diff(y))
+        transients = int(np.sum(diff >= float(transient_threshold)))
+    else:
+        transients = 0
+
+    return {
+        "peak": peak,
+        "rms": rms,
+        "silence_ratio": silence_ratio,
+        "clip_ratio": clip_ratio,
+        "transients": transients,
+    }
+
+
+def _speaker_ref_candidate_starts(
+    segments: list[dict],
+    speaker: str,
+    *,
+    stride_seconds: float,
+    total_dur: float | None,
+    ref_seconds: float,
+) -> list[float]:
+    """
+    Propose candidate start offsets for a speaker, based on translation segment timestamps.
+
+    We keep it simple:
+    - only use segments where seg["speaker"] == speaker
+    - take at most one start per `stride_seconds` window
+    """
+    stride = float(max(0.1, float(stride_seconds)))
+    starts: list[float] = []
+    last_kept = -1e18
+    for seg in segments:
+        if str(seg.get("speaker") or "") != str(speaker):
+            continue
+        try:
+            s = float(seg.get("start", 0.0) or 0.0)
+        except Exception:
+            continue
+        if s < 0:
+            s = 0.0
+        if total_dur is not None:
+            if s + float(ref_seconds) > float(total_dur) + 1e-6:
+                continue
+        if s - last_kept < stride:
+            continue
+        starts.append(float(s))
+        last_kept = float(s)
+
+    # If timestamps produce too few candidates (e.g., missing speaker tags), caller will fallback.
+    return starts
+
+
+def _speaker_ref_candidate_filename(speaker: str, *, rank: int, start_sec: float) -> str:
+    # Keep file names short and filesystem-friendly.
+    ss = int(max(0.0, float(start_sec)))
+    return f"{speaker}.ref_{int(rank):02d}_{ss:05d}s.wav"
+
+
+def _speaker_ref_meta_path(speaker_dir: str, speaker: str) -> str:
+    return os.path.join(speaker_dir, f"{speaker}.ref_meta.json")
+
+
+def _ensure_speaker_ref_multi(
+    *,
+    folder: str,
+    segments: list[dict],
+    speakers: set[str],
+    speaker_dir: str,
+    vocals_path: str,
+    ref_seconds: float,
+    sample_rate: int = 24000,
+) -> None:
+    """
+    Save multiple reference candidates under `SPEAKER/` and auto-select the best.
+
+    Output:
+      - `SPEAKER/<speaker>.ref_XX_YYYYYs.wav` (top-N candidates)
+      - `SPEAKER/<speaker>.wav` (best candidate, used by TTS/voice cloning)
+      - `SPEAKER/<speaker>.ref_meta.json` (selection details)
+    """
+    if not _speaker_ref_multi_enabled():
+        return
+    if not (vocals_path and os.path.exists(vocals_path)):
+        return
+    if not isinstance(segments, list) or not segments:
+        return
+
+    n_candidates, stride_s, silence_th, max_silence_ratio, transient_th = _speaker_ref_multi_params()
+
+    total_dur = wav_duration_seconds(vocals_path)
+    if total_dur is None:
+        try:
+            total_dur = float(librosa.get_duration(filename=vocals_path))
+        except Exception:
+            total_dur = None
+
+    # Cache key: if vocals didn't change and params unchanged, skip regeneration.
+    try:
+        src_mtime = float(os.path.getmtime(vocals_path))
+    except Exception:
+        src_mtime = None
+    try:
+        src_size = int(os.path.getsize(vocals_path))
+    except Exception:
+        src_size = None
+
+    for spk in sorted(speakers):
+        check_cancelled()
+        speaker = str(spk)
+        speaker_path = os.path.join(speaker_dir, f"{speaker}.wav")
+        meta_path = _speaker_ref_meta_path(speaker_dir, speaker)
+
+        # If meta is fresh, keep it.
+        if os.path.exists(meta_path) and os.path.exists(speaker_path) and is_valid_wav(speaker_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+                if (
+                    isinstance(meta, dict)
+                    and meta.get("source_path") == vocals_path
+                    and meta.get("source_mtime") == src_mtime
+                    and meta.get("source_size") == src_size
+                    and float(meta.get("ref_seconds") or 0.0) == float(ref_seconds)
+                    and float(meta.get("stride_seconds") or 0.0) == float(stride_s)
+                    and int(meta.get("n_candidates") or 0) == int(n_candidates)
+                    and float(meta.get("silence_threshold") or 0.0) == float(silence_th)
+                    and float(meta.get("max_silence_ratio") or 0.0) == float(max_silence_ratio)
+                    and float(meta.get("transient_threshold") or 0.0) == float(transient_th)
+                ):
+                    continue
+            except Exception:
+                pass
+
+        # Candidate starts primarily from this speaker's transcript timestamps.
+        starts = _speaker_ref_candidate_starts(
+            segments,
+            speaker,
+            stride_seconds=stride_s,
+            total_dur=total_dur,
+            ref_seconds=ref_seconds,
+        )
+        if not starts:
+            # Fallback: scan whole file by stride.
+            if total_dur is not None and total_dur > 0 and ref_seconds > 0:
+                starts = [float(x) for x in np.arange(0.0, max(0.0, float(total_dur) - float(ref_seconds)), float(stride_s)).tolist()]
+            else:
+                starts = [0.0]
+
+        # Evaluate candidates (quick metrics only; heavy processing runs on top-N only).
+        evals: list[dict] = []
+        for s in starts:
+            check_cancelled()
+            try:
+                y, _sr = librosa.load(
+                    vocals_path, sr=int(sample_rate), mono=True, offset=max(0.0, float(s)), duration=float(ref_seconds)
+                )
+            except Exception:
+                continue
+            if y.size <= int(sample_rate):  # require >= 1s
+                continue
+            m = _speaker_ref_quick_metrics(
+                y,
+                silence_threshold=float(silence_th),
+                transient_threshold=float(transient_th),
+            )
+            m["start_sec"] = float(s)
+            evals.append(m)
+
+        if not evals:
+            continue
+
+        def _key(m: dict) -> tuple:
+            # Prefer segments with enough speech activity (low silence), then fewer transients/clips, then higher rms.
+            sil = float(m.get("silence_ratio", 1.0) or 1.0)
+            rms = float(m.get("rms", 0.0) or 0.0)
+            trans = int(m.get("transients", 0) or 0)
+            clip = float(m.get("clip_ratio", 0.0) or 0.0)
+            bad_sil = 1 if sil > float(max_silence_ratio) else 0
+            bad_rms = 1 if rms < 0.03 else 0
+            return (bad_sil, bad_rms, trans, clip, -rms, sil, float(m.get("start_sec", 0.0) or 0.0))
+
+        evals.sort(key=_key)
+        top = evals[: min(int(n_candidates), len(evals))]
+
+        # Remove old candidates for this speaker to avoid confusion.
+        try:
+            prefix = f"{speaker}.ref_"
+            for name in os.listdir(speaker_dir):
+                if name.startswith(prefix) and name.endswith(".wav"):
+                    try:
+                        os.remove(os.path.join(speaker_dir, name))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Generate & save candidates with anti-pop processing.
+        saved: list[dict] = []
+        best_written = False
+        for rank, m in enumerate(top):
+            check_cancelled()
+            start_sec = float(m.get("start_sec", 0.0) or 0.0)
+            out_name = _speaker_ref_candidate_filename(speaker, rank=rank, start_sec=start_sec)
+            out_path = os.path.join(speaker_dir, out_name)
+            try:
+                y, _sr = librosa.load(
+                    vocals_path, sr=int(sample_rate), mono=True, offset=max(0.0, start_sec), duration=float(ref_seconds)
+                )
+                if y.size <= 0:
+                    continue
+                y_proc = prepare_speaker_ref_audio(
+                    y,
+                    sample_rate=int(sample_rate),
+                    trim_silence=True,
+                    trim_top_db=30.0,
+                    apply_soft_clip=True,
+                    clip_threshold=0.85,
+                    apply_smooth=True,
+                    smooth_max_diff=0.25,
+                )
+                if y_proc.size <= 0:
+                    y_proc = y.astype(np.float32)
+                save_wav_norm(y_proc.astype(np.float32, copy=False), out_path, sample_rate=int(sample_rate))
+                saved.append(
+                    {
+                        "rank": int(rank),
+                        "start_sec": float(start_sec),
+                        "path": out_name,
+                        "metrics": {
+                            "rms": float(m.get("rms", 0.0) or 0.0),
+                            "silence_ratio": float(m.get("silence_ratio", 1.0) or 1.0),
+                            "clip_ratio": float(m.get("clip_ratio", 0.0) or 0.0),
+                            "transients": int(m.get("transients", 0) or 0),
+                        },
+                    }
+                )
+                if rank == 0:
+                    save_wav_norm(y_proc.astype(np.float32, copy=False), speaker_path, sample_rate=int(sample_rate))
+                    best_written = True
+            except Exception as exc:
+                logger.warning(f"生成参考片段失败 speaker={speaker} start={start_sec:.2f}s: {exc}")
+                continue
+
+        if best_written and os.path.exists(speaker_path):
+            # Ensure duration cap + anti-pop on the final selected file.
+            _ensure_wav_max_duration(speaker_path, float(ref_seconds), sample_rate=int(sample_rate))
+
+        # Write meta (even if saving failed, to avoid retry storm; user can delete it to force rebuild).
+        payload = {
+            "version": 1,
+            "speaker": speaker,
+            "source_path": vocals_path,
+            "source_mtime": src_mtime,
+            "source_size": src_size,
+            "sample_rate": int(sample_rate),
+            "ref_seconds": float(ref_seconds),
+            "stride_seconds": float(stride_s),
+            "n_candidates": int(n_candidates),
+            "silence_threshold": float(silence_th),
+            "max_silence_ratio": float(max_silence_ratio),
+            "transient_threshold": float(transient_th),
+            "evaluated": int(len(evals)),
+            "saved": saved,
+            "selected": (saved[0] if saved else None),
+            "created_at": float(time.time()),
+        }
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
 def preprocess_text(text: str) -> str:
     text = text.replace('AI', '人工智能')
     text = re.sub(r'(?<!^)([A-Z])', r' \1', text)
@@ -1569,9 +1905,23 @@ def generate_wavs(
     speaker_dir = os.path.join(folder, "SPEAKER")
     os.makedirs(speaker_dir, exist_ok=True)
 
-    # 如果 SPEAKER/*.wav 丢失（常见于旧任务目录或中途清理），从 audio_vocals.wav 兜底生成
+    # 生成多份参考音频并自动选择最优（默认启用，可通过 TTS_SPEAKER_REF_MULTI=0 禁用）
     vocals_path = os.path.join(folder, "audio_vocals.wav")
     if os.path.exists(vocals_path):
+        try:
+            _ensure_speaker_ref_multi(
+                folder=folder,
+                segments=transcript,
+                speakers={str(x) for x in speakers},
+                speaker_dir=speaker_dir,
+                vocals_path=vocals_path,
+                ref_seconds=float(max_ref_seconds),
+                sample_rate=24000,
+            )
+        except Exception as exc:
+            logger.warning(f"多参考音频生成/选择失败（将继续使用兜底逻辑）: {exc}")
+
+        # 兜底：如果 SPEAKER/*.wav 丢失（常见于旧任务目录或中途清理），从 audio_vocals.wav 取前 N 秒生成
         for spk in speakers:
             check_cancelled()
             spk_path = os.path.join(speaker_dir, f"{spk}.wav")
