@@ -204,6 +204,12 @@ BILI_COOKIE_PATH=cookies.json
 BILI_PROXY=
 # 首选上传线路（留空则自动选择）。推荐：bda2 / auto
 BILI_UPLOAD_CDN=
+# Submit API 轮换顺序（留空使用默认）
+# BILI_SUBMIT_APIS=web,b-cut,client
+# 使用 bcut 预上传避免风控（默认启用）
+# BILI_BCUT_PREUPLOAD=1
+# 投稿分区（默认 201 科学科普）
+# BILI_TID=201
 # 上传间隔（秒），避免触发限流
 BILI_UPLOAD_INTERVAL=60
 ```
