@@ -21,7 +21,13 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
-from ..utils import ensure_torchaudio_backend_compat, save_wav, save_wav_norm
+from ..utils import (
+    ensure_torchaudio_backend_compat,
+    read_speaker_ref_seconds,
+    save_wav,
+    save_wav_norm,
+    wav_duration_seconds,
+)
 
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
@@ -129,28 +135,6 @@ def is_valid_wav(path: str) -> bool:
         return False
 
 
-def _read_speaker_ref_seconds(default: float = 15.0) -> float:
-    """
-    Speaker reference audio duration (seconds) for voice cloning.
-
-    Official recommendation is usually 10-20s; we default to 15s.
-    Clamp to [3, 60] seconds to avoid pathological inputs.
-    """
-    raw = os.getenv("TTS_SPEAKER_REF_SECONDS")
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if not raw:
-        return default
-    try:
-        v = float(raw)
-    except ValueError:
-        return default
-    if not (v > 0):
-        return default
-    return float(max(3.0, min(v, 60.0)))
-
-
 def _read_env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -200,20 +184,6 @@ def _tts_duration_guard_params() -> tuple[float, float, float, int]:
     return float(ratio), float(extra), float(abs_cap), int(retries)
 
 
-def _wav_duration_seconds(path: str) -> float | None:
-    try:
-        with wave.open(path, "rb") as wf:
-            rate = int(wf.getframerate() or 0)
-            if rate <= 0:
-                return None
-            frames = int(wf.getnframes() or 0)
-            if frames <= 0:
-                return 0.0
-            return frames / float(rate)
-    except Exception:
-        return None
-
-
 def _tts_segment_allowed_max_seconds(seg_dur: float, ratio: float, extra: float, abs_cap: float) -> float | None:
     """
     Compute allowed max duration for a TTS segment.
@@ -231,7 +201,7 @@ def _tts_segment_allowed_max_seconds(seg_dur: float, ratio: float, extra: float,
 def _tts_wav_ok_for_segment(path: str, seg_dur: float, ratio: float, extra: float, abs_cap: float) -> bool:
     if not (os.path.exists(path) and is_valid_wav(path)):
         return False
-    dur = _wav_duration_seconds(path)
+    dur = wav_duration_seconds(path)
     if dur is None:
         return False
     allowed = _tts_segment_allowed_max_seconds(seg_dur, ratio, extra, abs_cap)
@@ -321,7 +291,7 @@ def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 2
     if max_seconds <= 0:
         return
 
-    dur = _wav_duration_seconds(path)
+    dur = wav_duration_seconds(path)
     if dur is not None and dur <= max_seconds + 0.02:
         return
 
@@ -1530,7 +1500,7 @@ def generate_wavs(
     )
 
     # 防止历史数据/旧逻辑生成超长 SPEAKER/*.wav 导致 voice cloning 显存/时间爆炸
-    max_ref_seconds = _read_speaker_ref_seconds()
+    max_ref_seconds = read_speaker_ref_seconds()
     allow_silence_fallback = (os.getenv("TTS_ALLOW_SILENCE_FALLBACK", "").strip().lower() in {"1", "true", "yes", "y"})
     failed_segments: list[int] = []
     speaker_dir = os.path.join(folder, "SPEAKER")
@@ -1621,7 +1591,7 @@ def generate_wavs(
                         seg_dur = 0.0
                     if _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
                         # Also guard against "hit max_new_tokens cap" outputs from old runs.
-                        if not _qwen_tts_is_degenerate_hit_cap(wav_dur=_wav_duration_seconds(out)):
+                        if not _qwen_tts_is_degenerate_hit_cap(wav_dur=wav_duration_seconds(out)):
                             qwen_cached_before.add(i)
                         else:
                             try:
@@ -1664,7 +1634,7 @@ def generate_wavs(
                                 seg_dur = 0.0
                             if (
                                 (not _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap))
-                                or _qwen_tts_is_degenerate_hit_cap(wav_dur=_wav_duration_seconds(out))
+                                or _qwen_tts_is_degenerate_hit_cap(wav_dur=wav_duration_seconds(out))
                             ):
                                 os.remove(out)
                         except Exception:
@@ -1816,7 +1786,7 @@ def generate_wavs(
             if os.path.exists(output_path):
                 try:
                     if _tts_wav_ok_for_segment(output_path, seg_dur, dur_ratio, dur_extra, dur_abs_cap) and (
-                        (tts_method != "qwen") or (not _qwen_tts_is_degenerate_hit_cap(wav_dur=_wav_duration_seconds(output_path)))
+                        (tts_method != "qwen") or (not _qwen_tts_is_degenerate_hit_cap(wav_dur=wav_duration_seconds(output_path)))
                     ):
                         wav_ok = True
                     else:
@@ -1913,7 +1883,7 @@ def generate_wavs(
                     if tts_method == "qwen":
                         qwen_dur = _qwen_resp_duration_seconds(qwen_resp) if qwen_resp else None
                         if qwen_dur is None and os.path.exists(output_path):
-                            qwen_dur = _wav_duration_seconds(output_path)
+                            qwen_dur = wav_duration_seconds(output_path)
                         if _qwen_tts_is_degenerate_hit_cap(wav_dur=qwen_dur):
                             last_err = f"qwen_tts_degenerate_hit_max_new_tokens ({_qwen_tts_max_new_tokens()})"
                             logger.warning(
@@ -1931,7 +1901,7 @@ def generate_wavs(
                         wav_ok = True
                         break
 
-                    wav_dur = _wav_duration_seconds(output_path) if os.path.exists(output_path) else None
+                    wav_dur = wav_duration_seconds(output_path) if os.path.exists(output_path) else None
                     allowed = _tts_segment_allowed_max_seconds(seg_dur, dur_ratio, dur_extra, dur_abs_cap)
                     if wav_dur is not None and allowed is not None and wav_dur > allowed + 0.02:
                         logger.warning(

@@ -1,9 +1,50 @@
 import os
 import re
+import wave
 
 import numpy as np
 from scipy.io import wavfile
 from loguru import logger
+
+
+def wav_duration_seconds(path: str) -> float | None:
+    """Return WAV duration in seconds using stdlib `wave`.
+
+    Returns None if header is invalid/unreadable.
+    """
+    try:
+        with wave.open(path, "rb") as wf:
+            rate = int(wf.getframerate() or 0)
+            if rate <= 0:
+                return None
+            frames = int(wf.getnframes() or 0)
+            if frames <= 0:
+                return 0.0
+            return frames / float(rate)
+    except Exception:
+        return None
+
+
+def read_speaker_ref_seconds(default: float = 15.0) -> float:
+    """
+    Speaker reference audio duration (seconds) for voice cloning.
+
+    Official recommendation is usually 10-20s; we default to 15s.
+    Clamp to [3, 60] seconds to avoid pathological inputs.
+    """
+    raw = os.getenv("TTS_SPEAKER_REF_SECONDS")
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    if not (v > 0):
+        return default
+    return float(max(3.0, min(v, 60.0)))
 
 
 def valid_file(path: str, *, min_bytes: int = 1) -> bool:

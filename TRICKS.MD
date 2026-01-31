@@ -1,6 +1,7 @@
 # YouDub Tricks 技巧集
 
-本文档记录了为实现双语字幕对轴和TTS语音生成兜底所采用的各种技巧和策略。
+本文档记录了本项目中“带计算/规则”的核心算法与工程策略（字幕字号/换行、时间轴、对齐、兜底等）。
+注意：为了避免文档与实现漂移，优先写 **关键规则/公式 + 对应函数名**，不要长期依赖拷贝出来的旧代码片段。
 
 ---
 
@@ -24,25 +25,38 @@
 - `translation_adaptive.json` - 对轴后的字幕时间轴
 - `adaptive_plan.json` - 视频合成计划（speech + pause 段）
 
-### 2. 字幕换行阈值按分辨率计算
+补充要点（实现见 `src/youdub/steps/synthesize_video.py::_ensure_audio_combined` + 合成阶段滤镜生成）：
+- 音频侧：自适应模式下 **不对 TTS 做 time_stretch**；只做首尾静音裁剪 + 插入短停顿，输出时间轴由“拼接后的样本游标”生成。
+- 停顿时长：按译文末尾标点粗略估计（句号/问号/感叹号更长，逗号/分号/冒号次之，其它更短）。
+- 视频侧：按 `adaptive_plan.json` 逐段 `trim + setpts`（倍率 `factor = target_duration / src_duration`），然后 `concat`；避免强制固定 FPS（使用 `-vsync vfr`）。
+
+### 2. 字幕样式参数（字号/描边/边距/换行阈值）
 
 **问题**: 固定的换行字符数在不同分辨率/宽高比下表现不一致（竖屏视频字幕过长，横屏过短）。
 
-**解决方案**: 根据输出宽度和字号动态计算每行最大字符数。
+**解决方案**: 根据输出分辨率动态计算：字号、描边、底边距，以及 CJK/英文换行阈值（实现见 `src/youdub/steps/synthesize_video.py::_calc_subtitle_style_params` / `_calc_subtitle_wrap_chars`）。
 
 ```python
-def _calc_subtitle_wrap_chars(width, font_size, *, en_font_scale=0.75):
-    # 水平安全边距：~3% 每侧，至少10px
-    margin_x = max(10, int(round(w * 0.03)))
-    safe_w = max(1, w - 2 * margin_x)
-    
-    # CJK字符宽度约等于字号
-    max_chars_zh = max(1, int(safe_w / (float(fs) * 0.85)))
-    # 英文字符更窄
-    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.62)))
+def _calc_subtitle_style_params(width, height, *, en_font_scale=0.75):
+    # base_dim 取短边：横屏取高度，竖屏取宽度
+    base_dim = min(width, height)
+
+    # 经验比例：横屏略大(4.5%)，竖屏略小(4.0%)
+    font_scale = 0.045 if (width >= height) else 0.040
+    font_size = clamp(round(base_dim * font_scale), 18, 120)
+
+    outline = max(1, round(font_size * 0.08))     # 描边约为字号的 8%
+    margin_v = max(10, round(font_size * 0.20))   # 底边距约为字号的 20%
+
+    # 换行阈值：按宽度扣掉左右安全边距后，再按“平均字形宽度”估算能容纳的字符数
+    margin_x = max(10, round(width * 0.04))       # 左右各 ~4%，保守避免裁切
+    safe_w = width - 2 * margin_x
+    max_chars_zh = max(1, int(safe_w / (font_size * 0.90)))
+    en_fs = max(1, round(font_size * en_font_scale))
+    max_chars_en = max(1, int(safe_w / (en_fs * 0.65)))
 ```
 
-### 3. 双语字幕英文仅保留一句
+### 3. 双语字幕英文仅保留一句（避免铺屏）
 
 **问题**: 直接显示整段英文原文会铺满屏幕，影响可读性。
 
@@ -55,7 +69,7 @@ def _first_sentence(text, *, max_chars=220):
     # 避免把长段落全部显示
 ```
 
-### 4. 双语字幕原文补齐
+### 4. 双语字幕原文补齐（旧文件兼容）
 
 **问题**: 旧版 `translation.json` 可能缺少 `text` 字段（原文）。
 
@@ -68,7 +82,7 @@ def _ensure_bilingual_source_text(folder, translation, *, adaptive_segment_stret
     # 回写到 translation.json 持久化
 ```
 
-### 5. 原文到译文数量映射
+### 5. 原文到译文数量映射（避免重复长段落）
 
 **问题**: 译文按句切分后数量可能多于原文句子数，导致重复显示原文。
 
@@ -81,6 +95,20 @@ def _map_source_text_to_translation_count(text, target_count):
     # 3. 还不够，按单词均分
     # 目标: 产出恰好 target_count 个原文块，避免重复
 ```
+
+### 6. 翻译分句后的时间轴再分配（对齐字幕可读性）
+
+实现见 `src/youdub/steps/translate.py::split_sentences`：
+- 将每段译文按句切分（`split_text_into_sentences`）
+- 将原文映射到相同数量（`_map_source_text_to_translation_count`）
+- 按每句字符数分配时间：`duration_per_char = (end - start) / sum(len(sentence))`
+- **强制最后一句的 end 等于原段 end**，避免累计误差导致时间轴漂移
+
+### 7. 时间戳格式化（SRT/ASS）
+
+实现见 `src/youdub/steps/synthesize_video.py`：
+- `format_timestamp(seconds)`：SRT 格式 `HH:MM:SS,mmm`
+- `format_timestamp_ass(seconds)`：ASS 格式 `H:MM:SS.cc`（厘秒，做四舍五入并处理 `cs==100` 进位）
 
 ---
 
@@ -277,3 +305,56 @@ if attempt >= 1 and not qwen_restarted_for_this_segment:
     _restart_qwen_worker("segment invalid twice")
     qwen_restarted_for_this_segment = True
 ```
+
+### 4. 输出分辨率计算（按宽高比 + 偶数对齐）
+
+实现见 `src/youdub/steps/synthesize_video.py::convert_resolution`：
+- 输入：视频宽高比 `aspect_ratio` + 目标档位（如 `1080p`）
+- 规则：短边固定为 `base_res`，长边按宽高比推算；最后把宽高都对齐为偶数（FFmpeg 编码更稳）
+
+### 5. 下载后视频有效性快速检查（ffprobe 时长兜底）
+
+实现见 `src/youdub/steps/download.py::_probe_video_valid`：
+- 优先探测 `stream=duration`（有视频流且可读时长）
+- 失败则回退到 `format=duration`
+- 只要可解析且 `duration >= min_duration` 即判定有效；超时/异常直接视为无效
+
+### 6. WAV 写入归一化（峰值缩放到 int16）
+
+实现见 `src/youdub/utils.py::save_wav_norm`：
+- 计算峰值 `peak = max(abs(max(wav)), abs(min(wav)))`
+- 缩放系数 `32767 / max(0.01, peak)`，避免除 0
+- 写入 int16，防止削波并保持音量可听
+
+---
+
+## 五、ASR 转写 / 说话人相关算法
+
+### 1. 句子切分并按权重分配时间（无词级时间戳的兜底）
+
+实现见 `src/youdub/steps/transcribe.py::_split_text_with_timing`：
+- 用句末标点切分：`(?<=[。！？!?\.])\s*`
+- 权重：每段去空格后的字符数（最小 1）
+- 按权重线性分配时长：`seg_dur = duration * (w / sum(w))`
+- 最后一段强制贴到原 `end_s`（避免浮点误差）
+
+### 2. 转写段合并（按说话人边界 + 句末标点）
+
+实现见 `src/youdub/steps/transcribe.py::merge_segments`：
+- **永不跨 speaker 合并**
+- buffer 末尾字符如果属于 `ending='!"\\').:;?]}~'` 则截断（认为一句结束）
+- 否则把下一段拼到 buffer，并延长 `end`
+
+### 3. 说话人分配：与 diarization turns 最大重叠
+
+实现见 `src/youdub/steps/transcribe.py::_assign_speakers_by_overlap`：
+- 对每个 ASR segment，在与其时间窗口相交的 turns 中，选择 **重叠时长最大** 的 speaker
+- turns 先按 start 排序，并用游标跳过完全在 segment 之前的 turn，避免 `O(n^2)` 扫描退化
+
+---
+
+## 六、通用小工具（用于“去重复实现”）
+
+目前已集中到 `src/youdub/utils.py`：
+- `wav_duration_seconds(path)`：用 stdlib `wave` 读 wav header 计算时长（返回 `float | None`）
+- `read_speaker_ref_seconds(default=15.0)`：读取 `TTS_SPEAKER_REF_SECONDS` 并 clamp 到 `[3, 60]`

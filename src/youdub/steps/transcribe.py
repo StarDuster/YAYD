@@ -8,7 +8,6 @@ import os
 import re
 import sys
 import time
-import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,12 @@ from loguru import logger
 from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
-from ..utils import ensure_torchaudio_backend_compat, save_wav
+from ..utils import (
+    ensure_torchaudio_backend_compat,
+    read_speaker_ref_seconds,
+    save_wav,
+    wav_duration_seconds,
+)
 
 
 @contextlib.contextmanager
@@ -95,20 +99,6 @@ def _import_qwen_asr():
     return Qwen3ASRModel
 
 
-def _wav_duration_seconds(path: str) -> float | None:
-    try:
-        with wave.open(path, "rb") as wf:
-            rate = int(wf.getframerate() or 0)
-            if rate <= 0:
-                return None
-            frames = int(wf.getnframes() or 0)
-            if frames <= 0:
-                return 0.0
-            return frames / float(rate)
-    except Exception:
-        return None
-
-
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\.])\s*")
 
 
@@ -135,28 +125,6 @@ def _split_text_with_timing(text: str, start_s: float, end_s: float) -> list[dic
         out.append({"start": float(cur), "end": float(seg_end), "text": p, "speaker": "SPEAKER_00"})
         cur = seg_end
     return out
-
-
-def _read_speaker_ref_seconds(default: float = 15.0) -> float:
-    """
-    Speaker reference audio duration (seconds) for downstream TTS voice cloning.
-
-    Official recommendation is usually 10-20s; we default to 15s.
-    Clamp to [3, 60] seconds to avoid pathological inputs.
-    """
-    raw = os.getenv("TTS_SPEAKER_REF_SECONDS")
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if not raw:
-        return default
-    try:
-        v = float(raw)
-    except ValueError:
-        return default
-    if not (v > 0):
-        return default
-    return float(max(3.0, min(v, 60.0)))
 
 
 def _preload_cudnn_for_onnxruntime_gpu() -> None:
@@ -540,7 +508,7 @@ def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> Non
         return
 
     target_sr = 24000
-    max_ref_seconds = _read_speaker_ref_seconds()
+    max_ref_seconds = read_speaker_ref_seconds()
     max_ref_samples = int(max_ref_seconds * float(target_sr))
     delay = 0.05
     speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
@@ -737,7 +705,7 @@ def transcribe_audio(
         logger.info(f"转录中(Qwen3-ASR) {wav_path}")
         t0 = time.time()
 
-        dur = _wav_duration_seconds(wav_path)
+        dur = wav_duration_seconds(wav_path)
         if dur is None:
             # Fallback: use librosa header-based duration.
             try:
