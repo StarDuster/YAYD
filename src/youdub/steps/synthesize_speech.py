@@ -539,7 +539,15 @@ def _ensure_speaker_ref_multi(
                     and float(meta.get("max_silence_ratio") or 0.0) == float(max_silence_ratio)
                     and float(meta.get("transient_threshold") or 0.0) == float(transient_th)
                 ):
-                    continue
+                    # Only skip when we have a valid selection record (otherwise retry).
+                    sel = meta.get("selected")
+                    sel_name = None
+                    if isinstance(sel, dict):
+                        sel_name = sel.get("path")
+                    if isinstance(sel_name, str) and sel_name.endswith(".wav"):
+                        sel_path = os.path.join(speaker_dir, sel_name)
+                        if os.path.exists(sel_path) and is_valid_wav(sel_path):
+                            continue
             except Exception:
                 pass
 
