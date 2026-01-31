@@ -20,7 +20,9 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v2: audio_combined = audio_tts + instruments (NO original vocals mixed in)
 # v3: match TTS loudness to original vocals peak + normalize output;
 #     adaptive mode no longer phase-vocoder stretches TTS (avoid “回音/空洞”感)
-_AUDIO_COMBINED_MIX_VERSION = 3
+# v4: non-adaptive mode aligns TTS onto original timeline (by ASR timestamps)
+#     to avoid subtitle drift / voice desync.
+_AUDIO_COMBINED_MIX_VERSION = 4
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -926,7 +928,8 @@ def _ensure_audio_combined(
         - 逐段拼接（可裁剪首尾静音）并插入短停顿，生成 translation_adaptive.json
         - 同时生成 adaptive_plan.json，用于逐段拉伸/裁剪原视频并 concat
     否则:
-        - 按顺序拼接TTS音频片段
+        - 将各段 TTS 放置到原始时间轴（segment start），中间自动补静音
+          这样字幕（基于 translation.json 的时间戳）不会随段落时长差异而漂移。
     """
     check_cancelled()
     
@@ -1100,26 +1103,93 @@ def _ensure_audio_combined(
         logger.info(f"已生成 adaptive_plan.json: {adaptive_plan_path}")
         
     else:
-        # 非自适应模式：按顺序拼接
-        audio_segments: list[np.ndarray] = []
-        for _i, wav_file in enumerate(wav_files[:len(translation)]):
+        # 非自适应模式：对齐到原始时间轴（按 translation.json 的 start 放置）
+        # 这样字幕轴=语音轴（后续再统一做 speed_up/atempo 缩放即可）。
+        trim_top_db = 35.0
+
+        def _safe_float(v: Any, default: float = 0.0) -> float:
+            try:
+                x = float(v)
+                if not (x == x):  # NaN
+                    return float(default)
+                return float(x)
+            except Exception:
+                return float(default)
+
+        # Pre-allocate by max(end) to avoid repeated reallocs.
+        max_end = 0.0
+        for seg in translation:
+            try:
+                s0 = _safe_float(seg.get("start", 0.0), 0.0)
+                s1 = _safe_float(seg.get("end", s0), s0)
+                if s1 < s0:
+                    s0, s1 = s1, s0
+                if s1 > max_end:
+                    max_end = float(s1)
+            except Exception:
+                continue
+
+        total_samples = int(round(max(0.0, float(max_end)) * float(sample_rate)))
+        if total_samples <= 0:
+            raise ValueError("无法从 translation.json 计算有效时长（end <= 0）")
+
+        audio_tts = np.zeros(total_samples, dtype=np.float32)
+        last_written_end = 0
+
+        for i in range(len(translation)):
             check_cancelled()
-            wav_path = os.path.join(wavs_folder, wav_file)
+            wav_path = os.path.join(wavs_folder, wav_files[i])
             if not os.path.exists(wav_path):
                 logger.warning(f"TTS音频文件不存在: {wav_path}")
                 continue
             
             try:
-                audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
-                audio_segments.append(audio.astype(np.float32, copy=False))
+                tts_audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
+                tts_audio = tts_audio.astype(np.float32, copy=False)
+
+                # Trim leading/trailing silence so subtitle->speech offset is smaller.
+                if tts_audio.size > 0:
+                    try:
+                        trimmed, _idx = librosa.effects.trim(tts_audio, top_db=float(trim_top_db))
+                        if trimmed is not None and trimmed.size > 0:
+                            tts_audio = trimmed.astype(np.float32, copy=False)
+                    except Exception:
+                        pass
+
+                seg = translation[i]
+                start_s = _safe_float(seg.get("start", 0.0), 0.0)
+                if start_s < 0.0:
+                    start_s = 0.0
+                start_idx = int(round(start_s * float(sample_rate)))
+                if start_idx < 0:
+                    start_idx = 0
+
+                seg_len = int(tts_audio.shape[0])
+                if seg_len <= 0:
+                    continue
+                end_idx = start_idx + seg_len
+
+                if end_idx > int(audio_tts.shape[0]):
+                    # Extend output buffer if one segment runs beyond the max(end) window.
+                    audio_tts = np.pad(audio_tts, (0, end_idx - int(audio_tts.shape[0])), mode="constant")
+
+                # If overlaps happen, cut the previous tail so the new segment aligns to its subtitle.
+                if start_idx < last_written_end:
+                    overlap = float(last_written_end - start_idx) / float(sample_rate)
+                    logger.warning(
+                        f"非自适应模式：检测到 TTS 片段重叠 idx={i} overlap={overlap:.3f}s，"
+                        "将截断前一段尾部以保证字幕/语音对齐。建议使用 adaptive_segment_stretch 获得更自然效果。"
+                    )
+                    audio_tts[start_idx:last_written_end] = 0.0
+
+                audio_tts[start_idx:end_idx] = tts_audio
+                last_written_end = max(last_written_end, end_idx)
             except Exception as e:
                 logger.warning(f"加载TTS音频失败 {wav_path}: {e}")
                 continue
-        
-        if not audio_segments:
+
+        if last_written_end <= 0:
             raise ValueError("没有有效的TTS音频片段")
-        
-        audio_tts = np.concatenate(audio_segments).astype(np.float32, copy=False)
     
     # 将 TTS 音量匹配到原始人声峰值（确保音量与原视频相近）
     audio_vocals_path = os.path.join(folder, 'audio_vocals.wav')
