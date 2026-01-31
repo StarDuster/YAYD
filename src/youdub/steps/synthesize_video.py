@@ -4,6 +4,7 @@ import re
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
 
@@ -1681,10 +1682,11 @@ def synthesize_all_video_under_folder(
     bilingual_subtitle: bool = False,
     auto_upload_video: bool = False,
 ) -> str:
-    count = 0
+    # Collect targets first so we can optionally run them concurrently.
+    targets: list[str] = []
     for root, _dirs, files in os.walk(folder):
         check_cancelled()
-        if 'download.mp4' not in files:
+        if "download.mp4" not in files:
             continue
         # Use the same freshness logic as synthesize_video() to avoid stale reuse.
         meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
@@ -1700,26 +1702,80 @@ def synthesize_all_video_under_folder(
             use_nvenc=use_nvenc,
         )
         if not up_to_date:
-            synthesize_video(
-                root,
-                subtitles=subtitles,
-                bilingual_subtitle=bilingual_subtitle,
-                speed_up=speed_up,
-                fps=fps,
-                resolution=resolution,
-                use_nvenc=use_nvenc,
-                adaptive_segment_stretch=adaptive_segment_stretch,
-            )
-            count += 1
+            targets.append(root)
 
-        if auto_upload_video:
-            # Enqueue in background so it won't block synthesizing other videos.
+    if not targets:
+        msg = f"视频合成完成: {folder}（处理 0 个文件）"
+        logger.info(msg)
+        return msg
+
+    def _maybe_enqueue_upload(root: str) -> None:
+        if not auto_upload_video:
+            return
+        # Enqueue in background so it won't block synthesizing other videos.
+        try:
+            from .upload import upload_video_async  # local import to avoid hard dependency for non-upload users
+
+            upload_video_async(root)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"加入B站后台上传队列失败（忽略）: {exc}")
+
+    ok = 0
+    failed: list[str] = []
+
+    # Only parallelize when NVENC is enabled and there are multiple videos.
+    # Rationale:
+    # - NVENC has a dedicated concurrency guard (_NVENC_SEMAPHORE).
+    # - libx264 parallelism can easily saturate CPU and degrade overall throughput.
+    parallel = bool(use_nvenc) and len(targets) > 1
+    max_workers = min(_NVENC_MAX_CONCURRENCY, len(targets)) if parallel else 1
+
+    if parallel:
+        logger.info(
+            f"检测到多个视频且启用 NVENC，将并发合成视频: max_workers={max_workers}（NVENC并发上限={_NVENC_MAX_CONCURRENCY}）"
+        )
+
+    def _run_one(root: str) -> None:
+        synthesize_video(
+            root,
+            subtitles=subtitles,
+            bilingual_subtitle=bilingual_subtitle,
+            speed_up=speed_up,
+            fps=fps,
+            resolution=resolution,
+            use_nvenc=use_nvenc,
+            adaptive_segment_stretch=adaptive_segment_stretch,
+        )
+
+    if max_workers <= 1:
+        for root in targets:
+            check_cancelled()
             try:
-                from .upload import upload_video_async  # local import to avoid hard dependency for non-upload users
-
-                upload_video_async(root)
+                _run_one(root)
+                ok += 1
+                _maybe_enqueue_upload(root)
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"加入B站后台上传队列失败（忽略）: {exc}")
-    msg = f"视频合成完成: {folder}（处理 {count} 个文件）"
+                failed.append(root)
+                logger.exception(f"视频合成失败（已跳过）: {root} ({exc})")
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_root = {executor.submit(_run_one, root): root for root in targets}
+            for future in as_completed(future_to_root):
+                check_cancelled()
+                root = future_to_root[future]
+                try:
+                    future.result()
+                    ok += 1
+                    _maybe_enqueue_upload(root)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(root)
+                    logger.exception(f"视频合成失败（已跳过）: {root} ({exc})")
+
+    msg = f"视频合成完成: {folder}（处理 {len(targets)} 个文件，成功 {ok}，失败 {len(failed)}）"
+    if failed:
+        # Keep it short to avoid spamming logs for huge batches.
+        preview = failed[:8]
+        more = f" ...（另有 {len(failed) - len(preview)} 个）" if len(failed) > len(preview) else ""
+        logger.warning(f"以下目录视频合成失败，请查看日志定位原因: {preview}{more}")
     logger.info(msg)
     return msg
