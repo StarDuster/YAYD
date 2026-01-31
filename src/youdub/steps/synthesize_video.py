@@ -33,7 +33,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v8: restore subtitle font scaling (1080p -> ~36) for readability
 # v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
 # v10: keep 1080p landscape at ~36; portrait slightly smaller
-_VIDEO_META_VERSION = 10
+# v11: increase 1080p landscape subtitle size (~49) to match expected readability
+_VIDEO_META_VERSION = 11
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -619,21 +620,22 @@ def _calc_subtitle_style_params(
     h = max(1, int(height))
 
     # Subtitle font size: readable across resolutions.
-    # - Landscape: scale from height (1080p 16:9 -> ~36).
-    # - Portrait: scale from width, slightly smaller (1080x1920 -> ~33).
+    # - Landscape: scale from height (1080p 16:9 -> ~49).
+    # - Portrait: scale from width, slightly smaller (1080x1920 -> ~33~36).
     if w >= h:
         base_dim = h
-        scale = 1.0
+        font_scale = 0.045
     else:
         base_dim = w
-        scale = 0.94
+        font_scale = 0.033 * 0.94
 
     # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
-    font_size = int(round(float(base_dim) * 0.033 * float(scale)))
+    font_size = int(round(float(base_dim) * float(font_scale)))
     font_size = max(18, min(font_size, 120))
-    outline = max(1, int(round(font_size / 20)))
-    # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
-    margin_v = max(12, int(round(font_size * 0.80)))
+    # Outline: keep strong contrast on complex backgrounds (49 -> 4, 36 -> 3).
+    outline = max(1, int(round(float(font_size) * 0.08)))
+    # Bottom margin: keep tight (49 -> 10) while avoiding clipping.
+    margin_v = max(10, int(round(float(font_size) * 0.20)))
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(
         int(w), int(font_size), en_font_scale=float(en_font_scale)
     )
