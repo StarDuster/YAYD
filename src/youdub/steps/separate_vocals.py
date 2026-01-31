@@ -1,3 +1,4 @@
+import gc
 import os
 import subprocess
 import time
@@ -9,7 +10,7 @@ from loguru import logger
 from ..config import Settings
 from ..models import ModelManager
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..utils import gc_and_maybe_trim, save_wav_norm, valid_file
+from ..utils import save_wav_norm, valid_file
 
 
 class DemucsDependencyError(RuntimeError):
@@ -106,7 +107,7 @@ def unload_model() -> None:
         _DEMUCS_DEVICE = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        gc_and_maybe_trim()
+        gc.collect()
         logger.info("Demucs 模型已卸载")
 
 

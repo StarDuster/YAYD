@@ -21,7 +21,7 @@ from loguru import logger
 from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
-from ..utils import ensure_torchaudio_backend_compat, gc_and_maybe_trim, save_wav
+from ..utils import ensure_torchaudio_backend_compat, save_wav
 
 
 @contextlib.contextmanager
@@ -229,7 +229,9 @@ def unload_all_models() -> None:
     if cleared:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        gc_and_maybe_trim()
+        import gc
+
+        gc.collect()
         logger.info("ASR/说话人分离模型已卸载")
 
 
