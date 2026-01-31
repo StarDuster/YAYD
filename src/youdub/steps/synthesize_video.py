@@ -139,16 +139,21 @@ def _audio_combined_needs_rebuild(
 ) -> bool:
     audio_combined_path = os.path.join(folder, "audio_combined.wav")
     if not valid_file(audio_combined_path, min_bytes=44):
+        logger.debug(f"audio_combined 需要重建: 文件不存在或过小")
         return True
 
     meta = _read_audio_combined_meta(folder)
     if not meta:
+        logger.debug(f"audio_combined 需要重建: 元数据文件不存在")
         return True
     if int(meta.get("mix_version") or 0) != int(_AUDIO_COMBINED_MIX_VERSION):
+        logger.debug(f"audio_combined 需要重建: mix_version 不匹配 ({meta.get('mix_version')} != {_AUDIO_COMBINED_MIX_VERSION})")
         return True
     if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
+        logger.debug(f"audio_combined 需要重建: adaptive_segment_stretch 参数不匹配")
         return True
     if int(meta.get("sample_rate") or 0) != int(sample_rate):
+        logger.debug(f"audio_combined 需要重建: sample_rate 不匹配 ({meta.get('sample_rate')} != {sample_rate})")
         return True
 
     # audio_combined depends on: TTS wavs, translation timeline/text (pauses), instruments, and vocals (for loudness match)
@@ -158,7 +163,10 @@ def _audio_combined_needs_rebuild(
         os.path.join(folder, "audio_instruments.wav"),
         os.path.join(folder, "audio_vocals.wav"),
     ]
-    return _is_stale(audio_combined_path, deps)
+    if _is_stale(audio_combined_path, deps):
+        logger.debug(f"audio_combined 需要重建: 依赖文件比 audio_combined.wav 更新")
+        return True
+    return False
 
 
 def _video_up_to_date(
@@ -175,39 +183,53 @@ def _video_up_to_date(
 ) -> bool:
     output_video = os.path.join(folder, "video.mp4")
     if not valid_file(output_video, min_bytes=1024):
+        logger.debug(f"video 过期原因: video.mp4 不存在或过小")
         return False
 
     # If audio needs rebuild (e.g. old mixing semantics), video is also stale.
     if _audio_combined_needs_rebuild(
         folder, adaptive_segment_stretch=adaptive_segment_stretch, sample_rate=sample_rate
     ):
+        logger.debug(f"video 过期原因: audio_combined 需要重建")
         return False
 
     meta = _read_video_meta(folder)
     if not meta:
+        logger.debug(f"video 过期原因: 元数据文件不存在")
         return False
     if int(meta.get("version") or 0) != int(_VIDEO_META_VERSION):
+        logger.debug(f"video 过期原因: 元数据版本不匹配 ({meta.get('version')} != {_VIDEO_META_VERSION})")
         return False
     if bool(meta.get("subtitles")) != bool(subtitles):
+        logger.debug(f"video 过期原因: subtitles 参数不匹配")
         return False
     if bool(meta.get("bilingual_subtitle")) != bool(bilingual_subtitle):
+        logger.debug(f"video 过期原因: bilingual_subtitle 参数不匹配")
         return False
     if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
+        logger.debug(f"video 过期原因: adaptive_segment_stretch 参数不匹配")
         return False
     try:
         if abs(float(meta.get("speed_up")) - float(speed_up)) > 1e-6:
+            logger.debug(f"video 过期原因: speed_up 参数不匹配 ({meta.get('speed_up')} != {speed_up})")
             return False
     except Exception:
+        logger.debug(f"video 过期原因: speed_up 参数解析失败")
         return False
     if int(meta.get("fps") or 0) != int(fps):
+        logger.debug(f"video 过期原因: fps 参数不匹配 ({meta.get('fps')} != {fps})")
         return False
     if str(meta.get("resolution") or "") != str(resolution):
+        logger.debug(f"video 过期原因: resolution 参数不匹配 ({meta.get('resolution')} != {resolution})")
         return False
     if bool(meta.get("use_nvenc")) != bool(use_nvenc):
+        logger.debug(f"video 过期原因: use_nvenc 参数不匹配")
         return False
     if int(meta.get("audio_sample_rate") or 0) != int(_VIDEO_AUDIO_SAMPLE_RATE):
+        logger.debug(f"video 过期原因: audio_sample_rate 不匹配 ({meta.get('audio_sample_rate')} != {_VIDEO_AUDIO_SAMPLE_RATE})")
         return False
     if str(meta.get("audio_bitrate") or "") != str(_VIDEO_AUDIO_BITRATE):
+        logger.debug(f"video 过期原因: audio_bitrate 不匹配 ({meta.get('audio_bitrate')} != {_VIDEO_AUDIO_BITRATE})")
         return False
 
     deps = [
@@ -220,7 +242,10 @@ def _video_up_to_date(
     if subtitles:
         tr = "translation_adaptive.json" if adaptive_segment_stretch else "translation.json"
         deps.append(os.path.join(folder, tr))
-    return not _is_stale(output_video, deps)
+    if _is_stale(output_video, deps):
+        logger.debug(f"video 过期原因: 依赖文件比 video.mp4 更新")
+        return False
+    return True
 
 
 def _is_cjk_char(ch: str) -> bool:
