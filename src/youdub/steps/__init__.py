@@ -5,6 +5,7 @@ from .download import (
     get_target_folder,
 )
 from .separate_vocals import (
+    CorruptedVideoError,
     extract_audio_from_video,
     init_demucs,
     separate_all_audio_under_folder,
@@ -45,6 +46,7 @@ from .generate_info import (
 from .upload import upload_all_videos_under_folder, upload_video, upload_video_async
 
 __all__ = [
+    "CorruptedVideoError",
     "download_from_url",
     "download_single_video",
     "get_info_list_from_url",

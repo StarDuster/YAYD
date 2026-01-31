@@ -18,6 +18,11 @@ class DemucsDependencyError(RuntimeError):
     pass
 
 
+class CorruptedVideoError(RuntimeError):
+    """视频文件损坏，需要重新下载。"""
+    pass
+
+
 _DEMUCS_LOCK = threading.Lock()
 _DEMUCS_MODEL: Any | None = None
 _DEMUCS_MODEL_NAME: str | None = None
@@ -279,7 +284,31 @@ def extract_audio_from_video(folder: str) -> bool:
         pass
 
     if proc.returncode not in (0, None):
-        logger.error(f"FFmpeg 提取音频失败: {video_path} (rc={proc.returncode})\n{stderr or stdout}")
+        error_output = stderr or stdout
+        logger.error(f"FFmpeg 提取音频失败: {video_path} (rc={proc.returncode})\n{error_output}")
+        
+        # 检测视频文件损坏的特征
+        corruption_indicators = [
+            "Invalid NAL unit size",
+            "Error splitting the input into NAL units",
+            "does not contain any stream",
+            "Invalid data found when processing",
+            "moov atom not found",
+            "Invalid H.264",
+            "non-existing PPS",
+            "no frame!",
+        ]
+        is_corrupted = any(indicator in error_output for indicator in corruption_indicators)
+        
+        if is_corrupted:
+            logger.warning(f"检测到视频文件损坏，删除后请重新下载: {video_path}")
+            try:
+                os.remove(video_path)
+                logger.info(f"已删除损坏的视频文件: {video_path}")
+            except Exception as e:
+                logger.warning(f"删除损坏视频文件失败: {video_path} ({e})")
+            raise CorruptedVideoError(f"视频文件损坏，已删除: {video_path}")
+        
         return False
 
     sleep_with_cancel(1)
