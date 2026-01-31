@@ -341,20 +341,6 @@ def valid_translation(text: str, translation: str) -> tuple[bool, str]:
 
 _PUNCT_FIX_TRANSCRIPT_FILE = "transcript_punctuated.json"
 
-# NOTE:
-# Only allow changing these punctuation marks.
-# Do NOT include "-" or "_" here: they are often part of tokens (e.g. Q-Learning, file_name).
-_PUNCT_FIX_ALLOWED_CHARS = set(
-    "，。！？；：、"
-    ",.!?;:"
-    "…"
-    "“”‘’\"'"
-    "（）()"
-    "【】[]"
-    "《》"
-    "—–"
-)
-
 
 def _read_env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -368,18 +354,6 @@ def _read_env_bool(name: str, default: bool) -> bool:
     return bool(default)
 
 
-def _strip_punct_for_validation(s: str) -> str:
-    if not s:
-        return ""
-    return "".join(ch for ch in s if ch not in _PUNCT_FIX_ALLOWED_CHARS)
-
-
-def _punct_fix_is_valid(src: str, out: str) -> bool:
-    # Hard guarantee: only punctuation changes are allowed.
-    # Compare the exact sequence of all non-punctuation characters (including spaces/newlines).
-    return _strip_punct_for_validation(str(src)) == _strip_punct_for_validation(str(out))
-
-
 def _punct_fix_chunk(
     settings: Settings,
     payload: dict[str, str],
@@ -387,15 +361,14 @@ def _punct_fix_chunk(
     attempt_limit: int = 5,
 ) -> tuple[dict[str, str], bool]:
     """
-    Punctuate a JSON map {key: text} via LLM. Returns (mapping, ok).
-    - ok=True: mapping validated for all keys (only punctuation changes)
-    - ok=False: caller should treat as "best-effort failed" (mapping == original payload)
+    Refine transcript chunk via LLM: fix ASR errors and improve punctuation.
+    Returns (mapping, ok).
     """
     # Skip empty-only chunks quickly.
     if not any(str(v or "").strip() for v in payload.values()):
         return dict(payload), True
 
-    # We fill results progressively; any key we can't validate falls back to the original.
+    # We fill results progressively.
     result: dict[str, str] = {}
     remaining: dict[str, str] = {}
     for k, src in payload.items():
@@ -406,16 +379,18 @@ def _punct_fix_chunk(
             remaining[k] = str(src)
 
     system = (
-        "你是“Whisper 转写标点修复器”。你的任务：只通过【插入/删除/替换标点符号】来改善断句与可读性，"
-        "避免一句话里逗号过多导致句子过长。\n"
+        "你是专业的 ASR（语音识别）转录文本修复专家。你的任务是修复 Whisper 转录文本中的显著错误并优化标点符号，"
+        "使其更符合人类阅读习惯。\n"
         "\n"
-        "硬性规则（必须遵守）：\n"
-        "1) 除了标点符号以外，任何字符都不得改变：不得增删改任何汉字/字母/数字/大小写/空格/换行；词序必须完全保持。\n"
-        "2) 允许修改的只有标点符号（中英文逗号句号问号叹号分号冒号顿号引号括号等）。\n"
-        "3) 禁止：翻译、纠错、改写、润色、补词、删词、同义替换、调整措辞；禁止改变原有换行结构。\n"
-        "4) 不要改变 URL / 邮箱 / 版本号 / 文件名 / 代码 token 内部的字符（例如 3.14、foo_bar、Q-Learning、https://...）。\n"
-        "5) 断句目标：让句子更短更清晰。遇到“逗号串联很长”的情况，优先把部分逗号改为句号或分号；必要时插入句号/问号/叹号来断句。\n"
-        "6) 自检（输出前必须做）：对每一条 value，将输入与输出的所有标点符号删除后必须完全一致；若无法满足，直接原样返回该条输入。\n"
+        "请遵循以下原则：\n"
+        "1. **修正转录错误**：仅在发现明显的拼写错误、同音词混淆（如 \"their\" vs \"there\"）、无意义的重复词（如 \"the the\"）"
+        "或上下文完全不通顺的词汇时进行修正。对于专有名词、代码 token、版本号等，请保持谨慎，不要随意修改。\n"
+        "2. **优化标点符号**：\n"
+        "   - **长句断句**：Whisper 有时会输出非常长的句子（run-on sentences）。请在语法和语义合适的位置插入句号（. 或 。）"
+        "或分号（; 或 ；），将长句拆分为更短、更易读的句子。\n"
+        "   - **补充语气标点**：根据句子语气补充缺失的问号（?）、感叹号（!）或省略号（...）。\n"
+        "   - **保持风格**：尽量沿用原文的标点风格（全角/半角）。\n"
+        "3. **保持原意**：不要进行改写、润色或总结，必须保留原文的完整语义。\n"
         "\n"
         "输入是一个 JSON 对象：key 是字符串编号，value 是待处理文本。\n"
         "输出要求：只输出 JSON 对象本身，不要任何解释；必须包含与输入完全相同的所有 key。\n"
@@ -446,23 +421,26 @@ def _punct_fix_chunk(
             for k, src in remaining.items():
                 v = obj.get(k, None)
                 if v is None:
+                    # Key missing in output
                     invalid_keys.append(k)
                     continue
+                
+                # Check for empty output on non-empty input (safety guard)
                 cand = str(v)
-                if not _punct_fix_is_valid(src, cand):
-                    invalid_keys.append(k)
-                    continue
+                if src and not cand.strip():
+                     invalid_keys.append(k)
+                     continue
+
                 result[k] = cand
                 progressed += 1
 
             if invalid_keys:
                 had_failures = True
                 # If no key was accepted in this attempt, warn and stop retrying aggressively.
-                # Retrying the exact same payload often wastes minutes and does not improve output.
                 if progressed <= 0:
                     logger.warning(
-                        f"标点修复校验失败 (尝试={attempt + 1}/{attempt_limit}): "
-                        f"invalid_keys={invalid_keys[:5]} (total={len(invalid_keys)})"
+                        f"转录修复部分失败 (尝试={attempt + 1}/{attempt_limit}): "
+                        f"missing_keys={invalid_keys[:5]} (total={len(invalid_keys)})"
                     )
                     break
                 remaining = {k: remaining[k] for k in invalid_keys}
@@ -473,7 +451,7 @@ def _punct_fix_chunk(
             break
         except (ValueError, JSONDecodeError) as exc:
             last_parse_error = str(exc)
-            logger.warning(f"标点修复解析失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
+            logger.warning(f"转录修复解析失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
             sleep_with_cancel(0.3)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
@@ -487,7 +465,7 @@ def _punct_fix_chunk(
         had_failures = True
         # Avoid log spam; only mention parse errors when we never made progress.
         if last_parse_error and not result:
-            logger.warning(f"标点修复失败，将回退到原文（原因: {last_parse_error}）")
+            logger.warning(f"转录修复失败，将回退到原文（原因: {last_parse_error}）")
 
     final = dict(payload)
     final.update(result)

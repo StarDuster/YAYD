@@ -168,20 +168,6 @@ def test_valid_translation_rejects_chinese_label_patterns():
 # --------------------------------------------------------------------------- #
 
 
-def test_punct_fix_validation_allows_only_punctuation_changes():
-    from youdub.steps.translate import _punct_fix_is_valid
-
-    assert _punct_fix_is_valid("Hello world", "Hello, world") is True
-    assert _punct_fix_is_valid("你好世界", "你好世界！") is True
-    assert _punct_fix_is_valid("Hello, world", "Hello world") is True
-
-    # Hyphen is treated as non-punctuation to protect tokens like "Q-Learning".
-    assert _punct_fix_is_valid("Q-Learning", "Q Learning") is False
-
-    # Non-punctuation edits must be rejected.
-    assert _punct_fix_is_valid("abc", "abd") is False
-
-
 def test_translate_folder_applies_punctuation_fix_before_translate(tmp_path: Path, monkeypatch):
     import youdub.steps.translate as tr
 
@@ -206,11 +192,11 @@ def test_translate_folder_applies_punctuation_fix_before_translate(tmp_path: Pat
 
     def _fake_chat_completion_text(_backend, messages):
         system = str(messages[0].get("content", ""))
-        if "Whisper 转写标点修复器" not in system:
-            raise AssertionError("unexpected model call (not punctuation fix)")
+        if "转录文本修复专家" not in system:
+            raise AssertionError("unexpected model call (not transcription fix)")
         payload = json.loads(str(messages[1].get("content", "")))
-        # Only insert punctuation; keep every non-punctuation character exactly the same.
-        out = {k: str(v).replace("Hello world", "Hello, world") for k, v in payload.items()}
+        # Modify text (add punctuation AND fix capitalization)
+        out = {k: str(v).replace("Hello world", "Hello, World!") for k, v in payload.items()}
         return json.dumps(out, ensure_ascii=False)
 
     monkeypatch.setattr(tr, "_chat_completion_text", _fake_chat_completion_text)
@@ -225,7 +211,8 @@ def test_translate_folder_applies_punctuation_fix_before_translate(tmp_path: Pat
 
     ok = tr.translate_folder(str(folder), target_language="简体中文", settings=tr.Settings(openai_api_key="dummy"))
     assert ok is True
-    assert captured.get("text0") == "Hello, world"
+    # Verify that the text modification was accepted (even though it changed non-punctuation characters)
+    assert captured.get("text0") == "Hello, World!"
 
 
 def test_punctuated_transcript_cache_is_reused(tmp_path: Path, monkeypatch):
@@ -244,20 +231,20 @@ def test_punctuated_transcript_cache_is_reused(tmp_path: Path, monkeypatch):
     def _fake_chat_completion_text(_backend, messages):
         calls["n"] += 1
         payload = json.loads(str(messages[1].get("content", "")))
-        out = {k: str(v).replace("Hello world", "Hello, world") for k, v in payload.items()}
+        out = {k: str(v).replace("Hello world", "Hello, World!") for k, v in payload.items()}
         return json.dumps(out, ensure_ascii=False)
 
     monkeypatch.setattr(tr, "_chat_completion_text", _fake_chat_completion_text)
 
     settings = tr.Settings(openai_api_key="dummy")
     out1 = tr._load_or_create_punctuated_transcript(str(folder), transcript, settings=settings)  # noqa: SLF001
-    assert out1[0]["text"] == "Hello, world"
+    assert out1[0]["text"] == "Hello, World!"
     assert calls["n"] == 1
     assert (folder / "transcript_punctuated.json").exists()
 
     # Second call should use the cached file instead of calling the model again.
     out2 = tr._load_or_create_punctuated_transcript(str(folder), transcript, settings=settings)  # noqa: SLF001
-    assert out2[0]["text"] == "Hello, world"
+    assert out2[0]["text"] == "Hello, World!"
     assert calls["n"] == 1
 
 
