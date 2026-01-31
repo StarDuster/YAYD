@@ -620,7 +620,7 @@ def _clear_pending_bili_uploads() -> None:
 
 
 def _bili_upload_worker() -> None:
-    logger.info("B站后台上传线程已启动（不阻塞视频处理）")
+    logger.info("B站后台上传线程已启动")
     first_upload = True
     while True:
         folder = _BILI_UPLOAD_QUEUE.get()
@@ -693,5 +693,5 @@ def upload_video_async(folder: str) -> str:
             )
             _BILI_UPLOAD_WORKER.start()
 
-    logger.info(f"已加入B站后台上传队列（不阻塞后续处理）: {folder}")
+    logger.info(f"已加入B站上传队列: {folder}")
     return f"已加入B站后台上传队列: {folder}"
