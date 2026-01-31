@@ -20,8 +20,8 @@ dependencies = [
     "pydantic>=2.0.0,<3.0.0",
     "pydantic-settings>=2.0.0,<3.0.0",
 
-    # Video downloading
-    "yt-dlp[default,curl-cffi,secretstorage]",
+    # Video downloading (使用 nightly 版本以获取最新的 YouTube 反爬虫修复)
+    "yt-dlp[default,curl-cffi,secretstorage]>=2026.1.29",
     "curl_cffi",
     "yt-dlp-invidious",
     "bgutil-ytdlp-pot-provider",
@@ -126,6 +126,9 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
+# 允许使用预发布版本 (nightly)，以获取最新的 YouTube 反爬虫修复
+prerelease = "allow"
+
 # faster-whisper / qwen-tts depend on `onnxruntime`. We declare the runtime explicitly in
 # [project.optional-dependencies] (cpu/gpu extras), and patch upstream metadata to avoid forcing a specific onnxruntime wheel.
 dependency-metadata = [

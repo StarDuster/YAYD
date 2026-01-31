@@ -120,8 +120,8 @@ def download_single_video(
         'outtmpl': os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}', 'download'),
         'ignoreerrors': True,
         'remote_components': ['ejs:github'],
-        # 避免使用受 SABR 影响的 client (如 web_safari)
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'tv_embedded']}},
+        # web 支持 cookies，android/ios 不支持 cookies，排除受 SABR 影响的 web_safari
+        'extractor_args': {'youtube': {'player_client': ['web', 'android', 'ios']}},
     }
     _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
 
@@ -153,8 +153,8 @@ def get_info_list_from_url(
         'playlistend': num_videos,
         'ignoreerrors': True,
         'remote_components': ['ejs:github'],
-        # 避免使用受 SABR 影响的 client (如 web_safari)
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'tv_embedded']}},
+        # web 支持 cookies，android/ios 不支持 cookies，排除受 SABR 影响的 web_safari
+        'extractor_args': {'youtube': {'player_client': ['web', 'android', 'ios']}},
     }
     _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
 
