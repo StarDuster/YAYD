@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+from functools import lru_cache
 
 import numpy as np
 from scipy.io import wavfile
@@ -23,6 +25,70 @@ def require_file(path: str, desc: str, *, min_bytes: int = 1) -> None:
             raise FileNotFoundError(f"{desc}文件过小/疑似损坏: {path}")
     except OSError:
         raise FileNotFoundError(f"无法读取{desc}: {path}") from None
+
+
+def _env_flag(name: str) -> bool:
+    return (os.getenv(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@lru_cache(maxsize=1)
+def _is_wsl() -> bool:
+    """Best-effort WSL detection (WSL1/WSL2)."""
+    if sys.platform != "linux":
+        return False
+    for p in ("/proc/sys/kernel/osrelease", "/proc/version"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                if "microsoft" in f.read().lower():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def maybe_malloc_trim() -> bool:
+    """
+    Best-effort release freed heap memory back to the OS.
+
+    Why:
+    - Under WSL2, Python/C++ extension frees often don't reduce RSS promptly,
+      which looks like a memory leak and can trigger OOM.
+
+    Controls:
+    - `YOUDUB_MALLOC_TRIM=1` force-enable on Linux
+    - `YOUDUB_DISABLE_MALLOC_TRIM=1` disable
+
+    Returns True if `malloc_trim(0)` was called successfully.
+    """
+    if _env_flag("YOUDUB_DISABLE_MALLOC_TRIM"):
+        return False
+    if sys.platform != "linux":
+        return False
+    if not (_env_flag("YOUDUB_MALLOC_TRIM") or _is_wsl()):
+        return False
+    try:
+        import ctypes
+
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+        except Exception:
+            libc = ctypes.CDLL(None)
+        fn = getattr(libc, "malloc_trim", None)
+        if fn is None:
+            return False
+        fn.argtypes = [ctypes.c_size_t]
+        fn.restype = ctypes.c_int
+        return bool(fn(0))
+    except Exception:
+        return False
+
+
+def gc_and_maybe_trim() -> bool:
+    """Run GC and (optionally) trim heap RSS (Linux/WSL2)."""
+    import gc
+
+    gc.collect()
+    return maybe_malloc_trim()
 
 
 def _peak_abs(wav: np.ndarray) -> float:
