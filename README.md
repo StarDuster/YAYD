@@ -14,13 +14,18 @@
     *   采用 `faster-whisper` (Large-v3) + `ctranslate2` 进行高精度语音识别。
     *   集成 `pyannote.audio` (兼容 v3.1-v4) 进行说话人区分，支持多角色识别。
 4.  **文本翻译**: 支持 OpenAI 兼容 API 和并发翻译。
+    *   翻译前自动修复 ASR 标点（长句断句、补充语气标点）。
+    *   支持全局术语表，保持术语一致性。
 5.  **语音合成 (TTS)** (通过 `TTS_METHOD` 配置):
     *   ByteDance (火山引擎豆包语音大模型)
     *   Google Gemini TTS
     *   Qwen3-TTS (本地模型，Qwen3 TTS 实测效果已足够好，推荐使用)
 6.  **视频合成**: 音频对齐、变速处理，自动混音背景音轨，生成带字幕的最终视频。
     *   **加速倍率**: 英语和中文的平均每分钟字/词数存在差别，默认使用 1.2 倍加速以避免大范围无声片段。
-    *   **自适应时长**: 可在视频合成阶段启用"按段自适应拉伸语音"，根据每段原始时长动态调整 TTS 语速，减少无声间隙（启用后加速倍率设置无效）。
+    *   **自适应拉伸**: 可启用"按段自适应拉伸"模式，逐段拉伸原视频以匹配 TTS 音频时长，实现更精确的口型同步（启用后加速倍率设置无效）。
+    *   **双语字幕**: 支持生成中英双语字幕（ASS 格式），英文原文仅保留一句以提高可读性。
+
+更多实现细节请参阅 [TRICKS.MD](./TRICKS.MD)。
 
 ## 系统要求
 
@@ -173,10 +178,13 @@ QWEN_TTS_MODEL_PATH=models/TTS/Qwen3-TTS-12Hz-1.7B-Base
 QWEN_TTS_PYTHON=.venv/bin/python
 
 # --- 翻译配置 (可选) ---
-# 翻译策略: history (串行带上下文) / guide_parallel (默认，先生成翻译指南，再并发翻译)
-TRANSLATION_STRATEGY=parallel
-# guide_parallel 模式下的并发数
+# 翻译策略:
+#   - history: 串行翻译，每句带上下文历史
+#   - guide_parallel (默认): 先生成术语表和翻译指南，再并发分块翻译
+TRANSLATION_STRATEGY=guide_parallel
+# guide_parallel 模式下的并发数和分块大小
 TRANSLATION_MAX_CONCURRENCY=4
+TRANSLATION_CHUNK_SIZE=8
 
 # --- yt-dlp 下载认证 (可选) ---
 # 需要登录才能访问的内容（私有播放列表、年龄限制视频等）可配置 cookies。
@@ -191,11 +199,13 @@ YTDLP_COOKIES_FROM_BROWSER_PROFILE=
 
 # --- B站上传配置 (可选) ---
 # cookie 文件路径（由 biliup login 生成）
-BILI_COOKIE_PATH=bili_cookies.json
+BILI_COOKIE_PATH=cookies.json
 # 上传代理（可选，如 socks5h://127.0.0.1:1080）
 BILI_PROXY=
 # 首选上传线路：bda / bda2 / tx / txa / bldsa（留空则自动选择）
 BILI_UPLOAD_CDN=
+# 上传间隔（秒），避免触发限流
+BILI_UPLOAD_INTERVAL=60
 ```
 
 ## 使用说明
@@ -214,9 +224,26 @@ uv run youdub
 2.  **全自动模式**:
     *   输入视频 URL。
     *   选择目标语言。
+    *   可选：启用"双语字幕"和"自适应拉伸"选项。
     *   点击“提交”，系统将自动执行下载、分离、识别、翻译、合成全流程。
 3.  **分步模式**:
     *   可在各标签页单独执行特定步骤（如仅下载、仅翻译、仅 TTS），便于调试或人工修正中间结果（如修正 `translation.json`）。
+
+### 输出文件说明
+
+处理完成后，每个视频文件夹包含以下关键文件：
+
+| 文件 | 说明 |
+|------|------|
+| `download.mp4` | 原始视频 |
+| `transcript.json` | ASR 转写结果 |
+| `translation.json` | 翻译结果（按句切分，用于字幕） |
+| `translation_raw.json` | 原始翻译（1:1 对应转写，未按句切分） |
+| `summary.json` | 视频摘要和标签 |
+| `video.mp4` | 最终合成视频 |
+| `subtitles.srt` / `subtitles.ass` | 字幕文件 |
+| `wavs/` | TTS 生成的语音片段 |
+| `translation_adaptive.json` | 自适应模式下的时间轴（仅自适应模式） |
 
 ### yt-dlp 使用 Cookie（可选）
 

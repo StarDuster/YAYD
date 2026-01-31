@@ -86,29 +86,14 @@ def _map_source_text_to_translation_count(text, target_count):
 
 ## 二、TTS语音生成兜底
 
-### 1. Qwen TTS Token上限检测
+### 1. TTS输出时长校验（防止EOS预测失败）
 
-**问题**: Qwen3-TTS 有时会陷入退化循环，一直生成到 `max_new_tokens`（约170秒）。
+**问题**: TTS模型（尤其是Qwen3-TTS）有时无法正确采样到结束符（EOS），导致持续输出直到触及token上限，产生异常长的音频（如10秒原文生成170秒音频）。
 
-**解决方案**: 检测输出时长是否接近token上限，视为失败并重试。
-
-```python
-_QWEN_TTS_TOKEN_HZ = 12.0  # Tokenizer-12Hz
-_QWEN_TTS_MAX_NEW_TOKENS_DEFAULT = 2048
-
-def _qwen_tts_is_degenerate_hit_cap(*, wav_dur):
-    cap = float(_qwen_tts_max_new_tokens()) / 12.0  # ≈ 170秒
-    tol = 2.0  # 容差
-    return wav_dur >= cap - tol
-```
-
-### 2. TTS片段时长校验
-
-**问题**: TTS偶尔输出异常长的音频（如10秒原文生成10分钟音频）。
-
-**解决方案**: 基于原始片段时长设置上限，超出则删除重试。
+**解决方案**: 双层检测机制，任一触发即视为失败并重试。
 
 ```python
+# 层1: 相对上限 - 基于原始片段时长
 def _tts_duration_guard_params():
     ratio = 3.0      # 最大倍数
     extra = 8.0      # 额外秒数
@@ -118,9 +103,18 @@ def _tts_duration_guard_params():
 def _tts_segment_allowed_max_seconds(seg_dur, ratio, extra, abs_cap):
     # allowed = max(seg_dur * ratio, seg_dur + extra)
     # 例: 10秒原文 -> 允许最多 max(30, 18) = 30秒
+
+# 层2: 绝对上限 - 检测是否命中Qwen的max_new_tokens
+_QWEN_TTS_TOKEN_HZ = 12.0  # Tokenizer-12Hz
+_QWEN_TTS_MAX_NEW_TOKENS_DEFAULT = 2048
+
+def _qwen_tts_is_degenerate_hit_cap(*, wav_dur):
+    cap = float(_qwen_tts_max_new_tokens()) / 12.0  # ≈ 170秒
+    tol = 2.0  # 容差
+    return wav_dur >= cap - tol  # 接近上限 = 退化循环
 ```
 
-### 3. TTS提示词规范化
+### 2. TTS提示词规范化
 
 **问题**: Python代码token（如 `os.path.join`）和 `snake_case` 标识符会被TTS错误发音。
 
@@ -133,7 +127,7 @@ def _tts_prompt_normalize_python_tokens(text):
     # 注意: 不影响小数如 3.14
 ```
 
-### 4. 重试时逐步清理文本
+### 3. 重试时逐步清理文本
 
 **问题**: 含有markdown/代码块的文本可能导致TTS失败。
 
@@ -151,7 +145,7 @@ def _tts_text_for_attempt(raw_text, attempt):
         t = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9\s，。！？,.!?:：]", " ", t)
 ```
 
-### 5. 说话人参考音频裁剪
+### 4. 说话人参考音频裁剪
 
 **问题**: 历史遗留的超长 SPEAKER/*.wav 会导致voice cloning显存/时间爆炸。
 
@@ -161,31 +155,6 @@ def _tts_text_for_attempt(raw_text, attempt):
 def _ensure_wav_max_duration(path, max_seconds, sample_rate=24000):
     # 官方推荐10-20秒
     # 超出则用librosa裁剪
-```
-
-### 6. 缺失说话人音频兜底
-
-**问题**: 旧任务目录或中途清理后 SPEAKER/*.wav 丢失。
-
-**解决方案**: 从 `audio_vocals.wav` 自动生成。
-
-```python
-# 如果 SPEAKER/*.wav 丢失，从 audio_vocals.wav 截取前 max_ref_seconds 秒
-wav, _ = librosa.load(vocals_path, sr=24000, duration=max_ref_seconds)
-save_wav(wav, spk_path)
-```
-
-### 7. Marker存在但wavs不完整时继续生成
-
-**问题**: `.tts_done.json` 存在但 `wavs/` 目录被部分清理。
-
-**解决方案**: 校验所有分段wav文件的完整性。
-
-```python
-def _tts_segment_wavs_complete(folder, expected_segments):
-    # 检查 first/last segment
-    # 遍历检查每个 wav 是否存在且有效
-    # 检查时长是否在合理范围内
 ```
 
 ---
@@ -211,18 +180,27 @@ def _punct_fix_chunk(settings, payload, *, attempt_limit=5):
 
 ### 2. 翻译校验逻辑
 
-**问题**: LLM有时会输出解释性文本而非纯译文，或译文过长/过短。
+**问题**: LLM有时会输出解释性文本而非纯译文，或译文过长/过短，也不适合直接送给TTS。
 
 **解决方案**: 使用精确正则模式匹配检测异常输出。
 
 ```python
 explanation_patterns = [
-    (r'^翻译[：:]\s*', '翻译：'),           # 拒绝 "翻译：你好"
-    (r'翻译(结果|如下|为)[：:]?', '...'),   # 拒绝 "翻译结果是..."
-    (r'^(简体)?中文[：:]\s*', '中文：'),    # 拒绝 "中文：你好"
-    (r'[Tt]ranslat(e|ion)[：:]\s*', '...'), # 拒绝 "Translation: ..."
+    # 使用精确正则（带位置锚点和特定上下文），区分"模型解释"和"原文内容"
+    
+    # "翻译" - 拒绝元解释，允许内容讨论
+    (r'^翻译[：:]\s*', ...),              # 拒绝 "翻译：你好"（开头+冒号=元解释）
+    (r'翻译(结果|如下|为)[：:]?', ...),   # 拒绝 "翻译结果是..."
+    # 但允许 "机器翻译技术" / "这是一个翻译软件"（无特定模式=内容）
+    
+    # "中文" - 拒绝元解释，允许内容讨论
+    (r'^(简体)?中文[：:]\s*', ...),       # 拒绝 "中文：你好"（开头+冒号）
+    # 但允许 "学习中文" / "中文版本"（无冒号=内容）
+    
+    # "这句" - 拒绝解释句意，允许正常翻译
+    (r'这句.{0,3}(的翻译|的意思)', ...),  # 拒绝 "这句话的翻译是..."
+    # 但允许 "这句话很有道理"（无"翻译/意思"后缀=正常译文）
 ]
-# 注意: 允许正常翻译中提到"这句话"/"中文版本"等
 ```
 
 ### 3. 智能分段翻译
@@ -299,21 +277,3 @@ if attempt >= 1 and not qwen_restarted_for_this_segment:
     _restart_qwen_worker("segment invalid twice")
     qwen_restarted_for_this_segment = True
 ```
-
----
-
-## 相关提交
-
-| Commit | 描述 |
-|--------|------|
-| `5a301b2` | feat(synth): implement advanced adaptive stretch and bilingual ASS subtitles |
-| `b7f43e6` | fix(synth): prevent adaptive stretch drift via timeline anchoring |
-| `187fc66` | feat(synth): improve adaptive stretch with timeline compaction |
-| `470e1f0` | fix(synth): 限制Qwen3-TTS最大token并对命中上限输出重试 |
-| `77ced1b` | fix(synth): 增加TTS片段时长校验与重试 |
-| `0e429ef` | fix(synth): 规范化TTS提示词中的python点链与下划线 |
-| `72eec85` | feat(translate): 翻译前增加转写标点修复 |
-| `4d6a9e1` | fix(translate): 改进所有翻译校验逻辑，使用精确模式匹配 |
-| `082c511` | fix(video): 双语字幕英文仅保留一句 |
-| `bbe03c1` | fix(synth): 按视频分辨率等比例计算字幕换行阈值 |
-| `16b0df5` | fix(video): 缩放后再渲染字幕并补齐双语原文 |
