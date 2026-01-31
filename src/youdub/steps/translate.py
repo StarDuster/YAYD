@@ -395,6 +395,16 @@ def _punct_fix_chunk(
     if not any(str(v or "").strip() for v in payload.values()):
         return dict(payload), True
 
+    # We fill results progressively; any key we can't validate falls back to the original.
+    result: dict[str, str] = {}
+    remaining: dict[str, str] = {}
+    for k, src in payload.items():
+        if not str(src or "").strip():
+            # Preserve empties exactly.
+            result[k] = str(src or "")
+        else:
+            remaining[k] = str(src)
+
     system = (
         "你是“Whisper 转写标点修复器”。你的任务：只通过【插入/删除/替换标点符号】来改善断句与可读性，"
         "避免一句话里逗号过多导致句子过长。\n"
@@ -410,12 +420,18 @@ def _punct_fix_chunk(
         "输入是一个 JSON 对象：key 是字符串编号，value 是待处理文本。\n"
         "输出要求：只输出 JSON 对象本身，不要任何解释；必须包含与输入完全相同的所有 key。\n"
     )
-    user = json.dumps(payload, ensure_ascii=False)
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
     backend = _get_thread_backend(settings)
+    had_failures = False
+    last_parse_error: str | None = None
     for attempt in range(attempt_limit):
         check_cancelled()
+        if not remaining:
+            break
+
+        user = json.dumps(remaining, ensure_ascii=False)
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
         try:
             content = _chat_completion_text(backend, messages)
             obj = _extract_first_json_object(content)
@@ -425,34 +441,61 @@ def _punct_fix_chunk(
                     obj = cast(dict[str, Any], obj[wrap_key])
                     break
 
-            out: dict[str, str] = {}
-            for k, src in payload.items():
-                # Preserve empties exactly.
-                if not str(src or "").strip():
-                    out[k] = str(src or "")
-                    continue
+            invalid_keys: list[str] = []
+            progressed = 0
+            for k, src in remaining.items():
                 v = obj.get(k, None)
                 if v is None:
-                    raise ValueError(f"missing key: {k}")
+                    invalid_keys.append(k)
+                    continue
                 cand = str(v)
                 if not _punct_fix_is_valid(src, cand):
-                    raise ValueError(f"invalid punctuation fix for key={k}")
-                out[k] = cand
+                    invalid_keys.append(k)
+                    continue
+                result[k] = cand
+                progressed += 1
 
-            # Ensure we didn't lose keys (strict contract).
-            if set(out.keys()) != set(payload.keys()):
-                raise ValueError("key set mismatch")
-            return out, True
+            if invalid_keys:
+                had_failures = True
+                # If no key was accepted in this attempt, warn and stop retrying aggressively.
+                # Retrying the exact same payload often wastes minutes and does not improve output.
+                if progressed <= 0:
+                    logger.warning(
+                        f"标点修复校验失败 (尝试={attempt + 1}/{attempt_limit}): "
+                        f"invalid_keys={invalid_keys[:5]} (total={len(invalid_keys)})"
+                    )
+                    break
+                remaining = {k: remaining[k] for k in invalid_keys}
+                sleep_with_cancel(0.2)
+                continue
+
+            remaining = {}
+            break
         except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"标点修复解析/校验失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
-            sleep_with_cancel(0.8)
+            last_parse_error = str(exc)
+            logger.warning(f"标点修复解析失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
+            sleep_with_cancel(0.3)
         except Exception as exc:
             delay = _handle_sdk_exception(exc, attempt)
             if delay is None:
-                return dict(payload), False
+                had_failures = True
+                break
             sleep_with_cancel(delay)
 
-    return dict(payload), False
+    # Any remaining keys fall back to original text.
+    if remaining:
+        had_failures = True
+        # Avoid log spam; only mention parse errors when we never made progress.
+        if last_parse_error and not result:
+            logger.warning(f"标点修复失败，将回退到原文（原因: {last_parse_error}）")
+
+    final = dict(payload)
+    final.update(result)
+    # Ensure strict contract: return must contain all keys.
+    if set(final.keys()) != set(payload.keys()):
+        # Extremely defensive: if something went wrong, return original.
+        return dict(payload), False
+    return final, (not had_failures)
 
 
 def _load_or_create_punctuated_transcript(
@@ -493,21 +536,24 @@ def _load_or_create_punctuated_transcript(
         out: list[dict[str, Any]] = [dict(it) for it in transcript]
 
         # Small batching: one call returns a JSON map of multiple segments.
-        chunk_size = max(1, min(_read_int_env("PUNCTUATION_FIX_CHUNK_SIZE", 24), 128))
-        all_ok = True
+        chunk_size = max(1, min(_read_int_env("PUNCTUATION_FIX_CHUNK_SIZE", 8), 128))
+        attempt_limit = max(1, min(_read_int_env("PUNCTUATION_FIX_ATTEMPT_LIMIT", 2), 10))
+        any_changed = False
 
         for i0 in range(0, len(out), chunk_size):
             check_cancelled()
             idxs = list(range(i0, min(i0 + chunk_size, len(out))))
             payload = {str(i): cast(str, out[i].get("text", "")) for i in idxs}
-            fixed, ok = _punct_fix_chunk(settings, payload, attempt_limit=5)
-            if not ok:
-                all_ok = False
+            fixed, _ok = _punct_fix_chunk(settings, payload, attempt_limit=attempt_limit)
             for i in idxs:
-                out[i]["text"] = fixed.get(str(i), payload[str(i)])
+                src = payload[str(i)]
+                new = fixed.get(str(i), src)
+                if new != src:
+                    any_changed = True
+                out[i]["text"] = new
 
-        # Only cache if the whole run succeeded; avoid caching "no-op due to failures".
-        if all_ok:
+        # Cache only if we actually changed something (avoid caching "no-op due to failures").
+        if any_changed:
             try:
                 with open(punct_path, "w", encoding="utf-8") as f:
                     json.dump(out, f, indent=2, ensure_ascii=False)
