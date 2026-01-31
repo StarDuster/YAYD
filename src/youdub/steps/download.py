@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Generator
 
@@ -8,6 +9,10 @@ from loguru import logger
 
 from ..config import Settings
 from ..interrupts import check_cancelled
+
+# 下载重试配置
+MAX_DOWNLOAD_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
 
 
 def sanitize_title(title: str) -> str:
@@ -127,16 +132,24 @@ def download_single_video(
     }
     _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    webpage_url = info.get('webpage_url')
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         check_cancelled()
-        rc = ydl.download([info['webpage_url']])
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            rc = ydl.download([webpage_url])
+        
+        if os.path.exists(download_mp4):
+            logger.info(f"下载完成: {output_folder}")
+            return output_folder
+        
         if rc not in (0, None):
-            logger.warning(f"yt-dlp 返回非 0: {rc} ({info.get('webpage_url')})")
+            logger.warning(f"yt-dlp 返回非 0: {rc} ({webpage_url})")
+        
+        if attempt < MAX_DOWNLOAD_RETRIES:
+            logger.info(f"下载失败，{RETRY_DELAY_SECONDS}s 后重试 ({attempt}/{MAX_DOWNLOAD_RETRIES}): {webpage_url}")
+            time.sleep(RETRY_DELAY_SECONDS)
     
-    if os.path.exists(download_mp4):
-        logger.info(f"下载完成: {output_folder}")
-        return output_folder
-    logger.error(f"下载失败，文件不存在: {download_mp4}")
+    logger.error(f"下载失败（已重试 {MAX_DOWNLOAD_RETRIES} 次），文件不存在: {download_mp4}")
     return None
 
 
