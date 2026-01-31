@@ -26,7 +26,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v4: make wrap heuristic more conservative; shrink default font size further
 # v5: shrink non-bilingual subtitle font size further (1080p -> ~26)
 # v6: shrink non-bilingual subtitle size further (1080p -> ~19) and reduce outline
-_VIDEO_META_VERSION = 6
+# v7: use ASS for monolingual subtitles too (ensures font size is respected via PlayRes)
+_VIDEO_META_VERSION = 7
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -580,6 +581,86 @@ def _first_sentence(text: str, *, max_chars: int = 220) -> str:
     return s
 
 
+def _generate_ass_header(
+    *,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+    font_name: str = "Arial",
+    font_size: int = 49,
+    outline: int = 4,
+    margin_l: int = 10,
+    margin_r: int = 10,
+    margin_v: int = 10,
+) -> list[str]:
+    """Generate common ASS header lines."""
+    return [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        f"PlayResX: {int(play_res_x)}",
+        f"PlayResY: {int(play_res_y)}",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font_name},{int(font_size)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,{int(outline)},0,2,{int(margin_l)},{int(margin_r)},{int(margin_v)},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+
+def generate_monolingual_ass(
+    translation: list[dict[str, Any]],
+    ass_path: str,
+    *,
+    speed_up: float = 1.0,
+    play_res_x: int = 1920,
+    play_res_y: int = 1080,
+    font_name: str = "Arial",
+    font_size: int = 26,
+    outline: int = 2,
+    margin_l: int = 10,
+    margin_r: int = 10,
+    margin_v: int = 20,
+    max_chars_zh: int = 55,
+) -> None:
+    """Generate ASS subtitle file with only translated (Chinese) text."""
+    # Split long segments for readability.
+    translation = split_text(translation)
+
+    lines: list[str] = _generate_ass_header(
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
+        font_name=font_name,
+        font_size=font_size,
+        outline=outline,
+        margin_l=margin_l,
+        margin_r=margin_r,
+        margin_v=margin_v,
+    )
+
+    for seg in translation:
+        check_cancelled()
+        zh_raw = str(seg.get("translation") or "").strip()
+        if not zh_raw:
+            continue
+
+        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0) / float(speed_up))
+        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0) / float(speed_up))
+
+        zh = _ass_escape_text(wrap_text(zh_raw, max_chars_zh=max_chars_zh, max_chars_en=max_chars_zh)).replace(
+            "\n", r"\N"
+        )
+        if not zh:
+            continue
+
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{zh}")
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def generate_bilingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
@@ -599,23 +680,15 @@ def generate_bilingual_ass(
 ) -> None:
     en_font_size = max(10, int(round(float(font_size) * float(en_font_scale))))
 
-    lines: list[str] = []
-    lines.extend(
-        [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            "WrapStyle: 2",
-            "ScaledBorderAndShadow: yes",
-            f"PlayResX: {int(play_res_x)}",
-            f"PlayResY: {int(play_res_y)}",
-            "",
-            "[V4+ Styles]",
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,{font_name},{int(font_size)},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,{int(outline)},0,2,{int(margin_l)},{int(margin_r)},{int(margin_v)},1",
-            "",
-            "[Events]",
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-        ]
+    lines: list[str] = _generate_ass_header(
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
+        font_name=font_name,
+        font_size=font_size,
+        outline=outline,
+        margin_l=margin_l,
+        margin_r=margin_r,
+        margin_v=margin_v,
     )
 
     for seg in translation:
@@ -1209,8 +1282,8 @@ def synthesize_video(
 
     subtitle_filter = ""
     if subtitles:
+        ass_path = os.path.join(folder, "subtitles.ass")
         if bilingual_subtitle:
-            ass_path = os.path.join(folder, "subtitles.ass")
             generate_bilingual_ass(
                 translation,
                 ass_path,
@@ -1224,19 +1297,24 @@ def synthesize_video(
                 max_chars_zh=max_chars_zh,
                 max_chars_en=max_chars_en,
             )
-            ass_path_filter = ass_path.replace("\\", "/")
-            if os.name == "nt" and ":" in ass_path_filter:
-                ass_path_filter = ass_path_filter.replace(":", "\\:")
-            subtitle_filter = f"ass=filename='{ass_path_filter}':original_size={res_string}"
         else:
-            subtitle_filter = (
-                # IMPORTANT:
-                # Set original_size so libass doesn't default to 384x288,
-                # which would scale FontSize up massively on 1080p/4K outputs.
-                f"subtitles='{srt_path_filter}':original_size={res_string}:force_style="
-                f"'FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,"
-                f"OutlineColour=&H000000,Outline={outline},WrapStyle=2,MarginV={margin_v}'"
+            # Use ASS for monolingual too (ensures font size is respected via PlayRes).
+            generate_monolingual_ass(
+                translation,
+                ass_path,
+                speed_up=(1.0 if adaptive_segment_stretch else speed_up),
+                play_res_x=width,
+                play_res_y=height,
+                font_name="Arial",
+                font_size=font_size,
+                outline=outline,
+                margin_v=margin_v,
+                max_chars_zh=max_chars_zh,
             )
+        ass_path_filter = ass_path.replace("\\", "/")
+        if os.name == "nt" and ":" in ass_path_filter:
+            ass_path_filter = ass_path_filter.replace(":", "\\:")
+        subtitle_filter = f"ass=filename='{ass_path_filter}':original_size={res_string}"
 
     # Build ffmpeg filtergraph.
     filter_complex: str | None = None
@@ -1513,6 +1591,7 @@ def synthesize_all_video_under_folder(
     use_nvenc: bool = False,
     adaptive_segment_stretch: bool = False,
     bilingual_subtitle: bool = False,
+    auto_upload_video: bool = False,
 ) -> str:
     count = 0
     for root, _dirs, files in os.walk(folder):
@@ -1522,7 +1601,7 @@ def synthesize_all_video_under_folder(
         # Use the same freshness logic as synthesize_video() to avoid stale reuse.
         meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
         meta_fps = 0 if adaptive_segment_stretch else int(fps)
-        if _video_up_to_date(
+        up_to_date = _video_up_to_date(
             root,
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
@@ -1531,19 +1610,28 @@ def synthesize_all_video_under_folder(
             fps=meta_fps,
             resolution=resolution,
             use_nvenc=use_nvenc,
-        ):
-            continue
-        synthesize_video(
-            root,
-            subtitles=subtitles,
-            bilingual_subtitle=bilingual_subtitle,
-            speed_up=speed_up,
-            fps=fps,
-            resolution=resolution,
-            use_nvenc=use_nvenc,
-            adaptive_segment_stretch=adaptive_segment_stretch,
         )
-        count += 1
+        if not up_to_date:
+            synthesize_video(
+                root,
+                subtitles=subtitles,
+                bilingual_subtitle=bilingual_subtitle,
+                speed_up=speed_up,
+                fps=fps,
+                resolution=resolution,
+                use_nvenc=use_nvenc,
+                adaptive_segment_stretch=adaptive_segment_stretch,
+            )
+            count += 1
+
+        if auto_upload_video:
+            # Enqueue in background so it won't block synthesizing other videos.
+            try:
+                from .upload import upload_video_async  # local import to avoid hard dependency for non-upload users
+
+                upload_video_async(root)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"加入B站后台上传队列失败（忽略）: {exc}")
     msg = f"视频合成完成: {folder}（处理 {count} 个文件）"
     logger.info(msg)
     return msg
