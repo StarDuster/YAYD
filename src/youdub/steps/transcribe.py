@@ -207,23 +207,34 @@ def _preload_cudnn_for_onnxruntime_gpu() -> None:
 
 def unload_all_models() -> None:
     global _ASR_MODEL, _ASR_PIPELINE, _QWEN_ASR_MODEL, _DIARIZATION_PIPELINE
+    global _ASR_KEY, _QWEN_ASR_KEY, _DIARIZATION_KEY  # noqa: PLW0603
 
     cleared = False
-    if _ASR_PIPELINE is not None:
-        del _ASR_PIPELINE
+    # IMPORTANT:
+    # Do NOT `del _GLOBAL` for module-level caches. Under concurrency, another thread may
+    # observe a brief window where the name is missing and crash with NameError.
+    #
+    # Instead: move the object to a local var, clear the global to None, then `del` the local.
+    old_asr_pipeline = _ASR_PIPELINE
+    old_asr_model = _ASR_MODEL
+    old_qwen_model = _QWEN_ASR_MODEL
+    old_diar = _DIARIZATION_PIPELINE
+
+    if old_asr_pipeline is not None:
         _ASR_PIPELINE = None
+        _ASR_KEY = None
         cleared = True
-    if _ASR_MODEL is not None:
-        del _ASR_MODEL
+    if old_asr_model is not None:
         _ASR_MODEL = None
+        _ASR_KEY = None
         cleared = True
-    if _QWEN_ASR_MODEL is not None:
-        del _QWEN_ASR_MODEL
+    if old_qwen_model is not None:
         _QWEN_ASR_MODEL = None
+        _QWEN_ASR_KEY = None
         cleared = True
-    if _DIARIZATION_PIPELINE is not None:
-        del _DIARIZATION_PIPELINE
+    if old_diar is not None:
         _DIARIZATION_PIPELINE = None
+        _DIARIZATION_KEY = None
         cleared = True
 
     if cleared:
@@ -233,6 +244,15 @@ def unload_all_models() -> None:
 
         gc.collect()
         logger.info("ASR/说话人分离模型已卸载")
+
+    # Drop references (best-effort) to encourage GC.
+    try:
+        del old_asr_pipeline
+        del old_asr_model
+        del old_qwen_model
+        del old_diar
+    except Exception:
+        pass
 
 
 def _ensure_assets(
