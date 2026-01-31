@@ -934,7 +934,14 @@ with gr.Blocks(title="全自动") as do_everything_interface:
 
         # 其他设置
         gr.Markdown("### 其他")
-        max_workers_input = gr.Slider(minimum=1, maximum=100, step=1, label="最大并发任务数", value=1)
+        max_workers_input = gr.Slider(
+            minimum=1,
+            maximum=8,
+            step=1,
+            label="NVENC 后台编码并发数",
+            value=1,
+            info="仅在启用 NVENC 且处理多个视频时生效：用于后台视频合成(ffmpeg/h264_nvenc)并发数，不会并发执行 Demucs/ASR/TTS。",
+        )
         max_retries_input = gr.Slider(minimum=1, maximum=10, step=1, label="最大重试次数", value=3)
         auto_upload_input = gr.Checkbox(label="自动上传到 B 站", value=False)
 

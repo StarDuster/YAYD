@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import wave
 from pathlib import Path
 from typing import Any
@@ -379,3 +380,183 @@ def test_pipeline_warmup_skips_demucs_and_asr_when_outputs_exist(tmp_path: Path,
         whisper_model=str(whisper_dir),
     )
     assert "成功:" in out
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline max_workers concurrency policy
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_run_nvenc_multi_offloads_encoding_and_never_calls_process_single(tmp_path: Path, monkeypatch):
+    import youdub.pipeline as pl
+
+    # Keep the test deterministic and fast.
+    monkeypatch.setattr(pl, "check_cancelled", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "init_asr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "load_asr_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "load_qwen_asr_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.separate_vocals, "unload_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "unload_all_models", lambda *_args, **_kwargs: None)
+
+    # Pipeline validates Whisper model.bin paths early (outside ModelManager.ensure_ready),
+    # so provide a minimal dummy model directory.
+    whisper_dir = tmp_path / "whisper"
+    _touch_model_bin(whisper_dir)
+
+    settings = Settings(root_folder=tmp_path, whisper_model_path=whisper_dir)
+    manager = ModelManager(settings)
+    monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
+
+    info_list = [
+        {"title": "v1", "uploader": "u", "upload_date": "20260101", "webpage_url": "x1"},
+        {"title": "v2", "uploader": "u", "upload_date": "20260102", "webpage_url": "x2"},
+    ]
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: list(info_list))
+
+    def _stub_download_single_video(info: dict[str, Any], _root: str, _resolution: str, settings=None) -> str:
+        _ = settings
+        folder = tmp_path / "jobs" / str(info["title"])
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "download.mp4").write_bytes(b"0" * 2048)
+        (folder / "download.info.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+        return str(folder)
+
+    def _stub_separate_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        _write_dummy_wav(folder / "audio_vocals.wav", seconds=0.2)
+        _write_dummy_wav(folder / "audio_instruments.wav", seconds=0.2)
+        return "ok"
+
+    def _stub_transcribe_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        (folder / "transcript.json").write_text(
+            json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_translate_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        (folder / "translation.json").write_text(
+            json.dumps(
+                [{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (folder / "summary.json").write_text(
+            json.dumps({"title": "t", "author": "u", "summary": "s", "tags": [], "translation_model": "dummy"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_tts_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        (folder / "wavs").mkdir(parents=True, exist_ok=True)
+        _write_dummy_wav(folder / "wavs" / "0000.wav", seconds=0.1)
+        (folder / "wavs" / ".tts_done.json").write_text(
+            json.dumps({"tts_method": "bytedance"}, ensure_ascii=False), encoding="utf-8"
+        )
+        return "ok"
+
+    main_tid = threading.get_ident()
+    encode_tids: list[int] = []
+
+    def _stub_video_all(_folder: str, **_kwargs) -> str:
+        encode_tids.append(threading.get_ident())
+        folder = Path(_folder)
+        _write_dummy_wav(folder / "audio_combined.wav", seconds=0.2)
+        (folder / "video.mp4").write_bytes(b"0" * 2048)
+        return "ok"
+
+    def _stub_generate_info_all(_folder: str) -> str:
+        folder = Path(_folder)
+        (folder / "video.txt").write_text("ok", encoding="utf-8")
+        return "ok"
+
+    monkeypatch.setattr(pl.download, "download_single_video", _stub_download_single_video)
+    monkeypatch.setattr(pl.separate_vocals, "separate_all_audio_under_folder", _stub_separate_all)
+    monkeypatch.setattr(pl.transcribe, "transcribe_all_audio_under_folder", _stub_transcribe_all)
+    monkeypatch.setattr(pl.translate, "translate_all_transcript_under_folder", _stub_translate_all)
+    monkeypatch.setattr(pl.synthesize_speech, "generate_all_wavs_under_folder", _stub_tts_all)
+    monkeypatch.setattr(pl, "synthesize_all_video_under_folder", _stub_video_all)
+    monkeypatch.setattr(pl, "generate_all_info_under_folder", _stub_generate_info_all)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("process_single should not be called in NVENC multi-video mode")
+
+    monkeypatch.setattr(pl.VideoPipeline, "process_single", _boom)
+
+    pipe = pl.VideoPipeline(settings=settings, model_manager=manager)
+    out = pipe.run(
+        url="",
+        num_videos=len(info_list),
+        max_workers=3,  # should only affect encode_workers
+        use_nvenc=True,
+        whisper_diarization=False,
+        auto_upload_video=False,
+        max_retries=1,
+        whisper_device="cpu",
+        whisper_model=str(whisper_dir),
+        device="cpu",
+    )
+
+    assert "成功: 2" in out
+    assert encode_tids and len(encode_tids) == 2
+    assert all(tid != main_tid for tid in encode_tids)
+
+
+def test_pipeline_run_max_workers_gt1_without_nvenc_is_still_serial(tmp_path: Path, monkeypatch):
+    import youdub.pipeline as pl
+
+    main_tid = threading.get_ident()
+
+    whisper_dir = tmp_path / "whisper"
+    _touch_model_bin(whisper_dir)
+
+    settings = Settings(root_folder=tmp_path, whisper_model_path=whisper_dir)
+    manager = ModelManager(settings)
+    monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
+
+    monkeypatch.setattr(pl, "check_cancelled", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "init_asr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "load_asr_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "load_qwen_asr_model", lambda *_args, **_kwargs: None)
+
+    info_list = [
+        {"title": "v1", "uploader": "u", "upload_date": "20260101", "webpage_url": "x1"},
+        {"title": "v2", "uploader": "u", "upload_date": "20260102", "webpage_url": "x2"},
+        {"title": "v3", "uploader": "u", "upload_date": "20260103", "webpage_url": "x3"},
+    ]
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: list(info_list))
+    monkeypatch.setattr(pl.download, "get_target_folder", lambda *_args, **_kwargs: str(tmp_path / "job"))
+
+    calls: list[int] = []
+
+    def _stub_process_single(*_args, **_kwargs) -> bool:
+        # If run() ever uses ThreadPoolExecutor for full pipeline concurrency again,
+        # this would execute on worker threads (not main thread).
+        assert threading.get_ident() == main_tid
+        calls.append(threading.get_ident())
+        return True
+
+    monkeypatch.setattr(pl.VideoPipeline, "process_single", _stub_process_single)
+
+    pipe = pl.VideoPipeline(settings=settings, model_manager=manager)
+    out = pipe.run(
+        url="",
+        num_videos=len(info_list),
+        max_workers=8,
+        use_nvenc=False,
+        whisper_diarization=False,
+        auto_upload_video=False,
+        whisper_device="cpu",
+        whisper_model=str(whisper_dir),
+        device="cpu",
+    )
+    assert "成功: 3" in out
+    assert len(calls) == 3

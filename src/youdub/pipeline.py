@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -426,241 +426,197 @@ class VideoPipeline:
         success_list: list[dict[str, Any]] = []
         fail_list: list[dict[str, Any]] = []
 
-        if max_workers <= 1:
-            # When processing multiple videos sequentially, NVENC video encoding can be offloaded
-            # to background threads so the next video's ASR/TTS can proceed without waiting.
-            if use_nvenc and len(info_list) > 1:
-                max_encode_workers = min(8, len(info_list))
-                logger.info(
-                    f"检测到 NVENC 且有多个视频：将视频合成放到后台并发执行，避免阻塞后续视频处理 "
-                    f"(encode_workers={max_encode_workers}, pipeline_workers=1)"
-                )
+        # NOTE: max_workers 的新语义：
+        # - 主流程（Demucs/ASR/TTS/翻译等）永远串行，避免各步骤的全局缓存/卸载竞态。
+        # - 仅在 use_nvenc=True 且多视频时，把“视频合成(FFmpeg/NVENC)”放到后台线程池执行；
+        #   max_workers 只影响该后台线程池的并发数（encode_workers）。
 
-                def _preprocess_until_tts(info: dict[str, Any]) -> str | None:
-                    """Run steps up to TTS generation; return folder on success."""
-                    for _retry in range(int(max_retries)):
-                        check_cancelled()
-                        try:
-                            folder = download.download_single_video(info, root_folder, resolution, settings=self.settings)
-                            if folder is None:
-                                logger.warning(f"下载失败: {info.get('title')}")
-                                return None
+        def _preprocess_until_tts(info: dict[str, Any]) -> str | None:
+            """Run steps up to TTS generation; return folder on success."""
+            for _retry in range(int(max_retries)):
+                check_cancelled()
+                try:
+                    folder = download.download_single_video(info, root_folder, resolution, settings=self.settings)
+                    if folder is None:
+                        logger.warning(f"下载失败: {info.get('title')}")
+                        return None
 
-                            logger.info(f"开始处理: {folder}")
-                            require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
+                    logger.info(f"开始处理: {folder}")
+                    require_file(os.path.join(folder, "download.mp4"), "下载视频(download.mp4)", min_bytes=1024)
 
-                            check_cancelled()
-                            try:
-                                separate_vocals.separate_all_audio_under_folder(
-                                    folder,
-                                    model_name=demucs_model,
-                                    device=device,
-                                    progress=True,
-                                    shifts=shifts,
-                                    settings=self.settings,
-                                    model_manager=self.model_manager,
-                                )
-                            finally:
-                                # Best-effort: reduce GPU memory leaks when interrupted.
-                                try:
-                                    separate_vocals.unload_model()
-                                except Exception:
-                                    pass
-
-                            require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
-                            require_file(
-                                os.path.join(folder, "audio_instruments.wav"),
-                                "伴奏轨(audio_instruments.wav)",
-                                min_bytes=44,
-                            )
-
-                            asr_device = whisper_device or device
-                            check_cancelled()
-                            try:
-                                transcribe.transcribe_all_audio_under_folder(
-                                    folder,
-                                    model_name=whisper_model,
-                                    cpu_model_name=whisper_cpu_model,
-                                    device=asr_device,
-                                    batch_size=whisper_batch_size,
-                                    diarization=whisper_diarization,
-                                    min_speakers=whisper_min_speakers,
-                                    max_speakers=whisper_max_speakers,
-                                    settings=self.settings,
-                                    model_manager=self.model_manager,
-                                    asr_method=asr_method,
-                                    qwen_asr_model_dir=qwen_asr_model_dir,
-                                    qwen_asr_num_threads=int(qwen_asr_num_threads),
-                                    qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
-                                )
-                            finally:
-                                try:
-                                    transcribe.unload_all_models()
-                                except Exception:
-                                    pass
-
-                            require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
-
-                            check_cancelled()
-                            translate.translate_all_transcript_under_folder(
-                                folder, target_language=translation_target_language, settings=self.settings
-                            )
-                            require_file(os.path.join(folder, "translation.json"), "翻译结果(translation.json)", min_bytes=2)
-
-                            check_cancelled()
-                            synthesize_speech.generate_all_wavs_under_folder(
-                                folder,
-                                tts_method=tts_method,
-                                qwen_tts_batch_size=qwen_tts_batch_size,
-                            )
-
-                            require_file(
-                                os.path.join(folder, "wavs", ".tts_done.json"),
-                                "语音合成标记(wavs/.tts_done.json)",
-                                min_bytes=2,
-                            )
-                            require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
-
-                            return folder
-                        except Exception as exc:  # pylint: disable=broad-except
-                            logger.exception(f"处理失败(到TTS阶段): {info.get('title')} ({exc})")
-                    return None
-
-                encode_jobs: list[tuple[dict[str, Any], str, object]] = []
-                with ThreadPoolExecutor(max_workers=max_encode_workers) as encode_executor:
-                    for info in info_list:
-                        check_cancelled()
-                        folder = _preprocess_until_tts(info)
-                        if not folder:
-                            fail_list.append(info)
-                            continue
-
-                        # 当启用“按段自适应拉伸语音”时，忽略全局加速倍率（避免双重变速）。
-                        effective_speed_up = 1.0 if bool(tts_adaptive_segment_stretch) else float(speed_up)
-
-                        fut = encode_executor.submit(
-                            synthesize_all_video_under_folder,
+                    check_cancelled()
+                    try:
+                        separate_vocals.separate_all_audio_under_folder(
                             folder,
-                            subtitles=subtitles,
-                            bilingual_subtitle=bool(bilingual_subtitle),
-                            adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
-                            speed_up=effective_speed_up,
-                            fps=fps,
-                            resolution=target_resolution,
-                            use_nvenc=use_nvenc,
-                            auto_upload_video=False,
+                            model_name=demucs_model,
+                            device=device,
+                            progress=True,
+                            shifts=shifts,
+                            settings=self.settings,
+                            model_manager=self.model_manager,
                         )
-                        encode_jobs.append((info, folder, fut))
-                        logger.info(f"已加入后台视频合成队列（不阻塞后续视频处理）: {folder}")
-
-                    # Wait for all encode jobs and finalize (info + upload).
-                    for info, folder, fut in encode_jobs:
-                        check_cancelled()
+                    finally:
+                        # Best-effort: reduce GPU memory leaks when interrupted.
                         try:
-                            _ = fut.result()
-                            require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
+                            separate_vocals.unload_model()
+                        except Exception:
+                            pass
 
-                            check_cancelled()
-                            generate_all_info_under_folder(folder)
+                    require_file(os.path.join(folder, "audio_vocals.wav"), "人声轨(audio_vocals.wav)", min_bytes=44)
+                    require_file(
+                        os.path.join(folder, "audio_instruments.wav"),
+                        "伴奏轨(audio_instruments.wav)",
+                        min_bytes=44,
+                    )
 
-                            if auto_upload_video:
-                                # Run B站上传 in background so it won't block video processing.
-                                if self._already_uploaded(folder):
-                                    logger.info(f"检测到已上传，跳过自动上传: {folder}")
-                                else:
-                                    upload_video_async(folder)
+                    asr_device = whisper_device or device
+                    check_cancelled()
+                    try:
+                        transcribe.transcribe_all_audio_under_folder(
+                            folder,
+                            model_name=whisper_model,
+                            cpu_model_name=whisper_cpu_model,
+                            device=asr_device,
+                            batch_size=whisper_batch_size,
+                            diarization=whisper_diarization,
+                            min_speakers=whisper_min_speakers,
+                            max_speakers=whisper_max_speakers,
+                            settings=self.settings,
+                            model_manager=self.model_manager,
+                            asr_method=asr_method,
+                            qwen_asr_model_dir=qwen_asr_model_dir,
+                            qwen_asr_num_threads=int(qwen_asr_num_threads),
+                            qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
+                        )
+                    finally:
+                        try:
+                            transcribe.unload_all_models()
+                        except Exception:
+                            pass
 
-                            success_list.append(info)
-                        except Exception as exc:  # pylint: disable=broad-except
-                            logger.exception(f"处理失败(视频合成阶段): {info.get('title')} ({exc})")
-                            fail_list.append(info)
-            else:
+                    require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
+
+                    check_cancelled()
+                    translate.translate_all_transcript_under_folder(
+                        folder, target_language=translation_target_language, settings=self.settings
+                    )
+                    require_file(os.path.join(folder, "translation.json"), "翻译结果(translation.json)", min_bytes=2)
+
+                    check_cancelled()
+                    synthesize_speech.generate_all_wavs_under_folder(
+                        folder,
+                        tts_method=tts_method,
+                        qwen_tts_batch_size=qwen_tts_batch_size,
+                    )
+
+                    require_file(
+                        os.path.join(folder, "wavs", ".tts_done.json"),
+                        "语音合成标记(wavs/.tts_done.json)",
+                        min_bytes=2,
+                    )
+                    require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
+
+                    return folder
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(f"处理失败(到TTS阶段): {info.get('title')} ({exc})")
+            return None
+
+        def _finalize_after_encode(folder: str) -> None:
+            require_file(os.path.join(folder, "video.mp4"), "最终视频(video.mp4)", min_bytes=1024)
+
+            check_cancelled()
+            generate_all_info_under_folder(folder)
+
+            if auto_upload_video:
+                # Run B站上传 in background so it won't block video processing.
+                if self._already_uploaded(folder):
+                    logger.info(f"检测到已上传，跳过自动上传: {folder}")
+                else:
+                    upload_video_async(folder)
+
+        if use_nvenc and len(info_list) > 1:
+            requested = int(max_workers) if int(max_workers) > 0 else 1
+            encode_workers = min(requested, 8, len(info_list))
+            logger.info(
+                "检测到 NVENC 且有多个视频：视频合成将后台执行（不阻塞后续视频处理）"
+                f"（encode_workers={encode_workers}，max_workers仅影响该值）"
+            )
+
+            encode_jobs: list[tuple[dict[str, Any], str, object]] = []
+            with ThreadPoolExecutor(max_workers=encode_workers) as encode_executor:
                 for info in info_list:
                     check_cancelled()
-                    success = self.process_single(
-                        info,
-                        root_folder,
-                        resolution,
-                        demucs_model,
-                        device,
-                        shifts,
-                        whisper_model,
-                        whisper_batch_size,
-                        whisper_diarization,
-                        whisper_min_speakers,
-                        whisper_max_speakers,
-                        translation_target_language,
-                        tts_method,
-                        int(qwen_tts_batch_size),
-                        bool(tts_adaptive_segment_stretch),
-                        subtitles,
-                        speed_up,
-                        fps,
-                        target_resolution,
-                        max_retries,
-                        auto_upload_video,
-                        bool(bilingual_subtitle),
-                        use_nvenc,
-                        wd,
-                        whisper_cpu_model,
-                        asr_method=asr_method,
-                        qwen_asr_model_dir=qwen_asr_model_dir,
-                        qwen_asr_num_threads=int(qwen_asr_num_threads),
-                        qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
+                    folder = _preprocess_until_tts(info)
+                    if not folder:
+                        fail_list.append(info)
+                        continue
+
+                    # 当启用“按段自适应拉伸语音”时，忽略全局加速倍率（避免双重变速）。
+                    effective_speed_up = 1.0 if bool(tts_adaptive_segment_stretch) else float(speed_up)
+
+                    fut = encode_executor.submit(
+                        synthesize_all_video_under_folder,
+                        folder,
+                        subtitles=subtitles,
+                        bilingual_subtitle=bool(bilingual_subtitle),
+                        adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
+                        speed_up=effective_speed_up,
+                        fps=fps,
+                        resolution=target_resolution,
+                        use_nvenc=use_nvenc,
+                        auto_upload_video=False,
                     )
-                    if success:
+                    encode_jobs.append((info, folder, fut))
+                    logger.info(f"已加入后台视频合成队列: {folder}")
+
+                for info, folder, fut in encode_jobs:
+                    check_cancelled()
+                    try:
+                        _ = fut.result()
+                        _finalize_after_encode(folder)
                         success_list.append(info)
-                    else:
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.exception(f"处理失败(视频合成阶段): {info.get('title')} ({exc})")
                         fail_list.append(info)
         else:
-            logger.info(f"并发处理 {len(info_list)} 个视频: max_workers={max_workers}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_info = {
-                    executor.submit(
-                        self.process_single,
-                        info,
-                        root_folder,
-                        resolution,
-                        demucs_model,
-                        device,
-                        shifts,
-                        whisper_model,
-                        whisper_batch_size,
-                        whisper_diarization,
-                        whisper_min_speakers,
-                        whisper_max_speakers,
-                        translation_target_language,
-                        tts_method,
-                        int(qwen_tts_batch_size),
-                        bool(tts_adaptive_segment_stretch),
-                        subtitles,
-                        speed_up,
-                        fps,
-                        target_resolution,
-                        max_retries,
-                        auto_upload_video,
-                        bool(bilingual_subtitle),
-                        use_nvenc,
-                        wd,
-                        whisper_cpu_model,
-                        asr_method=asr_method,
-                        qwen_asr_model_dir=qwen_asr_model_dir,
-                        qwen_asr_num_threads=int(qwen_asr_num_threads),
-                        qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
-                    ): info
-                    for info in info_list
-                }
-                for future in as_completed(future_to_info):
-                    check_cancelled()
-                    info = future_to_info[future]
-                    try:
-                        success = future.result()
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.error(f"未处理异常: {info.get('title')} ({exc})")
-                        success = False
-                    if success:
-                        success_list.append(info)
-                    else:
-                        fail_list.append(info)
+            if int(max_workers) > 1:
+                logger.info("max_workers>1 将被忽略：当前不启用全流程并发，仅 NVENC 多视频时用于后台编码并发数。")
+            for info in info_list:
+                check_cancelled()
+                success = self.process_single(
+                    info,
+                    root_folder,
+                    resolution,
+                    demucs_model,
+                    device,
+                    shifts,
+                    whisper_model,
+                    whisper_batch_size,
+                    whisper_diarization,
+                    whisper_min_speakers,
+                    whisper_max_speakers,
+                    translation_target_language,
+                    tts_method,
+                    int(qwen_tts_batch_size),
+                    bool(tts_adaptive_segment_stretch),
+                    subtitles,
+                    speed_up,
+                    fps,
+                    target_resolution,
+                    max_retries,
+                    auto_upload_video,
+                    bool(bilingual_subtitle),
+                    use_nvenc,
+                    wd,
+                    whisper_cpu_model,
+                    asr_method=asr_method,
+                    qwen_asr_model_dir=qwen_asr_model_dir,
+                    qwen_asr_num_threads=int(qwen_asr_num_threads),
+                    qwen_asr_vad_segment_threshold=int(qwen_asr_vad_segment_threshold),
+                )
+                if success:
+                    success_list.append(info)
+                else:
+                    fail_list.append(info)
 
         return f"成功: {len(success_list)}\n失败: {len(fail_list)}"
