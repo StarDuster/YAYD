@@ -64,6 +64,38 @@ def test_valid_translation_rejects_too_long_for_short_source():
     assert "Only translate the following sentence" in msg
 
 
+def test_valid_translation_accepts_zheju_in_normal_translation():
+    """'这句' 作为 'This statement' 等的正常翻译应该被接受."""
+    from youdub.steps.translate import valid_translation
+
+    # "This statement says..." -> "这句陈述说的是..." 是合理翻译
+    ok, processed = valid_translation(
+        "This statement says that at any level of your code.",
+        "这句陈述说的是在你代码的任何层级。"
+    )
+    assert ok is True
+    assert "这句陈述" in processed
+
+
+def test_valid_translation_rejects_zheju_in_explanation_patterns():
+    """'这句' 出现在解释性模式中（如 '这句的意思是...'）应该被拒绝."""
+    from youdub.steps.translate import valid_translation
+
+    # LLM 添加了解释性内容
+    # 注意: 避免在翻译中使用 "翻译" 子串，因为它会被更早的 forbidden_substrings 检查拦截
+    long_source = "This is a longer sentence for testing purposes."
+    
+    # "这句的意思是..." 模式
+    ok, msg = valid_translation(long_source, "这句的意思是这是一个用于测试目的的较长句子")
+    assert ok is False
+    assert "explanation patterns" in msg
+    
+    # "这句话意思是..." 模式
+    ok, msg = valid_translation(long_source, "这句话意思是这是一个用于测试目的的较长句子")
+    assert ok is False
+    assert "explanation patterns" in msg
+
+
 # --------------------------------------------------------------------------- #
 # Strategy normalization
 # --------------------------------------------------------------------------- #

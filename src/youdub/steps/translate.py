@@ -296,11 +296,19 @@ def valid_translation(text: str, translation: str) -> tuple[bool, str]:
     if len(text) > 100 and len(translation) < len(text) * 0.15:
         return False, 'The translation is too short, content may be lost. Please translate the complete sentence.'
 
-    forbidden = ['翻译', '这句', '\n', '简体中文', '中文', 'translate', 'Translate', 'translation', 'Translation']
+    # Check for forbidden patterns that indicate LLM is explaining rather than translating
+    # Note: '这句' removed from simple substring check as it causes false positives
+    # when translating "This statement", "this sentence" etc.
+    forbidden_substrings = ['翻译', '\n', '简体中文', '中文', 'translate', 'Translate', 'translation', 'Translation']
     translation = translation.strip()
-    for word in forbidden:
+    for word in forbidden_substrings:
         if word in translation:
             return False, f"Don't include `{word}` in the translation. Only translate the following sentence and give me the result."
+    
+    # More precise pattern check for "这句" - only reject if it appears in explanation patterns
+    # like "这句话的翻译是", "这句的意思是", "这句话翻译成" etc.
+    if re.search(r'这句.{0,3}(的翻译|的意思|翻译成|意思是)', translation):
+        return False, "Don't include explanation patterns in the translation. Only translate the following sentence and give me the result."
 
     return True, translation_postprocess(translation)
 
