@@ -1332,7 +1332,17 @@ with gr.Blocks(title="语音合成") as tts_interface:
     )
     tts_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
-def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_stretch, speed_up, fps, resolution, use_nvenc):
+def _synthesize_video_wrapper(
+    folder,
+    subtitles,
+    bilingual_subtitle,
+    adaptive_stretch,
+    speed_up,
+    fps,
+    resolution,
+    use_nvenc,
+    auto_upload_video,
+):
     # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
     effective_speed_up = 1.0 if adaptive_stretch else speed_up
     return synthesize_all_video_under_folder(
@@ -1344,6 +1354,7 @@ def _synthesize_video_wrapper(folder, subtitles, bilingual_subtitle, adaptive_st
         fps=fps,
         resolution=resolution,
         use_nvenc=use_nvenc,
+        auto_upload_video=bool(auto_upload_video),
     )
 
 
@@ -1370,6 +1381,7 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
         synth_fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
         synth_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="输出分辨率", value="1080p")
         synth_nvenc_input = gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU")
+        synth_auto_upload_input = gr.Checkbox(label="自动上传到 B 站", value=False)
 
         synth_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
 
@@ -1389,6 +1401,7 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             synth_fps_input,
             synth_resolution_input,
             synth_nvenc_input,
+            synth_auto_upload_input,
         ],
         outputs=synth_output,
         **_INTERFACE_STREAM_KWARGS,

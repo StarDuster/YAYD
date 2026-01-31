@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import threading
@@ -11,7 +12,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from loguru import logger
 
-from ..interrupts import check_cancelled, sleep_with_cancel
+from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 
 load_dotenv()
 
@@ -25,6 +26,13 @@ else:
 
 
 _STDIO_CAPTURE_LOCK = threading.Lock()
+
+
+# --- Async Bilibili upload worker (non-blocking) ---
+_BILI_UPLOAD_QUEUE: "queue.Queue[str]" = queue.Queue()
+_BILI_UPLOAD_WORKER: threading.Thread | None = None
+_BILI_UPLOAD_LOCK = threading.Lock()
+_BILI_UPLOAD_ENQUEUED: set[str] = set()
 
 
 class _StdioTeeCapture:
@@ -572,3 +580,118 @@ def upload_all_videos_under_folder(folder: str) -> str:
                 count += 1
                 first_upload = False
     return f"上传完成: {folder}（成功 {count} 个）"
+
+
+def _folder_uploaded(folder: str) -> bool:
+    """Return True if `bilibili.json` exists and indicates success."""
+    marker = os.path.join(folder, "bilibili.json")
+    if not os.path.exists(marker):
+        return False
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return _is_uploaded(obj)
+    except Exception:
+        return False
+
+
+def _bili_upload_interval_seconds() -> int:
+    try:
+        return max(0, int(os.getenv("BILI_UPLOAD_INTERVAL") or "60"))
+    except Exception:
+        return 60
+
+
+def _clear_pending_bili_uploads() -> None:
+    """Best-effort clear queued uploads (used on cancellation)."""
+    while True:
+        try:
+            folder = _BILI_UPLOAD_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            with _BILI_UPLOAD_LOCK:
+                _BILI_UPLOAD_ENQUEUED.discard(folder)
+        finally:
+            try:
+                _BILI_UPLOAD_QUEUE.task_done()
+            except Exception:
+                pass
+
+
+def _bili_upload_worker() -> None:
+    logger.info("B站后台上传线程已启动（不阻塞视频处理）")
+    first_upload = True
+    while True:
+        folder = _BILI_UPLOAD_QUEUE.get()
+        try:
+            # De-dupe + skip if already uploaded.
+            if _folder_uploaded(folder):
+                logger.info(f"B站后台上传跳过（已上传）: {folder}")
+                continue
+
+            # Apply interval between *actual* uploads to reduce rate limiting.
+            if not first_upload:
+                interval = _bili_upload_interval_seconds()
+                if interval > 0:
+                    logger.info(f"等待 {interval} 秒后进行下一个 B 站上传…")
+                    sleep_with_cancel(interval)
+
+            ok = upload_video(folder)
+            first_upload = False
+            if ok:
+                logger.info(f"B站后台上传成功: {folder}")
+            else:
+                logger.error(f"B站后台上传失败: {folder}")
+        except CancelledByUser as exc:
+            logger.warning(f"B站后台上传被取消: {exc}")
+            _clear_pending_bili_uploads()
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"B站后台上传异常: {exc}")
+        finally:
+            with _BILI_UPLOAD_LOCK:
+                _BILI_UPLOAD_ENQUEUED.discard(folder)
+            try:
+                _BILI_UPLOAD_QUEUE.task_done()
+            except Exception:
+                pass
+
+
+def upload_video_async(folder: str) -> str:
+    """
+    Enqueue Bilibili upload in a background thread (non-blocking).
+
+    Notes:
+    - Uses a single daemon worker thread to avoid concurrent uploads (rate-limit friendly).
+    - Returns immediately so upstream steps (pipeline / video synthesis) won't be blocked.
+    """
+    if stream_gears is None:
+        return f"错误：stream_gears 不可用。请安装依赖 'biliup'。({_STREAM_GEARS_IMPORT_ERROR})"
+
+    folder = str(folder or "").strip()
+    if not folder:
+        return "错误：目录不能为空"
+    if not os.path.exists(folder):
+        return f"错误：目录不存在：{folder}"
+
+    if _folder_uploaded(folder):
+        return f"已上传，跳过：{folder}"
+
+    with _BILI_UPLOAD_LOCK:
+        if folder in _BILI_UPLOAD_ENQUEUED:
+            return f"已在后台上传队列中：{folder}"
+        _BILI_UPLOAD_ENQUEUED.add(folder)
+        _BILI_UPLOAD_QUEUE.put(folder)
+
+        global _BILI_UPLOAD_WORKER  # noqa: PLW0603
+        if _BILI_UPLOAD_WORKER is None or not _BILI_UPLOAD_WORKER.is_alive():
+            _BILI_UPLOAD_WORKER = threading.Thread(
+                target=_bili_upload_worker,
+                name="youdub-bili-upload-worker",
+                daemon=True,
+            )
+            _BILI_UPLOAD_WORKER.start()
+
+    logger.info(f"已加入B站后台上传队列（不阻塞后续处理）: {folder}")
+    return f"已加入B站后台上传队列: {folder}"

@@ -42,7 +42,7 @@ from .generate_info import (
     generate_summary_txt,
     resize_thumbnail,
 )
-from .upload import upload_all_videos_under_folder, upload_video
+from .upload import upload_all_videos_under_folder, upload_video, upload_video_async
 
 __all__ = [
     "download_from_url",
@@ -77,4 +77,5 @@ __all__ = [
     "generate_all_info_under_folder_stream",
     "upload_all_videos_under_folder",
     "upload_video",
+    "upload_video_async",
 ]

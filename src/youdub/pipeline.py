@@ -11,7 +11,7 @@ from loguru import logger
 
 from .config import Settings
 from .models import ModelCheckError, ModelManager
-from .interrupts import check_cancelled, sleep_with_cancel
+from .interrupts import check_cancelled
 from .utils import require_file, valid_file
 from .steps import (
     download,
@@ -21,7 +21,7 @@ from .steps import (
     synthesize_speech,
     transcribe,
     translate,
-    upload_all_videos_under_folder,
+    upload_video_async,
 )
 
 
@@ -174,11 +174,11 @@ class VideoPipeline:
                 check_cancelled()
                 generate_all_info_under_folder(folder)
                 if auto_upload_video:
-                    sleep_with_cancel(1)
-                    check_cancelled()
-                    upload_all_videos_under_folder(folder)
-                    if not self._already_uploaded(folder):
-                        raise RuntimeError(f"自动上传失败: {folder}")
+                    # Run B站上传 in background so it won't block video processing.
+                    if self._already_uploaded(folder):
+                        logger.info(f"检测到已上传，跳过自动上传: {folder}")
+                    else:
+                        upload_video_async(folder)
                 return True
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception(f"处理失败: {info.get('title')} ({exc})")

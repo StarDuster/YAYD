@@ -109,7 +109,6 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
 
     # Keep the test deterministic and fast.
     monkeypatch.setattr(pl, "check_cancelled", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(pl, "sleep_with_cancel", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(pl.separate_vocals, "unload_model", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(pl.transcribe, "unload_all_models", lambda *_args, **_kwargs: None)
 
