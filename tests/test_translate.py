@@ -48,12 +48,35 @@ def test_valid_translation_accepts_backticks_and_postprocesses():
     assert "，" in processed  # "..." -> "，"
 
 
-def test_valid_translation_rejects_forbidden_word():
+def test_valid_translation_rejects_explanation_patterns():
+    """解释性模式（如 '翻译：...'）应该被拒绝."""
     from youdub.steps.translate import valid_translation
 
-    ok, msg = valid_translation("Hello world", "翻译: 你好")
+    long_source = "This is a longer sentence for testing purposes."
+    
+    # "翻译：" 开头
+    ok, msg = valid_translation(long_source, "翻译：这是一个用于测试目的的较长句子")
     assert ok is False
-    assert "Don't include" in msg
+    assert "explanation patterns" in msg
+    
+    # "翻译结果是..."
+    ok, msg = valid_translation(long_source, "翻译结果是这是一个用于测试目的的较长句子")
+    assert ok is False
+    assert "explanation patterns" in msg
+    
+    # "以下是翻译..."
+    ok, msg = valid_translation(long_source, "以下是翻译这是一个用于测试目的的较长句子")
+    assert ok is False
+    assert "explanation patterns" in msg
+
+
+def test_valid_translation_rejects_newline():
+    """翻译中包含换行符应该被拒绝."""
+    from youdub.steps.translate import valid_translation
+
+    ok, msg = valid_translation("Hello world", "你好\n世界")
+    assert ok is False
+    assert "newline" in msg.lower()
 
 
 def test_valid_translation_rejects_too_long_for_short_source():
@@ -62,6 +85,35 @@ def test_valid_translation_rejects_too_long_for_short_source():
     ok, msg = valid_translation("Hi", "This translation is definitely too long.")
     assert ok is False
     assert "Only translate the following sentence" in msg
+
+
+def test_valid_translation_accepts_normal_content_with_keywords():
+    """正常翻译内容中包含 '翻译'、'中文' 等词应该被接受."""
+    from youdub.steps.translate import valid_translation
+
+    # "machine translation" -> "机器翻译" 是合理翻译
+    ok, processed = valid_translation(
+        "Machine translation technology has improved significantly.",
+        "机器翻译技术已经有了显著的进步。"
+    )
+    assert ok is True
+    assert "机器翻译" in processed
+    
+    # "learn Chinese" -> "学中文" 是合理翻译
+    ok, processed = valid_translation(
+        "Many people want to learn Chinese these days.",
+        "如今很多人都想学中文。"
+    )
+    assert ok is True
+    assert "学中文" in processed
+    
+    # "Simplified Chinese version" -> "简体中文版本" 是合理翻译
+    ok, processed = valid_translation(
+        "The Simplified Chinese version is now available.",
+        "简体中文版本现已上线。"
+    )
+    assert ok is True
+    assert "简体中文版本" in processed
 
 
 def test_valid_translation_accepts_zheju_in_normal_translation():
@@ -81,8 +133,6 @@ def test_valid_translation_rejects_zheju_in_explanation_patterns():
     """'这句' 出现在解释性模式中（如 '这句的意思是...'）应该被拒绝."""
     from youdub.steps.translate import valid_translation
 
-    # LLM 添加了解释性内容
-    # 注意: 避免在翻译中使用 "翻译" 子串，因为它会被更早的 forbidden_substrings 检查拦截
     long_source = "This is a longer sentence for testing purposes."
     
     # "这句的意思是..." 模式
@@ -92,6 +142,23 @@ def test_valid_translation_rejects_zheju_in_explanation_patterns():
     
     # "这句话意思是..." 模式
     ok, msg = valid_translation(long_source, "这句话意思是这是一个用于测试目的的较长句子")
+    assert ok is False
+    assert "explanation patterns" in msg
+
+
+def test_valid_translation_rejects_chinese_label_patterns():
+    """'中文：' 或 '简体中文翻译：' 等标签模式应该被拒绝."""
+    from youdub.steps.translate import valid_translation
+
+    long_source = "This is a longer sentence for testing purposes."
+    
+    # "中文：" 开头
+    ok, msg = valid_translation(long_source, "中文：这是一个用于测试目的的较长句子")
+    assert ok is False
+    assert "explanation patterns" in msg
+    
+    # "简体中文翻译：..."
+    ok, msg = valid_translation(long_source, "简体中文翻译：这是一个用于测试目的的较长句子")
     assert ok is False
     assert "explanation patterns" in msg
 

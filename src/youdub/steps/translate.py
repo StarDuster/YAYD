@@ -296,21 +296,224 @@ def valid_translation(text: str, translation: str) -> tuple[bool, str]:
     if len(text) > 100 and len(translation) < len(text) * 0.15:
         return False, 'The translation is too short, content may be lost. Please translate the complete sentence.'
 
-    # Check for forbidden patterns that indicate LLM is explaining rather than translating
-    # Note: '这句' removed from simple substring check as it causes false positives
-    # when translating "This statement", "this sentence" etc.
-    forbidden_substrings = ['翻译', '\n', '简体中文', '中文', 'translate', 'Translate', 'translation', 'Translation']
     translation = translation.strip()
-    for word in forbidden_substrings:
-        if word in translation:
-            return False, f"Don't include `{word}` in the translation. Only translate the following sentence and give me the result."
     
-    # More precise pattern check for "这句" - only reject if it appears in explanation patterns
-    # like "这句话的翻译是", "这句的意思是", "这句话翻译成" etc.
-    if re.search(r'这句.{0,3}(的翻译|的意思|翻译成|意思是)', translation):
-        return False, "Don't include explanation patterns in the translation. Only translate the following sentence and give me the result."
+    # Newline is always forbidden in translation output
+    if '\n' in translation:
+        return False, "Don't include newlines in the translation. Only translate the following sentence and give me the result."
+    
+    # Check for explanation patterns that indicate LLM is explaining rather than translating
+    # Use precise patterns instead of simple substring matching to avoid false positives
+    # when the source text discusses translation, Chinese language, etc.
+    
+    explanation_patterns = [
+        # "翻译" patterns - reject when used as meta-explanation, allow when part of content
+        # e.g. reject "翻译：你好" or "翻译结果是你好", allow "机器翻译技术"
+        (r'^翻译[：:]\s*', '翻译：'),
+        (r'翻译(结果|如下|为|成)[：:]?\s*', '翻译结果/如下/为'),
+        (r'(以下|下面)是?.{0,2}翻译', '以下是翻译'),
+        
+        # "中文/简体中文" patterns - reject meta-explanation, allow content discussion
+        # e.g. reject "中文：你好" or "简体中文翻译：", allow "学习中文" or "中文版本"
+        (r'^(简体)?中文[：:]\s*', '中文：'),
+        (r'(简体)?中文翻译[：:]?\s*', '中文翻译：'),
+        (r'翻译成?(简体)?中文[：:]?\s*', '翻译成中文：'),
+        
+        # "这句" patterns - reject explanation, allow normal translation of "this statement"
+        (r'这句.{0,3}(的翻译|的意思|翻译成|意思是)', '这句的翻译/意思'),
+        
+        # English patterns - in Chinese translation, these usually indicate LLM explaining
+        # e.g. "Translation: ..." or "Translate to Chinese: ..."
+        (r'[Tt]ranslat(e|ion)[：:]\s*', 'Translation:'),
+        (r'[Tt]ranslat(e|ion)\s+(to|into)\s+', 'Translate to'),
+    ]
+    
+    for pattern, desc in explanation_patterns:
+        if re.search(pattern, translation):
+            return False, f"Don't include explanation patterns ({desc}) in the translation. Only give the translated result."
 
     return True, translation_postprocess(translation)
+
+
+# --------------------------------------------------------------------------- #
+# Whisper punctuation fix (before translation)
+# --------------------------------------------------------------------------- #
+
+_PUNCT_FIX_TRANSCRIPT_FILE = "transcript_punctuated.json"
+
+# NOTE:
+# Only allow changing these punctuation marks.
+# Do NOT include "-" or "_" here: they are often part of tokens (e.g. Q-Learning, file_name).
+_PUNCT_FIX_ALLOWED_CHARS = set(
+    "，。！？；：、"
+    ",.!?;:"
+    "…"
+    "“”‘’\"'"
+    "（）()"
+    "【】[]"
+    "《》"
+    "—–"
+)
+
+
+def _read_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    s = raw.strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _strip_punct_for_validation(s: str) -> str:
+    if not s:
+        return ""
+    return "".join(ch for ch in s if ch not in _PUNCT_FIX_ALLOWED_CHARS)
+
+
+def _punct_fix_is_valid(src: str, out: str) -> bool:
+    # Hard guarantee: only punctuation changes are allowed.
+    # Compare the exact sequence of all non-punctuation characters (including spaces/newlines).
+    return _strip_punct_for_validation(str(src)) == _strip_punct_for_validation(str(out))
+
+
+def _punct_fix_chunk(
+    settings: Settings,
+    payload: dict[str, str],
+    *,
+    attempt_limit: int = 5,
+) -> tuple[dict[str, str], bool]:
+    """
+    Punctuate a JSON map {key: text} via LLM. Returns (mapping, ok).
+    - ok=True: mapping validated for all keys (only punctuation changes)
+    - ok=False: caller should treat as "best-effort failed" (mapping == original payload)
+    """
+    # Skip empty-only chunks quickly.
+    if not any(str(v or "").strip() for v in payload.values()):
+        return dict(payload), True
+
+    system = (
+        "你是“Whisper 转写标点修复器”。你的任务：只通过【插入/删除/替换标点符号】来改善断句与可读性，"
+        "避免一句话里逗号过多导致句子过长。\n"
+        "\n"
+        "硬性规则（必须遵守）：\n"
+        "1) 除了标点符号以外，任何字符都不得改变：不得增删改任何汉字/字母/数字/大小写/空格/换行；词序必须完全保持。\n"
+        "2) 允许修改的只有标点符号（中英文逗号句号问号叹号分号冒号顿号引号括号等）。\n"
+        "3) 禁止：翻译、纠错、改写、润色、补词、删词、同义替换、调整措辞；禁止改变原有换行结构。\n"
+        "4) 不要改变 URL / 邮箱 / 版本号 / 文件名 / 代码 token 内部的字符（例如 3.14、foo_bar、Q-Learning、https://...）。\n"
+        "5) 断句目标：让句子更短更清晰。遇到“逗号串联很长”的情况，优先把部分逗号改为句号或分号；必要时插入句号/问号/叹号来断句。\n"
+        "6) 自检（输出前必须做）：对每一条 value，将输入与输出的所有标点符号删除后必须完全一致；若无法满足，直接原样返回该条输入。\n"
+        "\n"
+        "输入是一个 JSON 对象：key 是字符串编号，value 是待处理文本。\n"
+        "输出要求：只输出 JSON 对象本身，不要任何解释；必须包含与输入完全相同的所有 key。\n"
+    )
+    user = json.dumps(payload, ensure_ascii=False)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    backend = _get_thread_backend(settings)
+    for attempt in range(attempt_limit):
+        check_cancelled()
+        try:
+            content = _chat_completion_text(backend, messages)
+            obj = _extract_first_json_object(content)
+            # Allow wrappers like {"result": {...}} / {"outputs": {...}}
+            for wrap_key in ("result", "results", "output", "outputs", "data"):
+                if isinstance(obj.get(wrap_key), dict):
+                    obj = cast(dict[str, Any], obj[wrap_key])
+                    break
+
+            out: dict[str, str] = {}
+            for k, src in payload.items():
+                # Preserve empties exactly.
+                if not str(src or "").strip():
+                    out[k] = str(src or "")
+                    continue
+                v = obj.get(k, None)
+                if v is None:
+                    raise ValueError(f"missing key: {k}")
+                cand = str(v)
+                if not _punct_fix_is_valid(src, cand):
+                    raise ValueError(f"invalid punctuation fix for key={k}")
+                out[k] = cand
+
+            # Ensure we didn't lose keys (strict contract).
+            if set(out.keys()) != set(payload.keys()):
+                raise ValueError("key set mismatch")
+            return out, True
+        except (ValueError, JSONDecodeError) as exc:
+            logger.warning(f"标点修复解析/校验失败 (尝试={attempt + 1}/{attempt_limit}): {exc}")
+            sleep_with_cancel(0.8)
+        except Exception as exc:
+            delay = _handle_sdk_exception(exc, attempt)
+            if delay is None:
+                return dict(payload), False
+            sleep_with_cancel(delay)
+
+    return dict(payload), False
+
+
+def _load_or_create_punctuated_transcript(
+    folder: str,
+    transcript: list[dict[str, Any]],
+    *,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    """
+    Best-effort:
+    - If cached punctuated transcript exists and is newer than transcript.json, reuse it.
+    - Otherwise, call LLM to fix punctuation (only punctuation allowed to change) and cache it.
+    """
+    if not transcript:
+        return transcript
+
+    # Allow disabling to save cost or for tests.
+    if not _read_env_bool("YOUDUB_PUNCTUATION_FIX_BEFORE_TRANSLATE", True):
+        return transcript
+
+    src_path = os.path.join(folder, "transcript.json")
+    punct_path = os.path.join(folder, _PUNCT_FIX_TRANSCRIPT_FILE)
+
+    if os.path.exists(punct_path) and os.path.exists(src_path):
+        try:
+            if os.path.getmtime(punct_path) >= os.path.getmtime(src_path):
+                with open(punct_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if isinstance(cached, list) and len(cached) == len(transcript) and all(
+                    isinstance(it, dict) and isinstance(it.get("text"), str) for it in cached[:50]
+                ):
+                    return cast(list[dict[str, Any]], cached)
+        except Exception:
+            # Ignore and regenerate.
+            pass
+
+    out: list[dict[str, Any]] = [dict(it) for it in transcript]
+
+    # Small batching: one call returns a JSON map of multiple segments.
+    chunk_size = max(1, min(_read_int_env("PUNCTUATION_FIX_CHUNK_SIZE", 24), 128))
+    all_ok = True
+
+    for i0 in range(0, len(out), chunk_size):
+        check_cancelled()
+        idxs = list(range(i0, min(i0 + chunk_size, len(out))))
+        payload = {str(i): cast(str, out[i].get("text", "")) for i in idxs}
+        fixed, ok = _punct_fix_chunk(settings, payload, attempt_limit=5)
+        if not ok:
+            all_ok = False
+        for i in idxs:
+            out[i]["text"] = fixed.get(str(i), payload[str(i)])
+
+    # Only cache if the whole run succeeded; avoid caching "no-op due to failures".
+    if all_ok:
+        try:
+            with open(punct_path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f"写入标点修复缓存失败（忽略）: {exc}")
+
+    return out
 
 
 def _translate_single_text(
@@ -1136,6 +1339,14 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
     if translation_ok:
         return True
     
+    # Punctuate transcript before translating (strictly punctuation-only changes).
+    check_cancelled()
+    try:
+        transcript = _load_or_create_punctuated_transcript(str(folder), cast(list[dict[str, Any]], transcript), settings=cfg)
+    except Exception as exc:  # pylint: disable=broad-except
+        # Best-effort: never block translation due to punctuation fix.
+        logger.warning(f"翻译前标点修复失败（忽略，继续翻译原始转写）: {exc}")
+
     # Perform translation
     check_cancelled()
     translations = _translate_content(summary, transcript, target_language, settings=settings)
