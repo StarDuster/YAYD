@@ -108,13 +108,14 @@ def test_upload_video_with_biliapi_writes_marker_and_calls_runner(monkeypatch, t
     cookie_path = tmp_path / "bili_cookies.json"
     cookie_path.write_text("cookie", encoding="utf-8")
 
-    ok = up._upload_video_with_biliapi(  # noqa: SLF001
+    success, actually_uploaded = up._upload_video_with_biliapi(  # noqa: SLF001
         str(folder),
         proxy="socks5h://127.0.0.1:1080",
         upload_cdn="bda2",
         cookie_path=cookie_path,
     )
-    assert ok is True
+    assert success is True
+    assert actually_uploaded is True
 
     payload = captured.get("payload")
     assert isinstance(payload, dict)
@@ -157,13 +158,14 @@ def test_upload_video_with_biliapi_skips_when_already_uploaded(monkeypatch, tmp_
     cookie_path = tmp_path / "bili_cookies.json"
     cookie_path.write_text("cookie", encoding="utf-8")
 
-    ok = up._upload_video_with_biliapi(  # noqa: SLF001
+    success, actually_uploaded = up._upload_video_with_biliapi(  # noqa: SLF001
         str(folder),
         proxy=None,
         upload_cdn=None,
         cookie_path=cookie_path,
     )
-    assert ok is True
+    assert success is True
+    assert actually_uploaded is False  # 跳过已上传的不算真正上传
 
 
 def test_upload_video_reads_env_and_forwards_to_impl(monkeypatch, tmp_path: Path):
@@ -187,7 +189,7 @@ def test_upload_video_reads_env_and_forwards_to_impl(monkeypatch, tmp_path: Path
                 "cookie_path": cookie_path,
             }
         )
-        return True
+        return (True, True)  # 返回 tuple
 
     monkeypatch.setattr(up, "_upload_video_with_biliapi", _fake_impl)
 
@@ -218,7 +220,8 @@ def test_upload_all_videos_counts_uploaded_folders(monkeypatch, tmp_path: Path):
     (job2 / "video.mp4").write_bytes(b"0")
 
     def _fake_impl(folder, *_args, **_kwargs):  # noqa: ANN001
-        return folder.endswith("job1")
+        # job1 成功，job2 失败
+        return (folder.endswith("job1"), folder.endswith("job1"))
 
     monkeypatch.setattr(up, "_upload_video_with_biliapi", _fake_impl)
     out = up.upload_all_videos_under_folder(str(tmp_path))
@@ -245,7 +248,7 @@ def test_upload_all_videos_waits_between_uploads(monkeypatch, tmp_path: Path):
 
     def _fake_impl(folder, *_args, **_kwargs):  # noqa: ANN001
         uploaded.append(folder)
-        return True
+        return (True, True)  # 返回 tuple
 
     monkeypatch.setattr(up, "_upload_video_with_biliapi", _fake_impl)
     monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
@@ -253,6 +256,41 @@ def test_upload_all_videos_waits_between_uploads(monkeypatch, tmp_path: Path):
     out = up.upload_all_videos_under_folder(str(tmp_path))
     assert "成功 2 个" in out
     assert len(uploaded) == 2
+    assert waits == [30]
+
+
+def test_upload_all_videos_skips_already_uploaded_no_wait(monkeypatch, tmp_path: Path):
+    """已上传的视频跳过时不应该等待间隔"""
+    import youdub.steps.upload as up
+
+    monkeypatch.setattr(up, "_biliapi_availability_error", lambda: None)
+    monkeypatch.setenv("BILI_COOKIE_PATH", str(tmp_path / "cookies.json"))
+    monkeypatch.setenv("BILI_UPLOAD_INTERVAL", "30")
+    (tmp_path / "cookies.json").write_text("cookie", encoding="utf-8")
+
+    job1 = tmp_path / "job1"
+    job2 = tmp_path / "job2"
+    job3 = tmp_path / "job3"
+    for job in [job1, job2, job3]:
+        job.mkdir(parents=True, exist_ok=True)
+        (job / "video.mp4").write_bytes(b"0")
+    # job2 已上传
+    (job2 / "bilibili.json").write_text(json.dumps({"results": [{"code": 0}]}), encoding="utf-8")
+
+    uploaded: list[str] = []
+    waits: list[int] = []
+
+    def _fake_impl(folder, *_args, **_kwargs):  # noqa: ANN001
+        uploaded.append(folder)
+        return (True, True)
+
+    monkeypatch.setattr(up, "_upload_video_with_biliapi", _fake_impl)
+    monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
+
+    out = up.upload_all_videos_under_folder(str(tmp_path))
+    # job1 和 job3 被上传，job2 跳过
+    assert len(uploaded) == 2
+    # 只有一次等待（job1 和 job3 之间），跳过 job2 不产生等待
     assert waits == [30]
 
 
@@ -306,13 +344,14 @@ def test_upload_video_returns_false_when_missing_video(monkeypatch, tmp_path: Pa
     cookie_path = tmp_path / "cookies.json"
     cookie_path.write_text("cookie", encoding="utf-8")
 
-    ok = up._upload_video_with_biliapi(  # noqa: SLF001
+    success, actually_uploaded = up._upload_video_with_biliapi(  # noqa: SLF001
         str(folder),
         proxy=None,
         upload_cdn=None,
         cookie_path=cookie_path,
     )
-    assert ok is False
+    assert success is False
+    assert actually_uploaded is False
 
 
 def test_upload_video_returns_false_when_missing_summary(monkeypatch, tmp_path: Path):
@@ -328,13 +367,14 @@ def test_upload_video_returns_false_when_missing_summary(monkeypatch, tmp_path: 
     cookie_path = tmp_path / "cookies.json"
     cookie_path.write_text("cookie", encoding="utf-8")
 
-    ok = up._upload_video_with_biliapi(  # noqa: SLF001
+    success, actually_uploaded = up._upload_video_with_biliapi(  # noqa: SLF001
         str(folder),
         proxy=None,
         upload_cdn=None,
         cookie_path=cookie_path,
     )
-    assert ok is False
+    assert success is False
+    assert actually_uploaded is False
 
 
 def test_upload_handles_runner_failure(monkeypatch, tmp_path: Path):
@@ -351,13 +391,14 @@ def test_upload_handles_runner_failure(monkeypatch, tmp_path: Path):
     cookie_path = tmp_path / "cookies.json"
     cookie_path.write_text("cookie", encoding="utf-8")
 
-    ok = up._upload_video_with_biliapi(  # noqa: SLF001
+    success, actually_uploaded = up._upload_video_with_biliapi(  # noqa: SLF001
         str(folder),
         proxy=None,
         upload_cdn=None,
         cookie_path=cookie_path,
     )
-    assert ok is False
+    assert success is False
+    assert actually_uploaded is False
     # No marker file should be created on failure
     assert not (folder / "bilibili.json").exists()
 
@@ -377,4 +418,3 @@ def test_is_uploaded_checks_nested_results():
     assert _is_uploaded({}) is False
     assert _is_uploaded(None) is False
     assert _is_uploaded([]) is False
-

@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
+from .generate_info import resize_thumbnail
 
 load_dotenv()
 
@@ -278,10 +279,22 @@ def _upload_video_with_biliapi(
             pass
 
     video_path = folder_path / "video.mp4"
-    # 封面优先级：download.webp > video.png
-    cover_path = folder_path / "download.webp"
+    # 封面优先级：video.png > download.webp（video.png 尺寸更符合 B 站要求）
+    # 如果 video.png 不存在，尝试从 download.* 生成
+    cover_path = folder_path / "video.png"
     if not cover_path.exists():
-        cover_path = folder_path / "video.png"
+        try:
+            generated = resize_thumbnail(str(folder_path))
+            if generated:
+                cover_path = Path(generated)
+                logger.info(f"已生成封面: {cover_path}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"生成封面失败: {exc}")
+    # 如果还是没有 video.png，回退到 download.webp
+    if not cover_path.exists():
+        fallback = folder_path / "download.webp"
+        if fallback.exists():
+            cover_path = fallback
     if not video_path.exists():
         logger.warning(f"未找到视频文件: {video_path}")
         return (False, False)
@@ -480,13 +493,19 @@ def upload_all_videos_under_folder(folder: str) -> str:
         )
 
     count = 0
-    need_wait = False  # 只有真正上传后才需要等待
+    need_wait = False  # 只有真正执行了上传才需要等待
     for root, _, files in os.walk(folder):
         check_cancelled()
         if "video.mp4" in files:
+            # 已上传的直接跳过：不计数，也不需要等待间隔
+            if _folder_uploaded(root):
+                logger.info(f"跳过（已上传）: {root}")
+                continue
+
             if need_wait and upload_interval > 0:
                 logger.info(f"等待 {upload_interval} 秒后上传下一个视频...")
                 sleep_with_cancel(upload_interval)
+
             success, actually_uploaded = _upload_video_with_biliapi(root, proxy, upload_cdn, cookie_path)
             if success:
                 count += 1
