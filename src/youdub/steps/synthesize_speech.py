@@ -99,6 +99,55 @@ def _read_speaker_ref_seconds(default: float = 15.0) -> float:
     return float(max(3.0, min(v, 60.0)))
 
 
+def _read_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    raw = raw.strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _read_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    raw = raw.strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _tts_duration_guard_params() -> tuple[float, float, float, int]:
+    """
+    Guardrail for "TTS segment should not be significantly longer than source segment".
+
+    Defaults are intentionally permissive (to tolerate language expansion) but will catch
+    pathological outputs like ~10-minute clips for a ~10s segment.
+    """
+    ratio = _read_env_float("YOUDUB_TTS_MAX_SEGMENT_DURATION_RATIO", 3.0)
+    extra = _read_env_float("YOUDUB_TTS_MAX_SEGMENT_DURATION_EXTRA_SEC", 8.0)
+    abs_cap = _read_env_float("YOUDUB_TTS_MAX_SEGMENT_DURATION_ABS_SEC", 180.0)
+    retries = _read_env_int("YOUDUB_TTS_SEGMENT_MAX_RETRIES", 3)
+
+    if not (ratio >= 1.0):
+        ratio = 3.0
+    if not (extra >= 0.0):
+        extra = 8.0
+    # abs_cap <= 0 means "disable absolute cap"
+    if not (retries >= 1):
+        retries = 3
+    retries = int(max(1, min(retries, 10)))
+    return float(ratio), float(extra), float(abs_cap), int(retries)
+
+
 def _wav_duration_seconds(path: str) -> float | None:
     try:
         with wave.open(path, "rb") as wf:
@@ -111,6 +160,60 @@ def _wav_duration_seconds(path: str) -> float | None:
             return frames / float(rate)
     except Exception:
         return None
+
+
+def _tts_segment_allowed_max_seconds(seg_dur: float, ratio: float, extra: float, abs_cap: float) -> float | None:
+    """
+    Compute allowed max duration for a TTS segment.
+
+    - seg_dur <= 0: only apply abs_cap (if configured), otherwise no guard.
+    - otherwise: max(seg_dur * ratio, seg_dur + extra).
+    """
+    sd = float(seg_dur or 0.0)
+    if sd <= 0.0:
+        return float(abs_cap) if (abs_cap and abs_cap > 0) else None
+    allowed = max(sd * float(ratio), sd + float(extra))
+    return float(allowed)
+
+
+def _tts_wav_ok_for_segment(path: str, seg_dur: float, ratio: float, extra: float, abs_cap: float) -> bool:
+    if not (os.path.exists(path) and is_valid_wav(path)):
+        return False
+    dur = _wav_duration_seconds(path)
+    if dur is None:
+        return False
+    allowed = _tts_segment_allowed_max_seconds(seg_dur, ratio, extra, abs_cap)
+    if allowed is None:
+        return True
+    # tolerate tiny header rounding errors
+    return bool(dur <= allowed + 0.02)
+
+
+def _tts_text_for_attempt(raw_text: str, attempt: int) -> str:
+    """
+    Text variants for retries:
+    - attempt 0: keep original (normalized)
+    - attempt 1+: strip markdown-ish code markers and make common code punctuation more TTS-friendly
+    - attempt 2+: more aggressive cleanup of uncommon symbols
+    """
+    t = str(raw_text or "")
+    if attempt <= 0:
+        return preprocess_text(t)
+
+    # Remove fenced blocks and inline backticks.
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = t.replace("`", "")
+
+    # Make common code tokens less likely to confuse TTS.
+    t = re.sub(r"(?<=[A-Za-z0-9])\.(?=[A-Za-z0-9])", " 点 ", t)
+    t = t.replace("_", " ")
+
+    if attempt >= 2:
+        # Keep only: CJK, ASCII alnum, whitespace, and basic punctuation.
+        t = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9\s，。！？,.!?:：；;（）()\-\+*/=]", " ", t)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    return preprocess_text(t)
 
 
 def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 24000) -> None:
@@ -1273,9 +1376,29 @@ def _tts_segment_wavs_complete(folder: str, expected_segments: int) -> bool:
         return False
 
     # Full check (cheap header parse): ensure no holes/corrupted files.
+    tr_path = os.path.join(folder, "translation.json")
+    transcript: list[dict] | None = None
+    try:
+        with open(tr_path, "r", encoding="utf-8") as f:
+            tr = json.load(f)
+        if isinstance(tr, list):
+            transcript = tr  # type: ignore[assignment]
+    except Exception:
+        transcript = None
+
+    dur_ratio, dur_extra, dur_abs_cap, _dur_retries = _tts_duration_guard_params()
     for i in range(n):
         p = _segment_wav_path(folder, i)
         if not (os.path.exists(p) and is_valid_wav(p)):
+            return False
+        seg_dur = 0.0
+        if transcript is not None and i < len(transcript):
+            it = transcript[i]
+            try:
+                seg_dur = float(max(0.0, float(it.get("end", 0.0)) - float(it.get("start", 0.0))))
+            except Exception:
+                seg_dur = 0.0
+        if not _tts_wav_ok_for_segment(p, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
             return False
     return True
 
@@ -1297,6 +1420,8 @@ def generate_wavs(
 
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
+
+    dur_ratio, dur_extra, dur_abs_cap, max_seg_retries = _tts_duration_guard_params()
         
     speakers = set(line["speaker"] for line in transcript)
     num_speakers = len(speakers)
@@ -1390,7 +1515,20 @@ def generate_wavs(
                 check_cancelled()
                 out = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
                 if os.path.exists(out) and is_valid_wav(out):
-                    qwen_cached_before.add(i)
+                    try:
+                        seg = transcript[i]
+                        seg_dur = float(max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))))
+                    except Exception:
+                        seg_dur = 0.0
+                    if _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
+                        qwen_cached_before.add(i)
+                    else:
+                        # Too long vs expected segment duration -> treat as bad cache and regenerate.
+                        try:
+                            os.remove(out)
+                            logger.warning(f"删除异常超长TTS缓存: {out}")
+                        except Exception:
+                            pass
 
             def _looks_like_oom(err: str) -> bool:
                 s = (err or "").lower()
@@ -1410,10 +1548,15 @@ def generate_wavs(
                     out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
                     spk_wav = os.path.join(folder, "SPEAKER", f"{speaker}.wav")
                     speaker_wav_for_req = spk_wav
-                    # If invalid/corrupted file exists, remove so worker can rewrite cleanly.
-                    if os.path.exists(out) and not is_valid_wav(out):
+                    # If invalid/corrupted/too-long file exists, remove so worker can rewrite cleanly.
+                    if os.path.exists(out):
                         try:
-                            os.remove(out)
+                            try:
+                                seg_dur = float(max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))))
+                            except Exception:
+                                seg_dur = 0.0
+                            if not _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
+                                os.remove(out)
                         except Exception:
                             pass
                     item: dict = {
@@ -1524,19 +1667,11 @@ def generate_wavs(
         for i, line in enumerate(transcript):
             check_cancelled()
             speaker = line["speaker"]
-            text = preprocess_text(line["translation"])
+            raw_translation = str(line.get("translation", ""))
             output_path = os.path.join(output_folder, f"{str(i).zfill(4)}.wav")
             speaker_wav = os.path.join(folder, "SPEAKER", f"{speaker}.wav")
             seg_no = i + 1
-            if tts_method == "qwen" and qwen_worker is not None and qwen_batch_size > 1:
-                was_cached = i in qwen_cached_before
-            else:
-                was_cached = os.path.exists(output_path) and is_valid_wav(output_path)
-            cache_tag = " [cached]" if was_cached else ""
-            logger.info(
-                f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}"
-            )
-
+            # Validate cache: must be a valid wav AND not significantly longer than the source segment.
             try:
                 seg_start = float(line.get("start", 0.0) or 0.0)
                 seg_end = float(line.get("end", seg_start) or seg_start)
@@ -1544,40 +1679,69 @@ def generate_wavs(
                 seg_start, seg_end = 0.0, 0.0
             seg_dur = float(max(0.0, seg_end - seg_start))
 
+            wav_ok = False
+            if os.path.exists(output_path):
+                try:
+                    if _tts_wav_ok_for_segment(output_path, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
+                        wav_ok = True
+                    else:
+                        # Bad cache (too long / invalid) -> delete so we can regenerate.
+                        os.remove(output_path)
+                        logger.warning(f"删除异常TTS片段缓存(将重试生成): {output_path}")
+                except Exception:
+                    # If we can't validate, remove to avoid downstream time-stretch crashes.
+                    try:
+                        os.remove(output_path)
+                    except Exception:
+                        pass
+
+            if tts_method == "qwen" and qwen_worker is not None and qwen_batch_size > 1:
+                was_cached = bool(wav_ok and (i in qwen_cached_before))
+            else:
+                was_cached = bool(wav_ok)
+            cache_tag = " [cached]" if was_cached else ""
+            logger.info(
+                f"TTS({tts_method}) {seg_no}/{total_segments}: {Path(output_path).name}{cache_tag} speaker={speaker}"
+            )
+
             tts_elapsed = 0.0
             qwen_resp: dict | None = qwen_resp_by_index.get(i)
-            needs_tts = not (os.path.exists(output_path) and is_valid_wav(output_path))
+            needs_tts = not wav_ok
             if needs_tts:
-                tts_begin = time.monotonic()
-                try:
+                last_err: str | None = None
+                qwen_restarted_for_this_segment = False
+                for attempt in range(max_seg_retries):
                     check_cancelled()
-                    if tts_method == "qwen" and qwen_worker is not None:
-                        if qwen_batch_size > 1:
-                            # Generate current + upcoming missing segments in one worker call.
-                            batch_indices: list[int] = []
-                            j = i
-                            while j < total_segments and len(batch_indices) < qwen_batch_size:
-                                check_cancelled()
-                                out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
-                                if not (os.path.exists(out) and is_valid_wav(out)):
-                                    batch_indices.append(j)
-                                j += 1
-                            _run_qwen_batch(batch_indices)
-                            qwen_resp = qwen_resp_by_index.get(i)
-                        else:
-                            try:
-                                qwen_resp = qwen_worker.synthesize(
-                                    text,
-                                    speaker_wav,
-                                    output_path,
-                                    language="Auto",
-                                    timeout_sec=qwen_timeout_sec,
-                                )
-                            except Exception as exc_qwen:
-                                if _should_restart_qwen_worker(str(exc_qwen)):
-                                    logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
-                                    _restart_qwen_worker(str(exc_qwen))
-                                    assert qwen_worker is not None
+                    if attempt > 0:
+                        logger.warning(f"TTS({tts_method})段 {i} 将重试(第 {attempt+1}/{max_seg_retries} 次)")
+
+                    text = _tts_text_for_attempt(raw_translation, attempt)
+                    tts_begin = time.monotonic()
+                    try:
+                        check_cancelled()
+                        if tts_method == "qwen" and qwen_worker is not None:
+                            if attempt == 0 and qwen_batch_size > 1:
+                                # Generate current + upcoming missing segments in one worker call.
+                                batch_indices = []
+                                j = i
+                                while j < total_segments and len(batch_indices) < qwen_batch_size:
+                                    check_cancelled()
+                                    out = os.path.join(output_folder, f"{str(j).zfill(4)}.wav")
+                                    # Validate existing cache as well (including duration guard).
+                                    seg_j = transcript[j]
+                                    try:
+                                        seg_dur_j = float(
+                                            max(0.0, float(seg_j.get("end", 0.0)) - float(seg_j.get("start", 0.0)))
+                                        )
+                                    except Exception:
+                                        seg_dur_j = 0.0
+                                    if not _tts_wav_ok_for_segment(out, seg_dur_j, dur_ratio, dur_extra, dur_abs_cap):
+                                        batch_indices.append(j)
+                                    j += 1
+                                _run_qwen_batch(batch_indices)
+                                qwen_resp = qwen_resp_by_index.get(i)
+                            else:
+                                try:
                                     qwen_resp = qwen_worker.synthesize(
                                         text,
                                         speaker_wav,
@@ -1585,17 +1749,65 @@ def generate_wavs(
                                         language="Auto",
                                         timeout_sec=qwen_timeout_sec,
                                     )
-                                else:
-                                    raise
-                    elif tts_method == "gemini":
-                        gemini_tts(text, output_path)
-                    else:
-                        bytedance_tts(text, output_path, speaker_wav)
-                except Exception as exc:
-                    logger.warning(f"TTS({tts_method})段 {i} 失败: {exc}")
-                tts_elapsed = time.monotonic() - tts_begin
+                                except Exception as exc_qwen:
+                                    if _should_restart_qwen_worker(str(exc_qwen)):
+                                        logger.warning(f"Qwen3-TTS worker 异常，将重启并重试一次: {exc_qwen}")
+                                        _restart_qwen_worker(str(exc_qwen))
+                                        assert qwen_worker is not None
+                                        qwen_resp = qwen_worker.synthesize(
+                                            text,
+                                            speaker_wav,
+                                            output_path,
+                                            language="Auto",
+                                            timeout_sec=qwen_timeout_sec,
+                                        )
+                                    else:
+                                        raise
+                        elif tts_method == "gemini":
+                            gemini_tts(text, output_path)
+                        else:
+                            bytedance_tts(text, output_path, speaker_wav)
+                        last_err = None
+                    except Exception as exc:
+                        last_err = str(exc)
+                        logger.warning(f"TTS({tts_method})段 {i} 失败: {exc}")
+                    finally:
+                        tts_elapsed += max(0.0, time.monotonic() - tts_begin)
 
-            valid_wav = os.path.exists(output_path) and is_valid_wav(output_path)
+                    # Validate the generated wav (including duration guard).
+                    if _tts_wav_ok_for_segment(output_path, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
+                        wav_ok = True
+                        break
+
+                    wav_dur = _wav_duration_seconds(output_path) if os.path.exists(output_path) else None
+                    allowed = _tts_segment_allowed_max_seconds(seg_dur, dur_ratio, dur_extra, dur_abs_cap)
+                    if wav_dur is not None and allowed is not None and wav_dur > allowed + 0.02:
+                        logger.warning(
+                            f"TTS({tts_method})段 {i} 输出异常过长: wav_dur={wav_dur:.2f}s > allowed={allowed:.2f}s "
+                            f"(seg_dur={seg_dur:.2f}s)"
+                        )
+
+                    # Cleanup before next retry.
+                    try:
+                        if os.path.exists(output_path):
+                            os.remove(output_path)
+                    except Exception:
+                        pass
+                    if (
+                        tts_method == "qwen"
+                        and qwen_worker is not None
+                        and (attempt + 1) < max_seg_retries  # only if we still have retries left
+                    ):
+                        # 用户期望：不要“一次失败就重启 worker”。
+                        # 策略：先在同一个 worker 上再试一次；若仍失败，再重启一次用于后续重试。
+                        if attempt >= 1 and not qwen_restarted_for_this_segment:
+                            _restart_qwen_worker(f"segment {i} invalid/too-long twice; restart worker")
+                            qwen_restarted_for_this_segment = True
+
+                if not wav_ok and last_err:
+                    logger.warning(f"TTS({tts_method})段 {i} 重试耗尽仍失败: {last_err}")
+
+            valid_wav = bool(wav_ok and os.path.exists(output_path) and is_valid_wav(output_path))
             if valid_wav:
                 source = "cached" if was_cached else "tts"
             else:

@@ -147,6 +147,48 @@ def test_generate_all_wavs_reruns_when_marker_exists_but_wavs_incomplete(tmp_pat
     assert called["n"] == 1
 
 
+def test_generate_all_wavs_reruns_when_marker_exists_but_wav_too_long(tmp_path: Path, monkeypatch):
+    import youdub.steps.synthesize_speech as ss
+
+    # Make the guard strict so the test is deterministic.
+    monkeypatch.setenv("YOUDUB_TTS_MAX_SEGMENT_DURATION_RATIO", "2")
+    monkeypatch.setenv("YOUDUB_TTS_MAX_SEGMENT_DURATION_EXTRA_SEC", "0")
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    (folder / "translation.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "translation": "好"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "wavs").mkdir(parents=True, exist_ok=True)
+    # Create an abnormally long segment wav (should trigger re-run even if marker exists).
+    _write_dummy_wav(folder / "wavs" / "0000.wav", seconds=5.0)
+
+    # Marker now lives in wavs/
+    (folder / "wavs" / ".tts_done.json").write_text(
+        json.dumps({"tts_method": "bytedance", "segments": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    called = {"n": 0}
+
+    def _fake_generate_wavs(_folder: str, _tts_method: str = "bytedance", **_kwargs) -> None:
+        called["n"] += 1
+        job = Path(_folder)
+        (job / "wavs").mkdir(parents=True, exist_ok=True)
+        _write_dummy_wav(job / "wavs" / "0000.wav", seconds=0.2)
+        (job / "wavs" / ".tts_done.json").write_text(
+            json.dumps({"tts_method": _tts_method, "segments": 1}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(ss, "generate_wavs", _fake_generate_wavs)
+
+    ss.generate_all_wavs_under_folder(str(tmp_path), tts_method="bytedance")
+    assert called["n"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # ByteDance TTS integration
 # --------------------------------------------------------------------------- #
@@ -229,6 +271,52 @@ def test_generate_wavs_bytedance_produces_audio_combined_and_srt(tmp_path: Path,
     assert srt_path.exists()
     content = srt_path.read_text(encoding="utf-8")
     assert "-->" in content
+
+
+def test_generate_wavs_retries_when_segment_too_long(tmp_path: Path, monkeypatch):
+    import youdub.steps.synthesize_speech as ss
+
+    # Avoid sleeps in unit tests.
+    monkeypatch.setattr(ss, "sleep_with_cancel", lambda *_args, **_kwargs: None)
+
+    # Make the guard strict so the test is deterministic.
+    monkeypatch.setenv("YOUDUB_TTS_MAX_SEGMENT_DURATION_RATIO", "2")
+    monkeypatch.setenv("YOUDUB_TTS_MAX_SEGMENT_DURATION_EXTRA_SEC", "0")
+    monkeypatch.setenv("YOUDUB_TTS_SEGMENT_MAX_RETRIES", "2")
+
+    folder = tmp_path / "job_retry"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SPEAKER").mkdir(parents=True, exist_ok=True)
+    _write_dummy_wav(folder / "SPEAKER" / "SPEAKER_00.wav", seconds=1.0)
+
+    (folder / "translation.json").write_text(
+        json.dumps(
+            [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "x", "translation": "你好"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {"n": 0}
+
+    def _fake_bytedance_tts(_text: str, output_path: str, _speaker_wav: str, voice_type: str | None = None) -> None:
+        _ = voice_type
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First attempt: produce a wav longer than allowed -> should be deleted and retried.
+            _write_dummy_wav(Path(output_path), seconds=5.0)
+        else:
+            _write_dummy_wav(Path(output_path), seconds=0.2)
+
+    monkeypatch.setattr(ss, "bytedance_tts", _fake_bytedance_tts)
+
+    ss.generate_wavs(str(folder), tts_method="bytedance")
+    assert calls["n"] == 2
+
+    out = folder / "wavs" / "0000.wav"
+    assert out.exists()
+    assert ss.is_valid_wav(str(out)) is True
+    assert _wav_duration_seconds(out) <= 2.05
 
 
 # --------------------------------------------------------------------------- #
