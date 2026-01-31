@@ -31,7 +31,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v7: use ASS for monolingual subtitles too (ensures font size is respected via PlayRes)
 # v8: restore subtitle font scaling (1080p -> ~36) for readability
 # v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
-_VIDEO_META_VERSION = 9
+# v10: keep 1080p landscape at ~36; portrait slightly smaller
+_VIDEO_META_VERSION = 10
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -617,18 +618,14 @@ def _calc_subtitle_style_params(
     h = max(1, int(height))
 
     # Subtitle font size: readable across resolutions.
-    # - Landscape: scale from height, with a mild boost for wider aspect ratios (1080p 16:9 -> ~42).
-    # - Portrait: scale from width, with a mild reduction for taller aspect ratios (1080x1920 -> ~33).
+    # - Landscape: scale from height (1080p 16:9 -> ~36).
+    # - Portrait: scale from width, slightly smaller (1080x1920 -> ~33).
     if w >= h:
-        aspect = float(w) / float(h)
-        aspect_bonus = min(0.35, max(0.0, (aspect - 1.0) * 0.20))
         base_dim = h
-        scale = 1.0 + float(aspect_bonus)
+        scale = 1.0
     else:
-        aspect = float(h) / float(w)
-        aspect_penalty = min(0.20, max(0.0, (aspect - 1.0) * 0.10))
         base_dim = w
-        scale = 1.0 - float(aspect_penalty)
+        scale = 0.94
 
     # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
     font_size = int(round(float(base_dim) * 0.033 * float(scale)))

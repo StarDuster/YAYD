@@ -22,7 +22,7 @@ def test_subtitle_style_params_1080p_not_tiny():
     import youdub.steps.synthesize_video as sv
 
     font_size, outline, margin_v, max_chars_zh, max_chars_en = sv._calc_subtitle_style_params(1920, 1080)
-    assert 30 <= font_size <= 60
+    assert font_size == 36
     assert outline >= 1
     assert margin_v >= 12
     assert max_chars_zh >= 1
@@ -30,7 +30,7 @@ def test_subtitle_style_params_1080p_not_tiny():
 
     # Portrait outputs should be slightly smaller than landscape for the same 1080 short edge.
     font_size2, *_rest = sv._calc_subtitle_style_params(1080, 1920)
-    assert 24 <= font_size2 <= 60
+    assert 24 <= font_size2 <= 36
     assert font_size2 < font_size
 
 
