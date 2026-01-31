@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Generator
@@ -13,6 +14,61 @@ from ..interrupts import check_cancelled
 # 下载重试配置
 MAX_DOWNLOAD_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
+
+
+def _probe_video_valid(path: str, min_duration: float = 1.0) -> bool:
+    """
+    使用 ffprobe 检查视频文件是否有效。
+    
+    Returns:
+        True 如果视频有效（有视频流且时长 >= min_duration 秒）
+        False 如果文件损坏或无法解析
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=duration",
+                "-of", "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.debug(f"ffprobe 返回非 0: {path}, stderr: {result.stderr[:200]}")
+            return False
+        
+        duration_str = result.stdout.strip()
+        if not duration_str:
+            # 没有视频流或无法读取时长，尝试用 format duration
+            result2 = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result2.returncode != 0:
+                return False
+            duration_str = result2.stdout.strip()
+        
+        if not duration_str:
+            return False
+        
+        duration = float(duration_str)
+        return duration >= min_duration
+    except (subprocess.TimeoutExpired, ValueError, OSError) as exc:
+        logger.debug(f"ffprobe 检查失败: {path}, {exc}")
+        return False
 
 
 def sanitize_title(title: str) -> str:
@@ -105,10 +161,15 @@ def download_single_video(
     if os.path.exists(download_mp4):
         try:
             if os.path.getsize(download_mp4) >= 1024:
-                logger.info(f"已下载: {output_folder}")
-                return output_folder
-            logger.warning(f"download.mp4 疑似无效(过小)，将重新下载: {download_mp4}")
-            os.remove(download_mp4)
+                # 使用 ffprobe 验证视频是否有效
+                if _probe_video_valid(download_mp4):
+                    logger.info(f"已下载: {output_folder}")
+                    return output_folder
+                logger.warning(f"download.mp4 文件损坏或不完整，将重新下载: {download_mp4}")
+                os.remove(download_mp4)
+            else:
+                logger.warning(f"download.mp4 疑似无效(过小)，将重新下载: {download_mp4}")
+                os.remove(download_mp4)
         except Exception:
             # Best-effort: proceed to re-download
             pass
@@ -139,8 +200,15 @@ def download_single_video(
             rc = ydl.download([webpage_url])
         
         if os.path.exists(download_mp4):
-            logger.info(f"下载完成: {output_folder}")
-            return output_folder
+            # 验证下载的文件是否有效
+            if _probe_video_valid(download_mp4):
+                logger.info(f"下载完成: {output_folder}")
+                return output_folder
+            logger.warning(f"下载的文件损坏或不完整，将重试: {download_mp4}")
+            try:
+                os.remove(download_mp4)
+            except Exception:
+                pass
         
         if rc not in (0, None):
             logger.warning(f"yt-dlp 返回非 0: {rc} ({webpage_url})")
