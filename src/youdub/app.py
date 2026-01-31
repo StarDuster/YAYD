@@ -881,7 +881,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
         )
         pipeline_diarization = gr.Checkbox(
             label="说话人分离",
-            value=True,
+            value=False,
             visible=(settings.asr_method == "whisper"),
         )
         pipeline_min_speakers = gr.Number(
@@ -939,7 +939,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             maximum=8,
             step=1,
             label="NVENC 后台编码并发数",
-            value=1,
+            value=8,
             info="仅在启用 NVENC 且处理多个视频时生效：用于后台视频合成(ffmpeg/h264_nvenc)并发数，不会并发执行 Demucs/ASR/TTS。",
         )
         max_retries_input = gr.Slider(minimum=1, maximum=10, step=1, label="最大重试次数", value=3)
@@ -1177,7 +1177,7 @@ with gr.Blocks(title="语音识别") as whisper_inference:
         )
         diarization_input = gr.Checkbox(
             label="说话人分离",
-            value=True,
+            value=False,
             visible=(settings.asr_method == "whisper"),
         )
         min_speakers_input = gr.Number(
@@ -1395,7 +1395,7 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             maximum=8,
             step=1,
             label="NVENC 后台编码并发数",
-            value=1,
+            value=8,
             info="仅在启用 NVENC 且处理多个视频时生效",
         )
         synth_auto_upload_input = gr.Checkbox(label="自动上传到 B 站", value=False)
