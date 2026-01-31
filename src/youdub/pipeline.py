@@ -23,6 +23,7 @@ from .steps import (
     translate,
     upload_video_async,
 )
+from .steps.separate_vocals import CorruptedVideoError
 
 
 class VideoPipeline:
@@ -517,6 +518,9 @@ class VideoPipeline:
                     require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
 
                     return folder
+                except CorruptedVideoError as exc:
+                    # 视频文件损坏，已被删除，下次重试会重新下载
+                    logger.warning(f"视频文件损坏已删除，将重新下载: {info.get('title')} ({exc})")
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception(f"处理失败(到TTS阶段): {info.get('title')} ({exc})")
             return None

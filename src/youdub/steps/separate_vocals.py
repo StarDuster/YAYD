@@ -216,6 +216,11 @@ def separate_audio(
 
 
 
+class CorruptedVideoError(RuntimeError):
+    """视频文件损坏，无法提取音频。"""
+    pass
+
+
 def extract_audio_from_video(folder: str) -> bool:
     video_path = os.path.join(folder, 'download.mp4')
     if not os.path.exists(video_path):
@@ -359,7 +364,12 @@ def separate_all_audio_under_folder(
 
         audio_wav = os.path.join(subdir, "audio.wav")
         if not os.path.exists(audio_wav):
-            extract_audio_from_video(subdir)
+            try:
+                extract_audio_from_video(subdir)
+            except CorruptedVideoError:
+                # 视频文件损坏，已被删除，跳过此目录
+                # 异常会向上传播，让 pipeline 知道需要重新下载
+                raise
 
         vocal_output_path = os.path.join(subdir, "audio_vocals.wav")
         instruments_output_path = os.path.join(subdir, "audio_instruments.wav")
