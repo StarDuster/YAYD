@@ -33,7 +33,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v8: restore subtitle font scaling (1080p -> ~36) for readability
 # v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
 # v10: keep 1080p landscape at ~36; portrait slightly smaller
-_VIDEO_META_VERSION = 10
+# v11: compensate ultrawide landscape so rendered size matches 16:9 baseline
+_VIDEO_META_VERSION = 11
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -620,10 +621,15 @@ def _calc_subtitle_style_params(
 
     # Subtitle font size: readable across resolutions.
     # - Landscape: scale from height (1080p 16:9 -> ~36).
+    #   For ultrawide outputs (e.g. 21:9), many players will scale the whole frame down to fit a 16:9 box,
+    #   which makes subtitles look smaller. Compensate by scaling font size with (aspect / (16/9)).
     # - Portrait: scale from width, slightly smaller (1080x1920 -> ~33).
     if w >= h:
         base_dim = h
-        scale = 1.0
+        # Only scale up for wider-than-16:9. Never shrink for narrower videos.
+        ref_aspect = 16.0 / 9.0
+        aspect = float(w) / float(h)
+        scale = max(1.0, float(aspect) / float(ref_aspect))
     else:
         base_dim = w
         scale = 0.94
