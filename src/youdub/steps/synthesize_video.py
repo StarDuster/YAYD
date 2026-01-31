@@ -530,16 +530,17 @@ def _calc_subtitle_wrap_chars(
     """
     w = max(1, int(width))
     fs = max(1, int(font_size))
-    # Horizontal safe margin: ~4% each side, at least 10px.
-    margin_x = max(10, int(round(w * 0.04)))
+    # Horizontal safe margin: ~3% each side, at least 10px.
+    # (Less conservative than before; avoids wrapping too aggressively on 16:9.)
+    margin_x = max(10, int(round(w * 0.03)))
     safe_w = max(1, w - 2 * margin_x)
 
     # Empirical average glyph widths (Arial-ish + libass):
     # - CJK: close to a square, slightly narrower than font size
     # - Latin: narrower, plus spaces; tuned to match previous defaults on 16:9
-    max_chars_zh = max(1, int(safe_w / (float(fs) * 0.90)))
+    max_chars_zh = max(1, int(safe_w / (float(fs) * 0.85)))
     en_fs = max(1, int(round(float(fs) * float(en_font_scale))))
-    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.65)))
+    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.62)))
     return max_chars_zh, max_chars_en
 
 
@@ -1174,13 +1175,14 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    # Subtitle font size: readable across resolutions (1080p -> ~49).
+    # Subtitle font size: readable across resolutions (1080p -> ~39).
     # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
     base_dim = min(width, height)
-    font_size = int(round(base_dim * 0.045))
+    font_size = int(round(base_dim * 0.036))
     font_size = max(18, min(font_size, 120))
-    outline = int(round(font_size / 12))
-    outline = max(2, outline)
+    outline = max(2, int(round(font_size / 16)))
+    # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
+    margin_v = max(12, int(round(font_size * 0.70)))
     max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(width, font_size, en_font_scale=0.75)
 
     srt_path = os.path.join(folder, 'subtitles.srt')
@@ -1214,6 +1216,7 @@ def synthesize_video(
                 font_name="Arial",
                 font_size=font_size,
                 outline=outline,
+                margin_v=margin_v,
                 max_chars_zh=max_chars_zh,
                 max_chars_en=max_chars_en,
             )
@@ -1225,7 +1228,7 @@ def synthesize_video(
             subtitle_filter = (
                 f"subtitles='{srt_path_filter}':force_style="
                 f"'FontName=Arial,FontSize={font_size},PrimaryColour=&HFFFFFF,"
-                f"OutlineColour=&H000000,Outline={outline},WrapStyle=2'"
+                f"OutlineColour=&H000000,Outline={outline},WrapStyle=2,MarginV={margin_v}'"
             )
 
     # Build ffmpeg filtergraph.
