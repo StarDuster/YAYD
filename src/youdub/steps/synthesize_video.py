@@ -601,6 +601,32 @@ def _calc_subtitle_wrap_chars(
     return max_chars_zh, max_chars_en
 
 
+def _calc_subtitle_style_params(
+    width: int,
+    height: int,
+    *,
+    en_font_scale: float = 0.75,
+) -> tuple[int, int, int, int, int]:
+    """
+    Calculate subtitle style parameters based on output resolution.
+
+    Returns: (font_size, outline, margin_v, max_chars_zh, max_chars_en)
+    """
+    # Subtitle font size: readable across resolutions (1080p -> ~36).
+    # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
+    base_dim = min(int(width), int(height))
+    # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
+    font_size = int(round(base_dim * 0.033))
+    font_size = max(18, min(font_size, 120))
+    outline = max(1, int(round(font_size / 20)))
+    # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
+    margin_v = max(12, int(round(font_size * 0.80)))
+    max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(
+        int(width), int(font_size), en_font_scale=float(en_font_scale)
+    )
+    return int(font_size), int(outline), int(margin_v), int(max_chars_zh), int(max_chars_en)
+
+
 def _first_sentence(text: str, *, max_chars: int = 220) -> str:
     """
     Return a short preview of source text for bilingual subtitles.
@@ -1304,16 +1330,9 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    # Subtitle font size: readable across resolutions (1080p -> ~36).
-    # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
-    base_dim = min(width, height)
-    # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
-    font_size = int(round(base_dim * 0.033))
-    font_size = max(18, min(font_size, 120))
-    outline = max(1, int(round(font_size / 20)))
-    # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
-    margin_v = max(12, int(round(font_size * 0.80)))
-    max_chars_zh, max_chars_en = _calc_subtitle_wrap_chars(width, font_size, en_font_scale=0.75)
+    font_size, outline, margin_v, max_chars_zh, max_chars_en = _calc_subtitle_style_params(
+        width, height, en_font_scale=0.75
+    )
 
     srt_path = os.path.join(folder, 'subtitles.srt')
     if subtitles:
