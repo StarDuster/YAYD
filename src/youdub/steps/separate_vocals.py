@@ -10,7 +10,7 @@ from loguru import logger
 from ..config import Settings
 from ..models import ModelManager
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..utils import save_wav, valid_file
+from ..utils import save_wav_norm, valid_file
 
 
 class DemucsDependencyError(RuntimeError):
@@ -193,10 +193,10 @@ def separate_audio(
     logger.info(f"分离完成，耗时 {time.time() - t_start:.2f} 秒")
 
     logger.info(f"保存人声: {vocal_output_path}")
-    save_wav(vocals, vocal_output_path, sample_rate=sr)
+    save_wav_norm(vocals, vocal_output_path, sample_rate=sr)
 
     logger.info(f"保存伴奏: {instruments_output_path}")
-    save_wav(instruments, instruments_output_path, sample_rate=sr)
+    save_wav_norm(instruments, instruments_output_path, sample_rate=sr)
 
     logger.info("分离任务完成")
 

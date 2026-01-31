@@ -21,7 +21,7 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
-from ..utils import ensure_torchaudio_backend_compat, save_wav
+from ..utils import ensure_torchaudio_backend_compat, save_wav, save_wav_norm
 
 _EMBEDDING_MODEL = None
 _EMBEDDING_INFERENCE = None
@@ -329,7 +329,7 @@ def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 2
         wav, _sr = librosa.load(path, sr=sample_rate, duration=max_seconds)
         if wav.size <= 0:
             return
-        save_wav(wav.astype(np.float32), path, sample_rate=sample_rate)
+        save_wav_norm(wav.astype(np.float32), path, sample_rate=sample_rate)
         logger.info(f"已裁剪说话人参考音频至 {max_seconds:.1f}秒: {path}")
     except Exception as exc:
         logger.warning(f"裁剪说话人音频失败 {path}: {exc}")
@@ -1548,7 +1548,7 @@ def generate_wavs(
                 check_cancelled()
                 wav, _sr = librosa.load(vocals_path, sr=24000, mono=True, duration=max_ref_seconds)
                 if wav.size > 0:
-                    save_wav(wav.astype(np.float32), spk_path, sample_rate=24000)
+                    save_wav_norm(wav.astype(np.float32), spk_path, sample_rate=24000)
                     logger.info(f"已生成缺失的说话人参考 ({max_ref_seconds:.1f}秒): {spk_path}")
             except Exception as exc:
                 logger.warning(f"生成说话人参考音频失败 {spk}: {exc}")
