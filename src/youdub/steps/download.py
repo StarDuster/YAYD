@@ -117,7 +117,8 @@ def download_single_video(
         'format': f'bestvideo[ext=mp4][height<={resolution_val}]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'writeinfojson': True,
         'writethumbnail': True,
-        'outtmpl': os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}', 'download'),
+        'outtmpl': os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}', 'download.%(ext)s'),
+        'merge_output_format': 'mp4',  # 确保合并后输出为 mp4
         'ignoreerrors': True,
         'remote_components': ['ejs:github'],
         # web 支持 cookies，android/ios 不支持 cookies，排除受 SABR 影响的 web_safari
