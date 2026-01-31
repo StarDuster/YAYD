@@ -164,6 +164,104 @@ def test_valid_translation_rejects_chinese_label_patterns():
 
 
 # --------------------------------------------------------------------------- #
+# Whisper punctuation fix (before translation)
+# --------------------------------------------------------------------------- #
+
+
+def test_punct_fix_validation_allows_only_punctuation_changes():
+    from youdub.steps.translate import _punct_fix_is_valid
+
+    assert _punct_fix_is_valid("Hello world", "Hello, world") is True
+    assert _punct_fix_is_valid("你好世界", "你好世界！") is True
+    assert _punct_fix_is_valid("Hello, world", "Hello world") is True
+
+    # Hyphen is treated as non-punctuation to protect tokens like "Q-Learning".
+    assert _punct_fix_is_valid("Q-Learning", "Q Learning") is False
+
+    # Non-punctuation edits must be rejected.
+    assert _punct_fix_is_valid("abc", "abd") is False
+
+
+def test_translate_folder_applies_punctuation_fix_before_translate(tmp_path: Path, monkeypatch):
+    import youdub.steps.translate as tr
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    (folder / "download.info.json").write_text(
+        json.dumps({"title": "t", "uploader": "u", "upload_date": "20260101"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "transcript.json").write_text(
+        json.dumps(
+            [{"start": 0.0, "end": 1.0, "text": "Hello world", "speaker": "SPEAKER_00"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("YOUDUB_PUNCTUATION_FIX_BEFORE_TRANSLATE", "1")
+
+    monkeypatch.setattr(tr, "summarize", lambda *_args, **_kwargs: {"title": "t", "author": "u", "summary": "s", "tags": []})
+
+    def _fake_chat_completion_text(_backend, messages):
+        system = str(messages[0].get("content", ""))
+        if "Whisper 转写标点修复器" not in system:
+            raise AssertionError("unexpected model call (not punctuation fix)")
+        payload = json.loads(str(messages[1].get("content", "")))
+        # Only insert punctuation; keep every non-punctuation character exactly the same.
+        out = {k: str(v).replace("Hello world", "Hello, world") for k, v in payload.items()}
+        return json.dumps(out, ensure_ascii=False)
+
+    monkeypatch.setattr(tr, "_chat_completion_text", _fake_chat_completion_text)
+
+    captured: dict[str, str] = {}
+
+    def _fake_translate_content(_summary, transcript, *_args, **_kwargs):
+        captured["text0"] = str(transcript[0].get("text", ""))
+        return ["好"]
+
+    monkeypatch.setattr(tr, "_translate_content", _fake_translate_content)
+
+    ok = tr.translate_folder(str(folder), target_language="简体中文", settings=tr.Settings(openai_api_key="dummy"))
+    assert ok is True
+    assert captured.get("text0") == "Hello, world"
+
+
+def test_punctuated_transcript_cache_is_reused(tmp_path: Path, monkeypatch):
+    import youdub.steps.translate as tr
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    transcript = [{"start": 0.0, "end": 1.0, "text": "Hello world", "speaker": "SPEAKER_00"}]
+    (folder / "transcript.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setenv("YOUDUB_PUNCTUATION_FIX_BEFORE_TRANSLATE", "1")
+
+    calls = {"n": 0}
+
+    def _fake_chat_completion_text(_backend, messages):
+        calls["n"] += 1
+        payload = json.loads(str(messages[1].get("content", "")))
+        out = {k: str(v).replace("Hello world", "Hello, world") for k, v in payload.items()}
+        return json.dumps(out, ensure_ascii=False)
+
+    monkeypatch.setattr(tr, "_chat_completion_text", _fake_chat_completion_text)
+
+    settings = tr.Settings(openai_api_key="dummy")
+    out1 = tr._load_or_create_punctuated_transcript(str(folder), transcript, settings=settings)  # noqa: SLF001
+    assert out1[0]["text"] == "Hello, world"
+    assert calls["n"] == 1
+    assert (folder / "transcript_punctuated.json").exists()
+
+    # Second call should use the cached file instead of calling the model again.
+    out2 = tr._load_or_create_punctuated_transcript(str(folder), transcript, settings=settings)  # noqa: SLF001
+    assert out2[0]["text"] == "Hello, world"
+    assert calls["n"] == 1
+
+
+# --------------------------------------------------------------------------- #
 # Strategy normalization
 # --------------------------------------------------------------------------- #
 

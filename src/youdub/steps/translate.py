@@ -489,31 +489,36 @@ def _load_or_create_punctuated_transcript(
             # Ignore and regenerate.
             pass
 
-    out: list[dict[str, Any]] = [dict(it) for it in transcript]
+    try:
+        out: list[dict[str, Any]] = [dict(it) for it in transcript]
 
-    # Small batching: one call returns a JSON map of multiple segments.
-    chunk_size = max(1, min(_read_int_env("PUNCTUATION_FIX_CHUNK_SIZE", 24), 128))
-    all_ok = True
+        # Small batching: one call returns a JSON map of multiple segments.
+        chunk_size = max(1, min(_read_int_env("PUNCTUATION_FIX_CHUNK_SIZE", 24), 128))
+        all_ok = True
 
-    for i0 in range(0, len(out), chunk_size):
-        check_cancelled()
-        idxs = list(range(i0, min(i0 + chunk_size, len(out))))
-        payload = {str(i): cast(str, out[i].get("text", "")) for i in idxs}
-        fixed, ok = _punct_fix_chunk(settings, payload, attempt_limit=5)
-        if not ok:
-            all_ok = False
-        for i in idxs:
-            out[i]["text"] = fixed.get(str(i), payload[str(i)])
+        for i0 in range(0, len(out), chunk_size):
+            check_cancelled()
+            idxs = list(range(i0, min(i0 + chunk_size, len(out))))
+            payload = {str(i): cast(str, out[i].get("text", "")) for i in idxs}
+            fixed, ok = _punct_fix_chunk(settings, payload, attempt_limit=5)
+            if not ok:
+                all_ok = False
+            for i in idxs:
+                out[i]["text"] = fixed.get(str(i), payload[str(i)])
 
-    # Only cache if the whole run succeeded; avoid caching "no-op due to failures".
-    if all_ok:
-        try:
-            with open(punct_path, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=2, ensure_ascii=False)
-        except Exception as exc:
-            logger.warning(f"写入标点修复缓存失败（忽略）: {exc}")
+        # Only cache if the whole run succeeded; avoid caching "no-op due to failures".
+        if all_ok:
+            try:
+                with open(punct_path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, indent=2, ensure_ascii=False)
+            except Exception as exc:
+                logger.warning(f"写入标点修复缓存失败（忽略）: {exc}")
 
-    return out
+        return out
+    except Exception as exc:  # pylint: disable=broad-except
+        # Best-effort: never block translation due to punctuation fix.
+        logger.warning(f"翻译前标点修复失败（忽略，继续翻译原始转写）: {exc}")
+        return transcript
 
 
 def _translate_single_text(
@@ -1341,11 +1346,11 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
     
     # Punctuate transcript before translating (strictly punctuation-only changes).
     check_cancelled()
-    try:
-        transcript = _load_or_create_punctuated_transcript(str(folder), cast(list[dict[str, Any]], transcript), settings=cfg)
-    except Exception as exc:  # pylint: disable=broad-except
-        # Best-effort: never block translation due to punctuation fix.
-        logger.warning(f"翻译前标点修复失败（忽略，继续翻译原始转写）: {exc}")
+    transcript = _load_or_create_punctuated_transcript(
+        str(folder),
+        cast(list[dict[str, Any]], transcript),
+        settings=cfg,
+    )
 
     # Perform translation
     check_cancelled()
