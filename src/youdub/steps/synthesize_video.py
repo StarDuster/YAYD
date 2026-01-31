@@ -2,7 +2,9 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from typing import Any
 
 import librosa
@@ -27,11 +29,34 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v5: shrink non-bilingual subtitle font size further (1080p -> ~26)
 # v6: shrink non-bilingual subtitle size further (1080p -> ~19) and reduce outline
 # v7: use ASS for monolingual subtitles too (ensures font size is respected via PlayRes)
-_VIDEO_META_VERSION = 7
+# v8: restore subtitle font scaling (1080p -> ~36) for readability
+_VIDEO_META_VERSION = 8
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
 _VIDEO_AUDIO_BITRATE = "128k"
+
+# NVENC 并发限制：全自动多视频时避免同时起太多 h264_nvenc 实例导致失败/性能抖动
+_NVENC_MAX_CONCURRENCY = 8
+_NVENC_SEMAPHORE = threading.BoundedSemaphore(_NVENC_MAX_CONCURRENCY)
+
+
+@contextmanager
+def _nvenc_slot():
+    acquired = False
+    try:
+        # Use short timeouts so cancellation remains responsive while waiting.
+        while not acquired:
+            check_cancelled()
+            acquired = _NVENC_SEMAPHORE.acquire(timeout=0.2)
+        yield
+    finally:
+        if acquired:
+            try:
+                _NVENC_SEMAPHORE.release()
+            except Exception:
+                # Best-effort; should never fail with BoundedSemaphore.
+                pass
 
 
 def _mtime(path: str) -> float | None:
@@ -235,8 +260,10 @@ def _video_up_to_date(
     deps = [
         os.path.join(folder, "download.mp4"),
         os.path.join(folder, "audio_combined.wav"),
-        os.path.join(folder, _VIDEO_META_NAME),
     ]
+    # NOTE:
+    # Do NOT include _VIDEO_META_NAME in deps: we write it after video.mp4, which would
+    # make the video look "stale" forever due to mtime ordering on modern filesystems.
     if adaptive_segment_stretch:
         deps.append(os.path.join(folder, "adaptive_plan.json"))
     if subtitles:
@@ -1277,11 +1304,12 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     res_string = f'{width}x{height}'
     
-    # Subtitle font size: readable across resolutions (1080p -> ~19).
+    # Subtitle font size: readable across resolutions (1080p -> ~36).
     # Use the shorter edge to avoid huge fonts on portrait videos (e.g. 1080x1920).
     base_dim = min(width, height)
-    font_size = int(round(base_dim * 0.018))
-    font_size = max(16, min(font_size, 120))
+    # Keep monolingual/bilingual consistent; bilingual already uses two lines + wrapping.
+    font_size = int(round(base_dim * 0.033))
+    font_size = max(18, min(font_size, 120))
     outline = max(1, int(round(font_size / 20)))
     # Increase bottom margin to avoid clipping (esp. bilingual / multi-line).
     margin_v = max(12, int(round(font_size * 0.80)))
@@ -1565,7 +1593,11 @@ def synthesize_video(
             raise
 
     try:
-        _run_ffmpeg(ffmpeg_command)
+        if use_nvenc:
+            with _nvenc_slot():
+                _run_ffmpeg(ffmpeg_command)
+        else:
+            _run_ffmpeg(ffmpeg_command)
         sleep_with_cancel(1)
         _write_video_meta(
             folder,

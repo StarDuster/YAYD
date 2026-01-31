@@ -336,6 +336,12 @@ class VideoPipeline:
 
         info_list = list(download.get_info_list_from_url(urls, num_videos, settings=self.settings))
 
+        # 全自动：当启用 NVENC 且需要处理多个视频时，自动开启并发（NVENC 并发由 synthesize_video 内部限制到 8）。
+        # 这里仅在用户未显式开启并发（max_workers<=1）时才自动提升，避免改变原有并发用户的预期。
+        if use_nvenc and len(info_list) > 1 and int(max_workers) <= 1:
+            max_workers = min(8, len(info_list))
+            logger.info(f"检测到 NVENC 且需要转码多个视频，自动启用并发: max_workers={max_workers}（NVENC 并发上限=8）")
+
         def _valid_transcript(path: str) -> bool:
             try:
                 if not os.path.exists(path) or os.path.getsize(path) < 2:
