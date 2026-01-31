@@ -572,3 +572,32 @@ def test_generate_wavs_qwen_creates_missing_speaker_ref(tmp_path: Path, monkeypa
     sv._ensure_audio_combined(str(folder), adaptive_segment_stretch=False)
     assert (folder / "audio_tts.wav").exists()
     assert (folder / "audio_combined.wav").exists()
+
+
+# --------------------------------------------------------------------------- #
+# TTS prompt text normalization (Python tokens)
+# --------------------------------------------------------------------------- #
+
+
+def test_tts_text_for_attempt_normalizes_python_tokens_for_tts_only():
+    import youdub.steps.synthesize_speech as ss
+
+    s1 = "接着导入 matplotlib.pyplot 简写为 plt，用来绘制幅度谱"
+    out1 = ss._tts_text_for_attempt(s1, 0)  # noqa: SLF001
+    assert "matplotlib dot pyplot" in out1
+    assert "matplotlib.pyplot" not in out1
+
+    s2 = "我们会调用 os.path.join"
+    out2 = ss._tts_text_for_attempt(s2, 0)  # noqa: SLF001
+    assert "os dot path dot join" in out2
+    assert "os.path.join" not in out2
+
+    s3 = "传入 base_dir 以及小提琴的文件路径"
+    out3 = ss._tts_text_for_attempt(s3, 0)  # noqa: SLF001
+    assert "base dir" in out3
+    assert "base_dir" not in out3
+
+    # Do not mis-handle decimals like 3.14 as "dot".
+    s4 = "圆周率是 3.14"
+    out4 = ss._tts_text_for_attempt(s4, 0)  # noqa: SLF001
+    assert " dot " not in out4
