@@ -35,6 +35,58 @@ _BYTEDANCE_API_URL = f"https://{_BYTEDANCE_HOST}/api/v1/tts"
 
 _GEMINI_CLIENT = None
 
+
+# Qwen3-TTS (Tokenizer-12Hz) output guard:
+# If the model keeps generating until `max_new_tokens`, the audio duration will be ~max_new_tokens/12 seconds.
+# This often indicates a degenerate loop / failure-to-stop. We treat it as a failure and retry.
+_QWEN_TTS_TOKEN_HZ = 12.0
+_QWEN_TTS_MAX_NEW_TOKENS_DEFAULT = 2048
+
+
+def _qwen_tts_max_new_tokens() -> int:
+    v = _read_env_int("YOUDUB_QWEN_TTS_MAX_NEW_TOKENS", _QWEN_TTS_MAX_NEW_TOKENS_DEFAULT)
+    if v <= 0:
+        return int(_QWEN_TTS_MAX_NEW_TOKENS_DEFAULT)
+    return int(v)
+
+
+def _qwen_tts_hit_max_tokens_seconds() -> float:
+    return float(_qwen_tts_max_new_tokens()) / float(_QWEN_TTS_TOKEN_HZ)
+
+
+def _qwen_tts_is_degenerate_hit_cap(*, wav_dur: float | None) -> bool:
+    """
+    Detect "keeps generating until max_new_tokens" by duration.
+
+    We intentionally use a small tolerance because wav header rounding and model decoding
+    may not land on the exact boundary.
+    """
+    if wav_dur is None:
+        return False
+    tol = _read_env_float("YOUDUB_QWEN_TTS_HIT_CAP_TOL_SEC", 2.0)
+    if tol < 0:
+        tol = 2.0
+    cap = _qwen_tts_hit_max_tokens_seconds()
+    return bool(float(wav_dur) >= float(cap) - float(tol))
+
+
+def _qwen_resp_duration_seconds(resp: dict | None) -> float | None:
+    if not isinstance(resp, dict):
+        return None
+    try:
+        sr = resp.get("sr")
+        n_samples = resp.get("n_samples")
+        if sr is None or n_samples is None:
+            return None
+        sr_f = float(sr)
+        ns_f = float(n_samples)
+        if not (sr_f > 0) or not (ns_f >= 0):
+            return None
+        return ns_f / sr_f
+    except Exception:
+        return None
+
+
 def _get_gemini_client():
     global _GEMINI_CLIENT
     if _GEMINI_CLIENT is None:
@@ -1521,7 +1573,15 @@ def generate_wavs(
                     except Exception:
                         seg_dur = 0.0
                     if _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
-                        qwen_cached_before.add(i)
+                        # Also guard against "hit max_new_tokens cap" outputs from old runs.
+                        if not _qwen_tts_is_degenerate_hit_cap(wav_dur=_wav_duration_seconds(out)):
+                            qwen_cached_before.add(i)
+                        else:
+                            try:
+                                os.remove(out)
+                                logger.warning(f"删除疑似退化(命中max_new_tokens)的TTS缓存: {out}")
+                            except Exception:
+                                pass
                     else:
                         # Too long vs expected segment duration -> treat as bad cache and regenerate.
                         try:
@@ -1555,7 +1615,10 @@ def generate_wavs(
                                 seg_dur = float(max(0.0, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))))
                             except Exception:
                                 seg_dur = 0.0
-                            if not _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
+                            if (
+                                (not _tts_wav_ok_for_segment(out, seg_dur, dur_ratio, dur_extra, dur_abs_cap))
+                                or _qwen_tts_is_degenerate_hit_cap(wav_dur=_wav_duration_seconds(out))
+                            ):
                                 os.remove(out)
                         except Exception:
                             pass
@@ -1653,6 +1716,29 @@ def generate_wavs(
                     else:
                         qwen_resp_by_index[j] = {"ok": False, "error": "invalid item result"}
 
+                # Detect degenerate "hit max_new_tokens" outputs and mark them as failures for retry.
+                cap_sec = _qwen_tts_hit_max_tokens_seconds()
+                for k, j in enumerate(batch_indices):
+                    rj = qwen_resp_by_index.get(j) or {}
+                    if not (isinstance(rj, dict) and rj.get("ok")):
+                        continue
+                    out = None
+                    try:
+                        out = str(batch_items[k].get("output_path", ""))
+                    except Exception:
+                        out = None
+                    dur = _qwen_resp_duration_seconds(rj)
+                    if _qwen_tts_is_degenerate_hit_cap(wav_dur=dur):
+                        if out and os.path.exists(out):
+                            try:
+                                os.remove(out)
+                            except Exception:
+                                pass
+                        qwen_resp_by_index[j] = {
+                            "ok": False,
+                            "error": f"qwen_tts_degenerate_hit_max_new_tokens ({_qwen_tts_max_new_tokens()}, ~{cap_sec:.1f}s)",
+                        }
+
                 # If the worker reports OOM for some items, retry those with smaller batches.
                 oom_failed: list[int] = []
                 for j in batch_indices:
@@ -1682,7 +1768,9 @@ def generate_wavs(
             wav_ok = False
             if os.path.exists(output_path):
                 try:
-                    if _tts_wav_ok_for_segment(output_path, seg_dur, dur_ratio, dur_extra, dur_abs_cap):
+                    if _tts_wav_ok_for_segment(output_path, seg_dur, dur_ratio, dur_extra, dur_abs_cap) and (
+                        (tts_method != "qwen") or (not _qwen_tts_is_degenerate_hit_cap(wav_dur=_wav_duration_seconds(output_path)))
+                    ):
                         wav_ok = True
                     else:
                         # Bad cache (too long / invalid) -> delete so we can regenerate.
@@ -1773,6 +1861,23 @@ def generate_wavs(
                         logger.warning(f"TTS({tts_method})段 {i} 失败: {exc}")
                     finally:
                         tts_elapsed += max(0.0, time.monotonic() - tts_begin)
+
+                    # Qwen退化检测：若一直生成到 max_new_tokens（约 170s），视为失败并重试。
+                    if tts_method == "qwen":
+                        qwen_dur = _qwen_resp_duration_seconds(qwen_resp) if qwen_resp else None
+                        if qwen_dur is None and os.path.exists(output_path):
+                            qwen_dur = _wav_duration_seconds(output_path)
+                        if _qwen_tts_is_degenerate_hit_cap(wav_dur=qwen_dur):
+                            last_err = f"qwen_tts_degenerate_hit_max_new_tokens ({_qwen_tts_max_new_tokens()})"
+                            logger.warning(
+                                f"TTS(qwen)段 {i} 疑似退化：输出接近token上限 "
+                                f"(wav_dur={qwen_dur:.2f}s ~= {_qwen_tts_hit_max_tokens_seconds():.2f}s)，将删除并重试"
+                            )
+                            try:
+                                if os.path.exists(output_path):
+                                    os.remove(output_path)
+                            except Exception:
+                                pass
 
                     # Validate the generated wav (including duration guard).
                     if _tts_wav_ok_for_segment(output_path, seg_dur, dur_ratio, dur_extra, dur_abs_cap):

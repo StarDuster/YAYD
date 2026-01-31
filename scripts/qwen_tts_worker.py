@@ -12,6 +12,7 @@ import numpy as np
 
 
 READY_LINE = "__READY__"
+DEFAULT_MAX_NEW_TOKENS = 2048
 
 
 def _parse_args() -> argparse.Namespace:
@@ -35,6 +36,11 @@ def main() -> int:
     # In stub mode we don't import qwen_tts at all; useful for CI/tests.
     tts = None
     xvec_prompt_cache: dict[str, object] = {}
+    # Cap generation length to avoid pathological endless outputs.
+    try:
+        max_new_tokens = int(os.getenv("YOUDUB_QWEN_TTS_MAX_NEW_TOKENS", str(DEFAULT_MAX_NEW_TOKENS)) or DEFAULT_MAX_NEW_TOKENS)
+    except Exception:
+        max_new_tokens = int(DEFAULT_MAX_NEW_TOKENS)
 
     if not args.stub:
         import torch
@@ -130,6 +136,7 @@ def main() -> int:
                             text=text,
                             language=language,
                             voice_clone_prompt=prompt,
+                            max_new_tokens=max_new_tokens,
                         )
                         if not wavs:
                             raise RuntimeError("返回空音频")
@@ -201,6 +208,7 @@ def main() -> int:
                             text=texts,
                             language=langs,
                             voice_clone_prompt=prompt,
+                            max_new_tokens=max_new_tokens,
                         )
                         if not wavs:
                             raise RuntimeError("返回空音频")
