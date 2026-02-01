@@ -545,13 +545,51 @@ def _load_or_create_punctuated_transcript(
         return transcript
 
 
+def _speaker_id(seg: dict[str, Any]) -> str:
+    s = str(seg.get("speaker") or "SPEAKER_00").strip()
+    return s or "SPEAKER_00"
+
+
+def _speaker_change_context(transcript: list[dict[str, Any]], idx: int, *, max_chars: int = 220) -> str:
+    """
+    If current segment's speaker differs from previous non-empty segment, return a short context string
+    describing the previous speaker + utterance (for translation disambiguation).
+    """
+    if idx <= 0 or idx >= len(transcript):
+        return ""
+
+    cur_speaker = _speaker_id(transcript[idx])
+
+    j = idx - 1
+    prev_text = ""
+    while j >= 0:
+        prev_text = str(transcript[j].get("text") or "").replace("\n", " ").strip()
+        if prev_text:
+            break
+        j -= 1
+
+    if j < 0 or not prev_text:
+        return ""
+
+    prev_speaker = _speaker_id(transcript[j])
+    if prev_speaker == cur_speaker:
+        return ""
+
+    if max_chars > 0 and len(prev_text) > max_chars:
+        prev_text = prev_text[:max_chars].rstrip() + "…"
+
+    return f"上文（{prev_speaker}）说：“{prev_text}”"
+
+
 def _translate_single_text(
     text: str,
     history: list[dict],
-    backend: str,
+    backend: _ChatBackend,
     fixed_message: list[dict],
     attempt_limit: int = 30,
-    enable_fallback: bool = True
+    enable_fallback: bool = True,
+    *,
+    user_prompt: str | None = None,
 ) -> str:
     """
     翻译单段文本，支持重试和自动拆分降级策略。
@@ -562,8 +600,9 @@ def _translate_single_text(
         check_cancelled()
         # Keep history short to avoid token limit
         current_history = history[-30:]
+        prompt = user_prompt if isinstance(user_prompt, str) and user_prompt.strip() else f'Translate:"{text}"'
         messages = fixed_message + current_history + [
-            {'role': 'user', 'content': f'Translate:"{text}"'}
+            {'role': 'user', 'content': prompt}
         ]
         
         try:
@@ -1029,6 +1068,8 @@ def _translate_single_with_guide(
     guide: dict[str, Any],
     text: str,
     target_language: str,
+    *,
+    context: str | None = None,
     attempt_limit: int = 30,
     enable_fallback: bool = True,
 ) -> str:
@@ -1049,9 +1090,18 @@ def _translate_single_with_guide(
         "- 不要加引号\n"
         "- 不要换行\n"
         "- 不要解释\n"
+        "- 不要输出说话人标签/编号\n"
         "- 必须完整翻译原文所有信息，不要漏译或省略\n"
     )
-    user = src
+    ctx = str(context or "").replace("\n", " ").strip()
+    if ctx:
+        user = (
+            f"{ctx}\n"
+            "现在请只翻译下面这一句（不要翻译上文），只输出译文：\n"
+            f"{src}"
+        )
+    else:
+        user = src
 
     backend = _get_thread_backend(settings)
     for attempt in range(attempt_limit):
@@ -1103,12 +1153,19 @@ def _translate_chunk_with_guide(
     indexes: list[int],
     target_language: str,
 ) -> dict[int, str]:
-    payload: dict[str, str] = {}
+    sentences: dict[str, str] = {}
+    speakers: dict[str, str] = {}
+    contexts: dict[str, str] = {}
     for i in indexes:
-        payload[str(i)] = cast(str, transcript[i].get("text", "")).strip()
+        k = str(i)
+        sentences[k] = cast(str, transcript[i].get("text", "")).strip()
+        speakers[k] = _speaker_id(transcript[i])
+        ctx = _speaker_change_context(transcript, i)
+        if ctx:
+            contexts[k] = ctx
 
     # Skip empty-only chunks quickly.
-    if not any(payload.values()):
+    if not any(sentences.values()):
         return {i: "" for i in indexes}
 
     guide_json = json.dumps(guide, ensure_ascii=False)
@@ -1116,8 +1173,14 @@ def _translate_chunk_with_guide(
         f"你是专业字幕翻译，目标语言：{target_language}。\n"
         f"{info}\n"
         f"指南（JSON）：{guide_json}\n"
-        "你会收到一个 JSON 对象：key 是句子编号（字符串），value 是原文。\n"
-        "请只返回 JSON 对象，保持相同 key，value 只包含译文本身：\n"
+        "你会收到一个 JSON 对象，包含：\n"
+        "- sentences: key 是句子编号（字符串），value 是原文\n"
+        "- speakers: key 是句子编号（字符串），value 是说话人 ID（仅供理解，不要输出）\n"
+        "- contexts: key 是句子编号（字符串），value 是上文（仅供理解，不要翻译）\n"
+        "请只返回 JSON 对象：\n"
+        '- 推荐格式：{"translations": {key: value}}\n'
+        "- 也接受直接返回 {key: value}\n"
+        "其中 value 只包含“sentences[key]”对应句子的译文（不要翻译 contexts）。\n"
         "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化\n"
@@ -1125,11 +1188,15 @@ def _translate_chunk_with_guide(
         "- 不要加引号\n"
         "- 不要换行\n"
         "- 不要解释\n"
+        "- 不要输出说话人标签/编号\n"
         "- 必须完整翻译原文所有信息，不要漏译或省略\n"
         "硬性要求：agent -> 智能体；强化学习中写 `Q-Learning`（不要写 Queue Learning）；"
         "变压器指模型时保留 `Transformer`；数学公式用 plain text，不要 LaTeX。\n"
     )
-    user = json.dumps(payload, ensure_ascii=False)
+    user = json.dumps(
+        {"sentences": sentences, "speakers": speakers, "contexts": contexts},
+        ensure_ascii=False,
+    )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
     backend = _get_thread_backend(settings)
@@ -1143,7 +1210,7 @@ def _translate_chunk_with_guide(
 
             out: dict[int, str] = {}
             for i in indexes:
-                src = payload.get(str(i), "")
+                src = sentences.get(str(i), "")
                 if not src:
                     out[i] = ""
                     continue
@@ -1156,7 +1223,7 @@ def _translate_chunk_with_guide(
                     raise _TranslationValidationError(processed)
                 out[i] = processed
 
-            missing = [i for i in indexes if payload.get(str(i), "") and not out.get(i)]
+            missing = [i for i in indexes if sentences.get(str(i), "") and not out.get(i)]
             if missing:
                 raise ValueError(f"missing translations: {missing[:10]}")
             return out
@@ -1176,11 +1243,18 @@ def _translate_chunk_with_guide(
     logger.warning(f"块翻译失败，回退到逐句翻译: indexes={indexes[:5]}.. (len={len(indexes)})")
     out: dict[int, str] = {}
     for i in indexes:
-        src = payload.get(str(i), "")
+        src = sentences.get(str(i), "")
         if not src:
             out[i] = ""
             continue
-        out[i] = _translate_single_with_guide(settings, info, guide, src, target_language)
+        out[i] = _translate_single_with_guide(
+            settings,
+            info,
+            guide,
+            src,
+            target_language,
+            context=contexts.get(str(i)) or None,
+        )
     return out
 
 
@@ -1232,7 +1306,20 @@ def _translate_content(
             pass
 
         results: list[str] = [""] * len(transcript)
-        chunks = [list(range(i, min(i + chunk_size, len(transcript)))) for i in range(0, len(transcript), chunk_size)]
+        # Chunking rule: do not mix different speakers within the same chunk.
+        chunks: list[list[int]] = []
+        buf: list[int] = []
+        buf_speaker: str | None = None
+        for i, seg in enumerate(transcript):
+            spk = _speaker_id(cast(dict[str, Any], seg))
+            if buf and (len(buf) >= chunk_size or (buf_speaker is not None and spk != buf_speaker)):
+                chunks.append(buf)
+                buf = []
+                buf_speaker = None
+            buf.append(i)
+            buf_speaker = spk
+        if buf:
+            chunks.append(buf)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -1268,9 +1355,25 @@ def _translate_content(
     ]
 
     history: list[dict[str, str]] = []
-    for line in transcript:
+    for idx, line in enumerate(transcript):
         check_cancelled()
         text = cast(str, line.get("text", ""))
+        if not str(text or "").strip():
+            full_translation.append("")
+            history.append({'role': 'user', 'content': f'Translate:"{text}"'})
+            history.append({'role': 'assistant', 'content': ""})
+            sleep_with_cancel(0.05)
+            continue
+
+        ctx = _speaker_change_context(transcript, idx)
+        speaker = _speaker_id(line)
+        prompt = None
+        if ctx:
+            prompt = (
+                f"{ctx}\n"
+                f"现在（{speaker}）说：“{text}”\n"
+                "请只翻译“现在说”的这一句，只输出译文；不要翻译上文，也不要输出任何说话人标签/编号。"
+            )
         translation = _translate_single_text(
             text=text,
             history=cast(list[dict], history),
@@ -1278,6 +1381,7 @@ def _translate_content(
             fixed_message=cast(list[dict], fixed_message),
             attempt_limit=30,
             enable_fallback=True,
+            user_prompt=prompt,
         )
         
         full_translation.append(translation)

@@ -342,8 +342,9 @@ def test_translate_content_guide_parallel_returns_indexed_translations(monkeypat
                 ensure_ascii=False,
             )
 
-        # Chunk translation step: user message is a JSON map {idx: text}.
-        payload = json.loads(user)
+        # Chunk translation step: user message is a JSON object containing sentences/speakers/contexts.
+        obj = json.loads(user)
+        payload = obj.get("sentences", obj) if isinstance(obj, dict) else obj
         out = {k: (f"句{k}" if str(v).strip() else "") for k, v in payload.items()}
         return json.dumps(out, ensure_ascii=False)
 
