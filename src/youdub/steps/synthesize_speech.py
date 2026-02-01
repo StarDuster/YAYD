@@ -1916,18 +1916,27 @@ def generate_wavs(
     # 生成多份参考音频并自动选择最优（默认启用，可通过 TTS_SPEAKER_REF_MULTI=0 禁用）
     vocals_path = os.path.join(folder, "audio_vocals.wav")
     if os.path.exists(vocals_path):
-        try:
-            _ensure_speaker_ref_multi(
-                folder=folder,
-                segments=transcript,
-                speakers={str(x) for x in speakers},
-                speaker_dir=speaker_dir,
-                vocals_path=vocals_path,
-                ref_seconds=float(max_ref_seconds),
-                sample_rate=24000,
+        # IMPORTANT:
+        # 多说话人场景下，audio_vocals.wav 仍是“所有人声的混合”，即便我们按时间戳切片也很容易混入其他说话人，
+        # 造成 reference 污染，表现为音色乱跳/多个说话人被同化。
+        # 因此：检测到多说话人时，强制关闭多参考自动选优，只保留转录阶段生成的 SPEAKER/*.wav。
+        if len(speakers) > 1 and _speaker_ref_multi_enabled():
+            logger.warning(
+                f"检测到多说话人({len(speakers)})，已自动关闭多参考音频选优（避免参考音频污染/覆盖）。"
             )
-        except Exception as exc:
-            logger.warning(f"多参考音频生成/选择失败（将继续使用兜底逻辑）: {exc}")
+        elif len(speakers) <= 1:
+            try:
+                _ensure_speaker_ref_multi(
+                    folder=folder,
+                    segments=transcript,
+                    speakers={str(x) for x in speakers},
+                    speaker_dir=speaker_dir,
+                    vocals_path=vocals_path,
+                    ref_seconds=float(max_ref_seconds),
+                    sample_rate=24000,
+                )
+            except Exception as exc:
+                logger.warning(f"多参考音频生成/选择失败（将继续使用兜底逻辑）: {exc}")
 
         # 兜底：如果 SPEAKER/*.wav 丢失（常见于旧任务目录或中途清理），从 audio_vocals.wav 取前 N 秒生成
         for spk in speakers:
