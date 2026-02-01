@@ -629,12 +629,9 @@ def download_models(selected_models: list[str], hf_token: str):
             "revision": "edc79942a0352e00c3b03657b4943f293cf0f1d0",
         },
         "diarization": {
-            "repo_id": "pyannote/speaker-diarization-3.1",
-            "revision": "84fd25912480287da0247647c3d2b4853cb3ee5d",
-        },
-        "segmentation": {
-            "repo_id": "pyannote/segmentation-3.0",
-            "revision": "4ca4d5a8d2ab82ddfbea8aa3b29c15431671239c",
+            "repo_id": "pyannote/speaker-diarization-community-1",
+            # community-1 is gated: requires accepting conditions + HF token.
+            "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
         },
         "qwen_asr": {
             "repo_id": "Qwen/Qwen3-ASR-1.7B",
@@ -711,27 +708,21 @@ def download_models(selected_models: list[str], hf_token: str):
                 logger.warning("未提供 HF_TOKEN，跳过 Pyannote 模型下载（需要同意协议并设置 token）")
             else:
                 diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
-                old_hf_home = os.environ.get("HF_HOME")
-                os.environ["HF_HOME"] = str(diar_dir)
+                diar_dir.mkdir(parents=True, exist_ok=True)
 
-                for key in ["diarization", "segmentation"]:
-                    conf = MODELS_TO_DOWNLOAD[key]
-                    logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
-                    try:
-                        snapshot_download(
-                            repo_id=conf["repo_id"],
-                            revision=conf["revision"],
-                            token=hf_token,
-                            resume_download=True,
-                        )
-                        logger.info(f"{conf['repo_id']} 下载完成。")
-                    except Exception as e:
-                        logger.error(f"下载失败 {conf['repo_id']}: {e}")
-
-                if old_hf_home is not None:
-                    os.environ["HF_HOME"] = old_hf_home
-                else:
-                    os.environ.pop("HF_HOME", None)
+                conf = MODELS_TO_DOWNLOAD["diarization"]
+                logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
+                try:
+                    snapshot_download(
+                        repo_id=conf["repo_id"],
+                        revision=conf["revision"],
+                        token=hf_token,
+                        cache_dir=str(diar_dir),
+                        resume_download=True,
+                    )
+                    logger.info(f"{conf['repo_id']} 下载完成。")
+                except Exception as e:
+                    logger.error(f"下载失败 {conf['repo_id']}: {e}")
 
         # 4. Qwen3-ASR
         if "qwen_asr" in selected_models:

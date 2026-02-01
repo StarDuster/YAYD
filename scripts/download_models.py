@@ -27,17 +27,12 @@ MODELS_TO_DOWNLOAD = {
         "type": "direct_download"
     },
     # Pyannote Diarization (Pipeline)
-    # Repo: https://huggingface.co/pyannote/speaker-diarization-3.1
+    # Repo: https://huggingface.co/pyannote/speaker-diarization-community-1
     "diarization": {
-        "repo_id": "pyannote/speaker-diarization-3.1",
-        "revision": "84fd25912480287da0247647c3d2b4853cb3ee5d", # Pinned from user logs
-        "type": "hf_cache"
-    },
-    # Pyannote Segmentation (Dependency)
-    # Repo: https://huggingface.co/pyannote/segmentation-3.0
-    "segmentation": {
-        "repo_id": "pyannote/segmentation-3.0",
-        "revision": "4ca4d5a8d2ab82ddfbea8aa3b29c15431671239c", # Latest stable compatible with 3.1
+        "repo_id": "pyannote/speaker-diarization-community-1",
+        # NOTE: community-1 is a gated model (needs accepting conditions + HF token).
+        # Pin to a recent known revision for reproducibility.
+        "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
         "type": "hf_cache"
     },
 }
@@ -128,25 +123,23 @@ def download_models():
         logger.error(f"Whisper 下载失败: {e}")
 
     # B. Diarization (HF Cache Style)
-    logger.info("\n=== 3. Pyannote 说话人分离（HF Cache） ===")
+    logger.info("\n=== 3. Pyannote 说话人分离（community-1 / HF Cache） ===")
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
+    diar_dir.mkdir(parents=True, exist_ok=True)
     
-    # Set HF_HOME to the target diarization directory to build the cache there
-    os.environ["HF_HOME"] = str(diar_dir)
-    
-    for key in ["diarization", "segmentation"]:
-        conf = MODELS_TO_DOWNLOAD[key]
-        logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
-        try:
-            snapshot_download(
-                repo_id=conf["repo_id"],
-                revision=conf["revision"],
-                token=token,
-                # No local_dir -> uses HF cache structure in HF_HOME
-                resume_download=True
-            )
-        except Exception as e:
-             logger.error(f"下载失败 {conf['repo_id']}: {e}")
+    conf = MODELS_TO_DOWNLOAD["diarization"]
+    logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
+    try:
+        snapshot_download(
+            repo_id=conf["repo_id"],
+            revision=conf["revision"],
+            token=token,
+            # Cache under WHISPER_DIARIZATION_MODEL_DIR/models--ORG--REPO/...
+            cache_dir=str(diar_dir),
+            resume_download=True,
+        )
+    except Exception as e:
+        logger.error(f"下载失败 {conf['repo_id']}: {e}")
 
     logger.info("\n下载流程已结束。")
     verify_offline_readiness()

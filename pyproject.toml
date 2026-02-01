@@ -28,11 +28,11 @@ dependencies = [
     "google-genai>=1.50.0",
 
     # Audio processing
-    "scipy>=1.11.0,<1.14.0",
-    "librosa>=0.10.0,<0.11.0",
+    "scipy>=1.14.0,<2.0.0",
+    "librosa>=0.11.0,<0.12.0",
     "audiostretchy>=1.3.5",
     "soundfile",
-    "numpy<2.0.0",
+    "numpy>=2.0.0,<3.0.0",
 
     # Vocal separation (offline / GPU-friendly)
     # Use demucs-infer (actively maintained inference-only Demucs fork).
@@ -47,7 +47,7 @@ dependencies = [
     # faster-whisper VAD uses onnxruntime. Keep it in cpu/gpu extras so you can choose the build.
 
     # Speaker diarization / speaker embedding (used by diarization + bytedance voice matching; optional at runtime)
-    "pyannote.audio>=3.1.0,<5.0.0",
+    "pyannote.audio>=4.0.0,<5.0.0",
 
     # Local TTS (Qwen3-TTS / Qwen-Audio worker)
     "qwen-tts==0.0.5",
@@ -78,7 +78,7 @@ dev = ["pytest>=7.0.0", "black>=23.0.0", "ruff>=0.1.0"]
 
 # CPU runtime stack (default runtime dependencies but kept optional so you can swap to GPU builds cleanly)
 # Use: `uv sync --extra cpu`
-cpu = ["onnxruntime"]
+cpu = ["onnxruntime>=1.17.0,<1.24.0"]
 
 # Optional GPU acceleration stack (Linux).
 # Use: `uv sync --extra gpu`
@@ -86,7 +86,7 @@ gpu = [
     # Used by our cuDNN preloader (and helps onnxruntime/ctranslate2 GPU providers).
     "nvidia-cudnn-cu12; sys_platform == 'linux'",
     # GPU build of onnxruntime (avoid co-install with onnxruntime)
-    "onnxruntime-gpu; sys_platform == 'linux'",
+    "onnxruntime-gpu>=1.17.0,<1.24.0; sys_platform == 'linux'",
 ]
 
 # Flash Attention (optional, significantly speeds up Transformer inference but takes a long time to compile).

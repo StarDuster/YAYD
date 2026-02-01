@@ -12,7 +12,7 @@
 2.  **人声分离**: 使用 `demucs-infer` (htdemucs_ft)，支持流式处理长音频避免显存溢出。
 3.  **语音识别 (ASR) 与 说话人分离 (Diarization)**:
     *   采用 `faster-whisper` (Large-v3) + `ctranslate2` 进行高精度语音识别。
-    *   集成 `pyannote.audio` (兼容 v3.1-v4) 进行说话人区分，支持多角色识别。
+    *   集成 `pyannote.audio` (v4 / community-1) 进行说话人区分，支持多角色识别。
 4.  **文本翻译**: 支持 OpenAI 兼容 API 和并发翻译。
     *   翻译前自动修复 ASR 标点（长句断句、补充语气标点）。
     *   支持全局术语表，保持术语一致性。
@@ -113,7 +113,7 @@ docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-pr
 项目提供了一键脚本下载所需的离线模型（Whisper, Demucs, Pyannote 等）。
 
 **注意**：下载 `pyannote` 模型需要 Hugging Face 访问令牌，并同意相关模型的使用协议。
-1.  访问 [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) 和 [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) 接受用户协议。
+1.  访问 [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) 接受用户协议（该模型为 gated，需要同意条款）。
 2.  在环境变量或 `.env` 中设置 `HF_TOKEN`。
 
 运行下载脚本：
@@ -122,7 +122,7 @@ uv run python scripts/download_models.py
 ```
 此脚本将下载：
 *   `Systran/faster-whisper-large-v3` (CTranslate2 格式)
-*   `pyannote/speaker-diarization-3.1` + `segmentation-3.0`
+*   `pyannote/speaker-diarization-community-1`
 *   `demucs htdemucs_ft` (via torch.hub)
 
 **Qwen3-TTS 模型** (仅当 `TTS_METHOD=qwen` 时需要)：

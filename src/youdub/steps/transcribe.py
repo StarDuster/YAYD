@@ -82,6 +82,7 @@ _QWEN_ASR_KEY: str | None = None
 
 _DIARIZATION_PIPELINE = None
 _DIARIZATION_KEY: str | None = None
+_PYANNOTE_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
 
 
 _CUDNN_PRELOADED = False
@@ -403,9 +404,48 @@ def init_asr(settings: Settings | None = None, model_manager: ModelManager | Non
 def _find_pyannote_config(root_dir: Path) -> Path | None:
     if not root_dir.exists():
         return None
-    for path in root_dir.rglob("config.yaml"):
-        if "snapshots" in path.parts:
-            return path
+
+    # Local clone layout (recommended by pyannote for offline use):
+    #   <dir>/config.yaml
+    direct = root_dir / "config.yaml"
+    if direct.exists():
+        return direct
+
+    org, repo = _PYANNOTE_DIARIZATION_MODEL_ID.split("/", 1)
+
+    # HF cache layout (new):
+    #   <HF_HOME>/hub/models--ORG--REPO/snapshots/<rev>/config.yaml
+    candidates = [
+        root_dir / f"models--{org}--{repo}",
+        root_dir / "hub" / f"models--{org}--{repo}",
+    ]
+
+    for base in candidates:
+        if not base.exists() or not base.is_dir():
+            continue
+
+        cfg_direct = base / "config.yaml"
+        if cfg_direct.exists():
+            return cfg_direct
+
+        snapshots = base / "snapshots"
+        if snapshots.exists() and snapshots.is_dir():
+            best: Path | None = None
+            best_mtime = -1.0
+            for snap in snapshots.iterdir():
+                cfg = snap / "config.yaml"
+                if not cfg.exists():
+                    continue
+                try:
+                    mtime = float(cfg.stat().st_mtime)
+                except Exception:
+                    mtime = 0.0
+                if mtime > best_mtime:
+                    best = cfg
+                    best_mtime = mtime
+            if best is not None:
+                return best
+
     return None
 
 
@@ -427,7 +467,8 @@ def load_diarize_model(
 
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     diar_dir_str = str(diar_dir) if diar_dir else ""
-    key = f"{device}|{diar_dir_str}"
+    cache_dir = diar_dir_str or None
+    key = f"{device}|{diar_dir_str}|{_PYANNOTE_DIARIZATION_MODEL_ID}"
     if _DIARIZATION_PIPELINE is not None and _DIARIZATION_KEY == key:
         return
 
@@ -444,32 +485,38 @@ def load_diarize_model(
             f"原始错误: {exc}"
         ) from exc
 
-    if diar_dir:
-        # Force HF cache into the provided directory for offline execution.
-        os.environ["HF_HOME"] = diar_dir_str
-        os.environ["TRANSFORMERS_CACHE"] = diar_dir_str
-
+    token = settings.hf_token
     cfg = _find_pyannote_config(diar_dir) if diar_dir else None
-
-    logger.info(f"加载说话人分离管道 (设备={device})")
+    logger.info(f"加载说话人分离管道: {_PYANNOTE_DIARIZATION_MODEL_ID} (设备={device})")
     t0 = time.time()
     with _torch_load_weights_only_compat():
         if cfg and cfg.exists():
-            pipeline = Pipeline.from_pretrained(str(cfg))
+            try:
+                pipeline = Pipeline.from_pretrained(str(cfg), token=token, cache_dir=cache_dir)
+            except TypeError:
+                try:
+                    pipeline = Pipeline.from_pretrained(str(cfg), use_auth_token=token, cache_dir=cache_dir)
+                except TypeError:
+                    # Older pyannote versions may not accept auth/cache kwargs for local checkpoints.
+                    pipeline = Pipeline.from_pretrained(str(cfg))
         else:
-            token = settings.hf_token
             if not token:
-                raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
+                raise ModelCheckError(f"缺少 HF_TOKEN，无法加载 {_PYANNOTE_DIARIZATION_MODEL_ID}。")
             # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
             try:
-                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+                pipeline = Pipeline.from_pretrained(_PYANNOTE_DIARIZATION_MODEL_ID, token=token, cache_dir=cache_dir)
             except TypeError:
-                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+                try:
+                    pipeline = Pipeline.from_pretrained(
+                        _PYANNOTE_DIARIZATION_MODEL_ID, use_auth_token=token, cache_dir=cache_dir
+                    )
+                except TypeError:
+                    pipeline = Pipeline.from_pretrained(_PYANNOTE_DIARIZATION_MODEL_ID, use_auth_token=token)
+    logger.info(f"说话人分离管道加载完成，耗时 {time.time() - t0:.2f}秒")
 
     pipeline.to(torch.device(device))
     _DIARIZATION_PIPELINE = pipeline
     _DIARIZATION_KEY = key
-    logger.info(f"说话人分离管道加载完成，耗时 {time.time() - t0:.2f}秒")
 
 
 def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~') -> list[dict[str, Any]]:
@@ -649,6 +696,44 @@ def transcribe_audio(
                 pass
         else:
             logger.info(f"转录已存在于 {folder}")
+            # Optional: re-run diarization on existing transcript to refresh speaker labels.
+            # IMPORTANT: do not change segmentation/text here (keep downstream alignment stable).
+            if diarization:
+                wav_path_existing = os.path.join(folder, "audio_vocals.wav")
+                if not os.path.exists(wav_path_existing):
+                    logger.warning(f"转录已存在但缺少人声轨，无法重新说话人分离: {wav_path_existing}")
+                else:
+                    try:
+                        check_cancelled()
+                        load_diarize_model(device=device, settings=settings, model_manager=model_manager)
+                        assert _DIARIZATION_PIPELINE is not None
+                        model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
+                        logger.info(f"转录已存在，重新计算说话人分离 ({model_tag})...")
+                        check_cancelled()
+                        ann = _DIARIZATION_PIPELINE(
+                            wav_path_existing, min_speakers=min_speakers, max_speakers=max_speakers
+                        )
+                        ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
+                        turns: list[dict[str, Any]] = []
+                        for seg, _, speaker in ann_view.itertracks(yield_label=True):
+                            check_cancelled()
+                            turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
+                        _assign_speakers_by_overlap(transcript, turns)
+
+                        check_cancelled()
+                        with open(transcript_path, "w", encoding="utf-8") as f:
+                            json.dump(transcript, f, indent=2, ensure_ascii=False)
+                        logger.info(f"已更新转录说话人标签: {transcript_path}")
+
+                        # Speaker refs are derived from speaker labels; refresh them best-effort.
+                        try:
+                            check_cancelled()
+                            generate_speaker_audio(folder, transcript)
+                        except Exception as exc:  # pylint: disable=broad-except
+                            logger.warning(f"生成说话人参考音频失败（忽略）: {exc}")
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.warning(f"重新说话人分离失败，保留原转录说话人标签: {exc}")
+
             # Ensure speaker reference files exist even when transcript step is skipped.
             try:
                 speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
@@ -835,11 +920,15 @@ def transcribe_audio(
         try:
             load_diarize_model(device=device, settings=settings, model_manager=model_manager)
             assert _DIARIZATION_PIPELINE is not None
-            logger.info("开始说话人分离 (pyannote)...")
+            model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
+            logger.info(f"开始说话人分离 ({model_tag})...")
             check_cancelled()
             ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+            # Some pyannote pipelines provide a non-overlapping ("exclusive") diarization view which
+            # generally aligns better with ASR timestamps. Fall back to legacy tracks when unavailable.
+            ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
             turns: list[dict[str, Any]] = []
-            for seg, _, speaker in ann.itertracks(yield_label=True):
+            for seg, _, speaker in ann_view.itertracks(yield_label=True):
                 check_cancelled()
                 turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
             _assign_speakers_by_overlap(transcript, turns)
