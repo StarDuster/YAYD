@@ -1426,19 +1426,35 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
         transcript_path = os.path.join(folder, "transcript.json")
         if os.path.exists(translation_raw_path) and os.path.exists(transcript_path):
             try:
-                tr_mtime = os.path.getmtime(transcript_path)
-                raw_mtime = os.path.getmtime(translation_raw_path)
-            except Exception:
-                tr_mtime = 0.0
-                raw_mtime = 0.0
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    src = json.load(f)
+                with open(translation_raw_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
 
-            if tr_mtime > raw_mtime:
-                try:
-                    with open(transcript_path, "r", encoding="utf-8") as f:
-                        src = json.load(f)
-                    with open(translation_raw_path, "r", encoding="utf-8") as f:
-                        raw = json.load(f)
-                    if isinstance(src, list) and isinstance(raw, list) and len(src) == len(raw):
+                if not isinstance(src, list) or not isinstance(raw, list):
+                    # Extremely defensive: unexpected types -> retranslate.
+                    translation_ok = False
+                    logger.warning(
+                        f"检测到转录/翻译格式异常，将重新翻译: {folder} "
+                        f"(transcript_type={type(src).__name__}, translation_raw_type={type(raw).__name__})"
+                    )
+                elif len(src) != len(raw):
+                    # When transcript segmentation/text changed, existing translation is invalid.
+                    translation_ok = False
+                    logger.warning(
+                        f"检测到转录与对轴前翻译分段数量不一致，将重新翻译: {folder} "
+                        f"(transcript={len(src)}, translation_raw={len(raw)})"
+                    )
+                else:
+                    # Length matches: only sync speakers when transcript is newer.
+                    try:
+                        tr_mtime = os.path.getmtime(transcript_path)
+                        raw_mtime = os.path.getmtime(translation_raw_path)
+                    except Exception:
+                        tr_mtime = 0.0
+                        raw_mtime = 0.0
+
+                    if tr_mtime > raw_mtime:
                         for i in range(len(raw)):
                             if isinstance(raw[i], dict) and isinstance(src[i], dict):
                                 raw[i]["speaker"] = src[i].get("speaker", raw[i].get("speaker", "SPEAKER_00"))
@@ -1448,20 +1464,21 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
                         with open(translation_path, "w", encoding="utf-8") as f:
                             json.dump(split_sentences(raw), f, indent=2, ensure_ascii=False)
                         logger.info(f"检测到转录已更新，已同步翻译说话人标签: {folder}")
-                    else:
-                        logger.warning(
-                            f"检测到转录更新，但无法同步翻译说话人标签（长度不匹配）: {folder} "
-                            f"(transcript={len(src) if isinstance(src, list) else 'n/a'}, raw={len(raw) if isinstance(raw, list) else 'n/a'})"
-                        )
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.warning(f"同步翻译说话人标签失败（忽略）: {exc}")
+            except Exception as exc:  # pylint: disable=broad-except
+                # 如果连文件都读不了，保守起见重翻译
+                translation_ok = False
+                logger.warning(f"读取转录/翻译文件失败，将重新翻译: {folder} ({exc})")
 
-        if not os.path.exists(translation_raw_path):
-            logger.warning(
-                f"检测到 {translation_path} 已存在，但缺少对轴前翻译文件: {translation_raw_path}（不会自动重翻译）"
-            )
-        logger.info(f"翻译已存在于 {folder}")
-        return True
+        # If transcript changed in a way that invalidates existing translation, re-run translation below.
+        if not translation_ok:
+            logger.info(f"翻译文件已过期，将重新生成: {folder}")
+        else:
+            if not os.path.exists(translation_raw_path):
+                logger.warning(
+                    f"检测到 {translation_path} 已存在，但缺少对轴前翻译文件: {translation_raw_path}（不会自动重翻译）"
+                )
+            logger.info(f"翻译已存在于 {folder}")
+            return True
 
     info_path = os.path.join(folder, 'download.info.json')
     if not os.path.exists(info_path):
