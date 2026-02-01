@@ -26,7 +26,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v5: estimate voice/BGM levels on multiple windows and pick the best-balanced ones;
 #     log original voice/BGM loudness + ratio to make debugging easy.
 # v6: improve window search by probing stems first (avoid missing music-heavy moments).
-_AUDIO_COMBINED_MIX_VERSION = 6
+# v7: adaptive mode aligns instruments per adaptive_plan (fix BGM drift vs stretched video).
+_AUDIO_COMBINED_MIX_VERSION = 7
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -948,6 +949,203 @@ def _get_video_duration(video_path: str) -> float:
     return 0.0
 
 
+def _atempo_chain(tempo: float) -> list[str]:
+    """
+    Build an FFmpeg `atempo` filter chain for an arbitrary tempo factor.
+
+    FFmpeg限制：单个 atempo 仅支持 [0.5, 2.0]，超出范围需链式组合。
+    """
+    t = float(tempo)
+    if not (t > 0.0):
+        t = 1.0
+    # Guard against insane values to avoid infinite loops.
+    t = float(max(0.01, min(t, 100.0)))
+
+    parts: list[float] = []
+    while t < 0.5:
+        parts.append(0.5)
+        t /= 0.5
+    while t > 2.0:
+        parts.append(2.0)
+        t /= 2.0
+    parts.append(t)
+
+    out: list[str] = []
+    for p in parts:
+        if not (p > 0.0):
+            continue
+        out.append(f"atempo={float(p):.9f}")
+    return out or ["atempo=1.0"]
+
+
+def _run_process_with_cancel(cmd: list[str]) -> None:
+    """
+    Run a subprocess while keeping cancellation responsive.
+
+    This is a lightweight variant used for short-lived FFmpeg helpers.
+    """
+    proc = subprocess.Popen(  # noqa: S603
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        while True:
+            check_cancelled()
+            rc = proc.poll()
+            if rc is not None:
+                break
+            time.sleep(0.1)
+        stdout = ""
+        stderr = ""
+        try:
+            stdout, stderr = proc.communicate(timeout=1)
+        except Exception:
+            pass
+        if proc.returncode not in (0, None):
+            raise subprocess.CalledProcessError(proc.returncode or 1, cmd, output=stdout, stderr=stderr)
+    except BaseException:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+
+
+def _render_adaptive_instruments(
+    folder: str,
+    *,
+    instruments_path: str,
+    adaptive_plan: list[dict[str, Any]],
+    sample_rate: int,
+) -> np.ndarray:
+    """
+    Render an "adaptive-aligned" instruments track following adaptive_plan.
+
+    Goal: In adaptive_segment_stretch mode, the video is built by per-segment trim+setpts+concat.
+    The instruments track must follow the SAME segment boundaries; otherwise BGM will drift.
+    """
+    if not adaptive_plan:
+        return np.zeros((0,), dtype=np.float32)
+    if not instruments_path or not os.path.exists(instruments_path):
+        return np.zeros((0,), dtype=np.float32)
+
+    # Use hidden temp files inside the job folder (safe under multi-job runs).
+    tag = f"{int(time.time() * 1000)}_{threading.get_ident()}"
+    script_path = os.path.join(folder, f".ffmpeg_instruments_adaptive_{tag}.txt")
+    out_path = os.path.join(folder, f".instruments_adaptive_{tag}.wav")
+
+    # Build filter_complex_script for audio:
+    # - atrim by src_start/src_end
+    # - aresample to target SR
+    # - atempo to match target duration
+    # - apad + atrim(end_sample) to guarantee exact samples per segment (keeps segment boundaries aligned)
+    lines: list[str] = []
+    a_labels: list[str] = []
+    for idx, seg in enumerate(adaptive_plan):
+        check_cancelled()
+        try:
+            s0 = float(seg.get("src_start", 0.0) or 0.0)
+            s1 = float(seg.get("src_end", 0.0) or 0.0)
+        except Exception:
+            s0, s1 = 0.0, 0.0
+        if s1 < s0:
+            s0, s1 = s1, s0
+        s0 = max(0.0, float(s0))
+        s1 = max(0.0, float(s1))
+        src_dur = max(0.001, float(s1 - s0))
+
+        target_samples = None
+        try:
+            ts = seg.get("target_samples")
+            if ts is not None:
+                target_samples = int(ts)
+        except Exception:
+            target_samples = None
+        if target_samples is None:
+            try:
+                out_dur = float(seg.get("target_duration", 0.0) or 0.0)
+            except Exception:
+                out_dur = 0.0
+            if not (out_dur > 0.0):
+                out_dur = src_dur
+            target_samples = int(round(out_dur * float(sample_rate)))
+
+        # Avoid zero-length segments: they break concat and will desync boundaries.
+        if target_samples <= 0:
+            target_samples = int(round(0.001 * float(sample_rate)))
+
+        out_dur_exact = float(target_samples) / float(sample_rate)
+        tempo = float(src_dur) / float(out_dur_exact) if out_dur_exact > 0 else 1.0
+        chain = _atempo_chain(tempo)
+
+        a = f"a{idx}"
+        a_labels.append(f"[{a}]")
+        filters: list[str] = [
+            f"atrim=start={s0:.6f}:end={s1:.6f}",
+            "asetpts=PTS-STARTPTS",
+            f"aresample={int(sample_rate)}",
+            "aformat=channel_layouts=mono",
+            *chain,
+            f"apad=pad_len={int(target_samples)}",
+            f"atrim=end_sample={int(target_samples)}",
+            "asetpts=PTS-STARTPTS",
+        ]
+        lines.append(f"[0:a]{','.join(filters)}[{a}]")
+
+    concat_in = "".join(a_labels)
+    lines.append(f"{concat_in}concat=n={len(a_labels)}:v=0:a=1[ainst]")
+
+    try:
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(";\n".join(lines) + "\n")
+    except Exception as exc:
+        raise RuntimeError(f"写入 instruments 自适应滤镜脚本失败: {exc}") from exc
+
+    cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        instruments_path,
+        "-filter_complex_script",
+        script_path,
+        "-map",
+        "[ainst]",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        str(int(sample_rate)),
+        "-ac",
+        "1",
+        out_path,
+    ]
+
+    try:
+        _run_process_with_cancel(cmd)
+        y, _ = librosa.load(out_path, sr=int(sample_rate), mono=True)
+        return y.astype(np.float32, copy=False)
+    finally:
+        # Best-effort cleanup of temp files.
+        for p in (out_path, script_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
 def _ensure_audio_combined(
     folder: str,
     adaptive_segment_stretch: bool = False,
@@ -1086,6 +1284,7 @@ def _ensure_audio_combined(
                     "src_start": round(orig_start, 6),
                     "src_end": round(orig_end, 6),
                     "target_duration": round(target_duration, 6),
+                    "target_samples": int(target_samples),
                 }
             )
 
@@ -1108,6 +1307,8 @@ def _ensure_audio_combined(
                     pause_src_start = max(0.0, pause_src_end - tail)
                 pause_duration = _gap_seconds_for_text(str(seg.get("translation") or ""))
 
+                # Compute pause samples using the exact same rounding as the audio cursor.
+                n_pause = int(round(float(pause_duration) * float(sample_rate)))
                 _append_silence(pause_duration)
                 adaptive_plan.append(
                     {
@@ -1115,6 +1316,7 @@ def _ensure_audio_combined(
                         "src_start": round(float(pause_src_start), 6),
                         "src_end": round(float(pause_src_end), 6),
                         "target_duration": round(float(pause_duration), 6),
+                        "target_samples": int(max(0, n_pause)),
                     }
                 )
 
@@ -1404,9 +1606,28 @@ def _ensure_audio_combined(
     check_cancelled()
     if os.path.exists(audio_instruments_path):
         try:
-            # 加载伴奏
-            instruments, _ = librosa.load(audio_instruments_path, sr=sample_rate, mono=True)
-            instruments = instruments.astype(np.float32, copy=False)
+            # 加载/渲染伴奏：
+            # - 非自适应：直接用原 instruments（再裁剪/补零到与 TTS 一致）
+            # - 自适应：必须按 adaptive_plan 逐段对齐到“拉伸后的视频时间轴”，否则背景音会累计跑轴。
+            instruments: np.ndarray
+            if adaptive_segment_stretch:
+                try:
+                    with open(adaptive_plan_path, "r", encoding="utf-8") as f:
+                        payload = json.load(f) or {}
+                    segs = list(payload.get("segments") or [])
+                except Exception:
+                    segs = []
+                if not segs:
+                    raise RuntimeError("adaptive_plan.json 缺失或为空，无法对齐伴奏")
+                instruments = _render_adaptive_instruments(
+                    folder,
+                    instruments_path=audio_instruments_path,
+                    adaptive_plan=segs,
+                    sample_rate=int(sample_rate),
+                )
+            else:
+                instruments, _ = librosa.load(audio_instruments_path, sr=sample_rate, mono=True)
+                instruments = instruments.astype(np.float32, copy=False)
             # Apply stem scale to restore original mix balance when available.
             if float(stem_inst_scale) != 1.0:
                 instruments = (instruments * np.float32(stem_inst_scale)).astype(np.float32, copy=False)
