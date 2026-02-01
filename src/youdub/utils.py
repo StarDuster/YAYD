@@ -1,5 +1,5 @@
+import contextlib
 import os
-import re
 import wave
 
 import numpy as np
@@ -76,188 +76,42 @@ def _peak_abs(wav: np.ndarray) -> float:
     return max(abs(max_val), abs(min_val))
 
 
-def ensure_torchaudio_backend_compat() -> None:
-    """
-    Compatibility shim for torchaudio / pyannote.audio backend APIs.
+@contextlib.contextmanager
+def torch_load_weights_only_compat():
+    """Temporarily force `torch.load(weights_only=False)` for legacy checkpoints.
 
-    `pyannote.audio==3.1.1` calls `torchaudio.set_audio_backend("soundfile")` and
-    `torchaudio.get_audio_backend()` / `torchaudio.list_audio_backends()` at import time.
-    Some torchaudio versions/builds may not expose these symbols, causing pyannote to fail
-    importing or executing diarization.
+    PyTorch 2.6+ changed the default value of `weights_only` from False to True. Some
+    Hugging Face checkpoints (including pyannote models) still rely on pickled objects
+    and will fail to load unless `weights_only=False`.
 
-    We provide best-effort no-op shims so pyannote can import and rely on the
-    default audio I/O stack (torchcodec / soundfile).
+    Scope this monkeypatch to model loading only.
     """
 
     try:
-        import torchaudio  # type: ignore
+        import torch  # type: ignore
     except Exception:
+        yield
         return
 
-    # torchaudio>=2.9 removed `torchaudio.info`, but pyannote.audio still calls it.
-    # Provide a best-effort implementation backed by soundfile (already a project dependency).
-    if not hasattr(torchaudio, "info"):
+    orig_load = torch.load
+
+    def _load(*args, **kwargs):  # type: ignore[no-untyped-def]
+        # Force legacy behavior even if callers explicitly pass weights_only=True
+        # (e.g. lightning_fabric cloud_io).
+        patched = dict(kwargs)
+        patched["weights_only"] = False
         try:
-            import soundfile as _sf  # type: ignore
-        except Exception:
-            _sf = None
+            return orig_load(*args, **patched)
+        except TypeError:
+            # Older torch versions may not accept `weights_only`.
+            patched.pop("weights_only", None)
+            return orig_load(*args, **patched)
 
-        try:
-            from torchaudio.backend.common import AudioMetaData as _AudioMetaData  # type: ignore
-        except Exception:
-            from typing import NamedTuple
-
-            class _AudioMetaData(NamedTuple):
-                sample_rate: int
-                num_frames: int
-                num_channels: int
-                bits_per_sample: int
-                encoding: str
-
-        def _guess_bits_per_sample(subtype: str | None) -> int:
-            if not subtype:
-                return 0
-            m = re.search(r"(\d+)", str(subtype))
-            return int(m.group(1)) if m else 0
-
-        def _info(uri, *_, **__):  # type: ignore[no-untyped-def]
-            if _sf is None:
-                raise RuntimeError("torchaudio.info 不可用且未安装 soundfile，无法读取音频元信息。")
-            try:
-                si = _sf.info(uri)
-            except Exception as exc:
-                raise RuntimeError(f"无法读取音频元信息: {exc}") from exc
-
-            return _AudioMetaData(
-                int(getattr(si, "samplerate", 0) or 0),
-                int(getattr(si, "frames", 0) or 0),
-                int(getattr(si, "channels", 0) or 0),
-                _guess_bits_per_sample(getattr(si, "subtype", None)),
-                str(getattr(si, "subtype", "") or getattr(si, "format", "") or ""),
-            )
-
-        try:
-            setattr(torchaudio, "info", _info)
-        except Exception:
-            pass
-
-    # torchaudio>=2.x may remove the `torchaudio.backend` package entirely.
-    # Some downstream libs/checkpoints still import it (e.g. during torch.load/unpickling),
-    # which would crash diarization. Provide a minimal module tree for compatibility.
+    torch.load = _load  # type: ignore[assignment]
     try:
-        import importlib.util
-        import sys
-        import types
-        from typing import NamedTuple
-
-        if importlib.util.find_spec("torchaudio.backend") is None:
-            backend_mod = types.ModuleType("torchaudio.backend")
-            # Mark as a package so `import torchaudio.backend.xxx` won't complain.
-            backend_mod.__path__ = []  # type: ignore[attr-defined]
-
-            class AudioMetaData(NamedTuple):
-                sample_rate: int
-                num_frames: int
-                num_channels: int
-                bits_per_sample: int
-                encoding: str
-
-            common_mod = types.ModuleType("torchaudio.backend.common")
-            common_mod.AudioMetaData = AudioMetaData
-
-            def _wrap_top_level(fn_name: str):
-                fn = getattr(torchaudio, fn_name, None)
-                if callable(fn):
-                    return fn
-
-                def _missing(*_args, **_kwargs):
-                    raise RuntimeError(f"torchaudio.{fn_name} 不可用，无法兼容旧的 torchaudio.backend 调用。")
-
-                return _missing
-
-            # Commonly referenced legacy backend submodules.
-            legacy_backend_names = [
-                "sox_io_backend",
-                "soundfile_backend",
-                "ffmpeg_backend",
-            ]
-
-            for name in legacy_backend_names:
-                mod = types.ModuleType(f"torchaudio.backend.{name}")
-                mod.load = _wrap_top_level("load")  # type: ignore[attr-defined]
-                mod.save = _wrap_top_level("save")  # type: ignore[attr-defined]
-                mod.info = _wrap_top_level("info")  # type: ignore[attr-defined]
-                sys.modules[f"torchaudio.backend.{name}"] = mod
-                setattr(backend_mod, name, mod)
-
-            setattr(backend_mod, "common", common_mod)
-            sys.modules["torchaudio.backend"] = backend_mod
-            sys.modules["torchaudio.backend.common"] = common_mod
-            # Ensure attribute access works: `torchaudio.backend`.
-            setattr(torchaudio, "backend", backend_mod)
-    except Exception:
-        # Best-effort only; never crash the main pipeline.
-        pass
-
-    # Keep a tiny per-process backend state so set/get/list are consistent.
-    state_attr = "_youdub_audio_backend"
-    if not hasattr(torchaudio, state_attr):
-        try:
-            setattr(torchaudio, state_attr, "soundfile")
-        except Exception:
-            # If we cannot set attributes on torchaudio module, shimming won't work reliably.
-            return
-
-    def _set_audio_backend(backend: str) -> None:
-        try:
-            setattr(torchaudio, state_attr, str(backend))
-        except Exception:
-            return None
-
-    def _get_audio_backend() -> str:
-        try:
-            v = getattr(torchaudio, state_attr)
-        except Exception:
-            return "soundfile"
-        return str(v) if v else "soundfile"
-
-    def _list_audio_backends() -> list[str]:
-        backends: list[str] = []
-
-        # Best-effort: expose "soundfile" if installed (commonly used by pyannote).
-        try:
-            import soundfile  # type: ignore  # noqa: F401
-
-            backends.append("soundfile")
-        except Exception:
-            pass
-
-        # Also include current backend value so callers won't crash on unexpected strings.
-        cur = _get_audio_backend()
-        if cur and cur not in backends:
-            backends.append(cur)
-
-        # If none detected, still provide a non-empty list for older callers.
-        return backends or ["soundfile"]
-
-    # Patch set/get/list if missing
-    if not hasattr(torchaudio, "set_audio_backend"):
-        try:
-            setattr(torchaudio, "set_audio_backend", _set_audio_backend)
-        except Exception:
-            pass
-
-    if not hasattr(torchaudio, "get_audio_backend"):
-        try:
-            setattr(torchaudio, "get_audio_backend", _get_audio_backend)
-        except Exception:
-            pass
-
-    if not hasattr(torchaudio, "list_audio_backends"):
-        try:
-            setattr(torchaudio, "list_audio_backends", _list_audio_backends)
-        except Exception:
-            pass
+        yield
+    finally:
+        torch.load = orig_load  # type: ignore[assignment]
 
 
 def save_wav(wav: np.ndarray, output_path: str, sample_rate: int = 24000) -> None:

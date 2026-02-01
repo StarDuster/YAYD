@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import importlib.util
 import json
@@ -21,41 +20,11 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
 from ..utils import (
-    ensure_torchaudio_backend_compat,
     read_speaker_ref_seconds,
     save_wav,
+    torch_load_weights_only_compat,
     wav_duration_seconds,
 )
-
-
-@contextlib.contextmanager
-def _torch_load_weights_only_compat():
-    """Temporarily force `torch.load(weights_only=False)` for legacy checkpoints.
-
-    Newer PyTorch versions changed `weights_only` default to True, which breaks loading
-    older (pickled) checkpoints used by pyannote.audio. We scope this monkeypatch to
-    diarization pipeline loading only.
-    """
-
-    orig_load = torch.load
-
-    def _load(*args, **kwargs):  # type: ignore[no-untyped-def]
-        # Force legacy behavior even if callers explicitly pass weights_only=True
-        # (e.g. lightning_fabric cloud_io).
-        patched = dict(kwargs)
-        patched["weights_only"] = False
-        try:
-            return orig_load(*args, **patched)
-        except TypeError:
-            # Older torch versions may not accept `weights_only`.
-            patched.pop("weights_only", None)
-            return orig_load(*args, **patched)
-
-    torch.load = _load  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        torch.load = orig_load  # type: ignore[assignment]
 
 
 def _import_faster_whisper():
@@ -472,10 +441,6 @@ def load_diarize_model(
     if _DIARIZATION_PIPELINE is not None and _DIARIZATION_KEY == key:
         return
 
-    # pyannote.audio<=3.1 imports torchaudio.set_audio_backend at import time, but torchaudio>=2.10 removed it.
-    # Provide a no-op shim so diarization can still work with the default backend.
-    ensure_torchaudio_backend_compat()
-
     try:
         from pyannote.audio import Pipeline  # type: ignore
     except Exception as exc:  # pylint: disable=broad-except
@@ -489,7 +454,7 @@ def load_diarize_model(
     cfg = _find_pyannote_config(diar_dir) if diar_dir else None
     logger.info(f"加载说话人分离管道: {_PYANNOTE_DIARIZATION_MODEL_ID} (设备={device})")
     t0 = time.time()
-    with _torch_load_weights_only_compat():
+    with torch_load_weights_only_compat():
         if cfg and cfg.exists():
             try:
                 pipeline = Pipeline.from_pretrained(str(cfg), token=token, cache_dir=cache_dir)

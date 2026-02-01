@@ -22,11 +22,11 @@ from ..models import ModelCheckError, ModelManager
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
 from ..utils import (
-    ensure_torchaudio_backend_compat,
     prepare_speaker_ref_audio,
     read_speaker_ref_seconds,
     save_wav,
     save_wav_norm,
+    torch_load_weights_only_compat,
     wav_duration_seconds,
 )
 
@@ -772,7 +772,6 @@ def load_embedding_model() -> None:
 
     try:
         try:
-            ensure_torchaudio_backend_compat()
             from pyannote.audio import Inference, Model  # type: ignore
         except Exception as exc:  # pylint: disable=broad-except
             raise RuntimeError(
@@ -782,11 +781,23 @@ def load_embedding_model() -> None:
 
         logger.info("加载pyannote/embedding模型...")
         token = _DEFAULT_SETTINGS.hf_token
-        # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
-        try:
-            _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token)
-        except TypeError:
-            _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
+        diar_dir = _DEFAULT_SETTINGS.resolve_path(_DEFAULT_SETTINGS.whisper_diarization_model_dir)
+        cache_dir = str(diar_dir) if diar_dir else None
+
+        # PyTorch 2.6+ 默认 weights_only=True，会导致 pyannote 模型加载失败。
+        with torch_load_weights_only_compat():
+            # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
+            try:
+                _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token, cache_dir=cache_dir)
+            except TypeError:
+                try:
+                    _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token, cache_dir=cache_dir)
+                except TypeError:
+                    # Older pyannote versions may not accept auth/cache kwargs.
+                    try:
+                        _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token)
+                    except TypeError:
+                        _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
         
         if _EMBEDDING_MODEL is None:
             logger.error("加载pyannote/embedding失败。请检查HF_TOKEN。")
