@@ -419,6 +419,7 @@ def _upload_video_with_biliapi(
     if bcut_pre is not None:
         upload_payload["upload"]["bcutPreUpload"] = bcut_pre
 
+    logger.info(f"正在上传: {folder}")
     logger.info("通过 biliAPI 上传中…")
     result = _run_biliapi_upload(upload_payload)
     if result.get("ok") is not True:
@@ -442,7 +443,7 @@ def _upload_video_with_biliapi(
     with submission_result_path.open("w", encoding="utf-8") as f:
         json.dump(_success_marker(marker_payload), f, ensure_ascii=False, indent=4)
 
-    logger.info("上传成功")
+    logger.info(f"上传成功: {folder}")
     return (True, True)
 
 
