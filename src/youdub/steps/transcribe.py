@@ -839,6 +839,7 @@ def transcribe_audio(
 
         _preload_cudnn_for_onnxruntime_gpu()
 
+        # VAD: 使用 faster-whisper 默认参数（避免过度切分导致重复/幻觉）
         # Prefer batched pipeline if available (much higher throughput on GPU).
         if _ASR_PIPELINE is not None:
             check_cancelled()
@@ -848,6 +849,8 @@ def transcribe_audio(
                 beam_size=5,
                 vad_filter=True,
                 condition_on_previous_text=False,
+                word_timestamps=True,  # 开启词级时间戳
+                no_speech_threshold=0.8,  # 提高阈值，防止漏句
             )
         else:
             check_cancelled()
@@ -856,6 +859,8 @@ def transcribe_audio(
                 beam_size=5,
                 vad_filter=True,
                 condition_on_previous_text=False,
+                word_timestamps=True,  # 开启词级时间戳
+                no_speech_threshold=0.8,  # 提高阈值，防止漏句
             )
 
         segments_list = []
