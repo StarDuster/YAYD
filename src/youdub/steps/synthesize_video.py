@@ -21,7 +21,9 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v2: audio_combined = audio_tts + instruments (NO original vocals mixed in)
 # v3: match TTS loudness to original vocals peak + normalize output;
 #     adaptive mode no longer phase-vocoder stretches TTS (avoid “回音/空洞”感)
-_AUDIO_COMBINED_MIX_VERSION = 3
+# v4: restore original mix balance by estimating stem scales against audio.wav;
+#     match TTS loudness to original vocals (RMS on active samples) instead of peak.
+_AUDIO_COMBINED_MIX_VERSION = 4
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -189,6 +191,7 @@ def _audio_combined_needs_rebuild(
     deps = [
         os.path.join(folder, "translation.json"),
         os.path.join(folder, "wavs", ".tts_done.json"),
+        os.path.join(folder, "audio.wav"),
         os.path.join(folder, "audio_instruments.wav"),
         os.path.join(folder, "audio_vocals.wav"),
     ]
@@ -1150,21 +1153,116 @@ def _ensure_audio_combined(
         
         audio_tts = np.concatenate(audio_segments).astype(np.float32, copy=False)
     
-    # 将 TTS 音量匹配到原始人声峰值（确保音量与原视频相近）
-    audio_vocals_path = os.path.join(folder, 'audio_vocals.wav')
-    if os.path.exists(audio_vocals_path) and len(audio_tts) > 0:
+    # 混音校准：
+    # - audio_vocals.wav / audio_instruments.wav 是 Demucs 分离产物（历史上会被各自归一化到峰值）
+    # - 直接 1:1 相加会破坏原视频的“人声/伴奏相对音量”（常见表现：背景音乐过低或过高）
+    # 因此这里尝试用 audio.wav（原混合音轨）对两个 stem 做线性拟合，恢复更接近原始的比例，
+    # 同时用“有效样本 RMS”匹配 TTS 音量到原人声（比 peak 更贴近听感）。
+    audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
+    audio_mix_path = os.path.join(folder, "audio.wav")
+
+    def _active_rms(y: np.ndarray, *, rel_th: float = 0.02) -> float:
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        if y.size <= 0:
+            return 0.0
+        peak = float(max(abs(float(np.max(y))), abs(float(np.min(y)))))
+        if not (peak > 1e-6):
+            return 0.0
+        th = float(peak) * float(rel_th)
+        mask = np.abs(y) > th
+        if bool(np.any(mask)):
+            yy = y[mask].astype(np.float32, copy=False)
+            return float(np.sqrt(float(np.mean(np.square(yy), dtype=np.float64))))
+        return float(np.sqrt(float(np.mean(np.square(y), dtype=np.float64))))
+
+    def _estimate_stem_scales(mix: np.ndarray, voc: np.ndarray, inst: np.ndarray) -> tuple[float, float]:
+        # Solve least squares for: mix ~= a*voc + b*inst  (2x2 normal equations, constant memory)
+        n = int(min(mix.shape[0], voc.shape[0], inst.shape[0]))
+        if n <= 0:
+            return 1.0, 1.0
+        m = mix[:n].astype(np.float64, copy=False)
+        v = voc[:n].astype(np.float64, copy=False)
+        i = inst[:n].astype(np.float64, copy=False)
+
+        vv = float(np.dot(v, v))
+        ii = float(np.dot(i, i))
+        vi = float(np.dot(v, i))
+        vm = float(np.dot(v, m))
+        im = float(np.dot(i, m))
+
+        det = vv * ii - vi * vi
+        if not (det > 1e-8):
+            return 1.0, 1.0
+
+        a = (vm * ii - im * vi) / det
+        b = (im * vv - vm * vi) / det
+        # Clamp to sane positive range; negative values indicate bad fit region.
+        a = float(max(0.0, min(a, 5.0)))
+        b = float(max(0.0, min(b, 5.0)))
+        if not (a > 0.0):
+            a = 1.0
+        if not (b > 0.0):
+            b = 1.0
+        return a, b
+
+    stem_vocal_scale = 1.0
+    stem_inst_scale = 1.0
+    tts_scale = 1.0
+
+    if len(audio_tts) > 0 and os.path.exists(audio_vocals_path):
         try:
             check_cancelled()
-            vocal_wav, _ = librosa.load(audio_vocals_path, sr=sample_rate, mono=True)
-            tts_peak = max(abs(float(np.max(audio_tts))), abs(float(np.min(audio_tts))))
-            if tts_peak > 0.0 and len(vocal_wav) > 0:
-                vocal_peak = max(abs(float(np.max(vocal_wav))), abs(float(np.min(vocal_wav))))
-                if vocal_peak > 0.0:
-                    scale = vocal_peak / tts_peak
-                    audio_tts = (audio_tts * np.float32(scale)).astype(np.float32)
-                    logger.info(f"TTS 音量已匹配到原始人声峰值 (scale={scale:.3f})")
+            # Use a mid-section for calibration to avoid intro/outro (often music-only).
+            calib_offset = 60.0
+            calib_dur = 120.0
+            vocal_calib, _ = librosa.load(
+                audio_vocals_path, sr=sample_rate, mono=True, offset=float(calib_offset), duration=float(calib_dur)
+            )
+            if vocal_calib.size <= 0:
+                vocal_calib, _ = librosa.load(audio_vocals_path, sr=sample_rate, mono=True, duration=float(calib_dur))
+
+            inst_calib = np.zeros((0,), dtype=np.float32)
+            if os.path.exists(audio_instruments_path):
+                inst_calib, _ = librosa.load(
+                    audio_instruments_path, sr=sample_rate, mono=True, offset=float(calib_offset), duration=float(calib_dur)
+                )
+                if inst_calib.size <= 0:
+                    inst_calib, _ = librosa.load(audio_instruments_path, sr=sample_rate, mono=True, duration=float(calib_dur))
+
+            mix_calib = np.zeros((0,), dtype=np.float32)
+            if os.path.exists(audio_mix_path):
+                mix_calib, _ = librosa.load(
+                    audio_mix_path, sr=sample_rate, mono=True, offset=float(calib_offset), duration=float(calib_dur)
+                )
+                if mix_calib.size <= 0:
+                    mix_calib, _ = librosa.load(audio_mix_path, sr=sample_rate, mono=True, duration=float(calib_dur))
+
+            if mix_calib.size > 0 and vocal_calib.size > 0 and inst_calib.size > 0:
+                stem_vocal_scale, stem_inst_scale = _estimate_stem_scales(mix_calib, vocal_calib, inst_calib)
+                logger.info(
+                    f"混音校准(对齐原音轨): stem_vocal_scale={stem_vocal_scale:.3f}, stem_instruments_scale={stem_inst_scale:.3f}"
+                )
+
+            # Match TTS loudness to (scaled) original vocals using active RMS.
+            vocal_target_rms = _active_rms((vocal_calib.astype(np.float32, copy=False) * np.float32(stem_vocal_scale)))
+            tts_r = _active_rms(audio_tts)
+            if vocal_target_rms > 0.0 and tts_r > 0.0:
+                tts_scale = float(vocal_target_rms / tts_r)
+                # Keep within a safe range to avoid extreme results on odd inputs.
+                tts_scale = float(max(0.2, min(tts_scale, 3.0)))
+                audio_tts = (audio_tts * np.float32(tts_scale)).astype(np.float32, copy=False)
+                logger.info(f"TTS 音量已匹配到原人声(active RMS) (scale={tts_scale:.3f})")
         except Exception as e:
-            logger.warning(f"匹配音量失败（将跳过缩放）: {e}")
+            logger.warning(f"混音校准/匹配音量失败（将回退默认混音）: {e}")
+
+    # Avoid int16 overflow when saving debug audio_tts.wav (numpy cast may wrap).
+    if len(audio_tts) > 0:
+        try:
+            peak = max(abs(float(np.max(audio_tts))), abs(float(np.min(audio_tts))))
+            if peak > 0.99:
+                audio_tts = (audio_tts * np.float32(0.99 / peak)).astype(np.float32, copy=False)
+        except Exception:
+            pass
 
     # 保存音量匹配后的音轨，便于排查/试听
     check_cancelled()
@@ -1178,6 +1276,9 @@ def _ensure_audio_combined(
             # 加载伴奏
             instruments, _ = librosa.load(audio_instruments_path, sr=sample_rate, mono=True)
             instruments = instruments.astype(np.float32, copy=False)
+            # Apply stem scale to restore original mix balance when available.
+            if float(stem_inst_scale) != 1.0:
+                instruments = (instruments * np.float32(stem_inst_scale)).astype(np.float32, copy=False)
             
             # 对齐长度（以TTS音频为准）
             tts_len = len(audio_tts)
