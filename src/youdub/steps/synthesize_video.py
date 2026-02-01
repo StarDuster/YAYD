@@ -23,7 +23,10 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 #     adaptive mode no longer phase-vocoder stretches TTS (avoid “回音/空洞”感)
 # v4: restore original mix balance by estimating stem scales against audio.wav;
 #     match TTS loudness to original vocals (RMS on active samples) instead of peak.
-_AUDIO_COMBINED_MIX_VERSION = 4
+# v5: estimate voice/BGM levels on multiple windows and pick the best-balanced ones;
+#     log original voice/BGM loudness + ratio to make debugging easy.
+# v6: improve window search by probing stems first (avoid missing music-heavy moments).
+_AUDIO_COMBINED_MIX_VERSION = 6
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -1208,50 +1211,178 @@ def _ensure_audio_combined(
     stem_vocal_scale = 1.0
     stem_inst_scale = 1.0
     tts_scale = 1.0
+    orig_voice_rms: float | None = None
+    orig_bgm_rms: float | None = None
+    orig_ratio_db: float | None = None
 
-    if len(audio_tts) > 0 and os.path.exists(audio_vocals_path):
+    def _safe_db_ratio(num: float, den: float) -> float | None:
+        n = float(num)
+        d = float(den)
+        if not (n > 0.0) or not (d > 0.0):
+            return None
+        return float(20.0 * np.log10(n / d))
+
+    def _duration_seconds(path: str) -> float | None:
+        try:
+            d = float(librosa.get_duration(path=path))
+            return d if d > 0 else None
+        except Exception:
+            return None
+
+    if (
+        len(audio_tts) > 0
+        and os.path.exists(audio_vocals_path)
+        and os.path.exists(audio_instruments_path)
+        and os.path.exists(audio_mix_path)
+    ):
         try:
             check_cancelled()
-            # Use a mid-section for calibration to avoid intro/outro (often music-only).
-            calib_offset = 60.0
-            calib_dur = 120.0
-            vocal_calib, _ = librosa.load(
-                audio_vocals_path, sr=sample_rate, mono=True, offset=float(calib_offset), duration=float(calib_dur)
-            )
-            if vocal_calib.size <= 0:
-                vocal_calib, _ = librosa.load(audio_vocals_path, sr=sample_rate, mono=True, duration=float(calib_dur))
+            # 校准策略（关键点）：
+            # 单一窗口很容易落在“纯人声/纯音乐/片头片尾”导致估计偏差，从而把 BGM 拉得几乎听不见。
+            # 这里改为采样多个窗口，按“人声与BGM都显著”的窗口打分，选 Top-K 后取中位数作为全局比例。
+            total_dur = _duration_seconds(audio_mix_path) or _duration_seconds(audio_vocals_path) or _duration_seconds(audio_instruments_path)
 
-            inst_calib = np.zeros((0,), dtype=np.float32)
-            if os.path.exists(audio_instruments_path):
-                inst_calib, _ = librosa.load(
-                    audio_instruments_path, sr=sample_rate, mono=True, offset=float(calib_offset), duration=float(calib_dur)
+            try:
+                calib_window = float(os.getenv("YOUDUB_MIX_CALIB_WINDOW_SECONDS", "30") or "30")
+            except Exception:
+                calib_window = 30.0
+            try:
+                calib_windows = int(os.getenv("YOUDUB_MIX_CALIB_MAX_WINDOWS", "10") or "10")
+            except Exception:
+                calib_windows = 10
+
+            calib_window = float(max(8.0, min(calib_window, 120.0)))
+            calib_windows = int(max(1, min(calib_windows, 25)))
+            topk = int(max(1, min(5, calib_windows)))
+
+            # Stage 1: coarse scan using only stems (fast) to find windows where BOTH vocals & BGM are present.
+            if total_dur is None:
+                probe_starts = [0.0]
+            else:
+                start_min = 60.0 if (float(total_dur) > 60.0 + float(calib_window) + 1e-6) else 0.0
+                start_max = max(float(start_min), float(total_dur) - float(calib_window))
+                if start_max <= start_min + 1e-6:
+                    probe_starts = [float(start_min)]
+                else:
+                    # Probe stride: trade accuracy for speed; keep it small enough to not miss "music comes in" moments.
+                    try:
+                        probe_stride = float(os.getenv("YOUDUB_MIX_CALIB_PROBE_STRIDE_SECONDS", "15") or "15")
+                    except Exception:
+                        probe_stride = 15.0
+                    probe_stride = float(max(5.0, min(probe_stride, 120.0)))
+                    probe_starts = [float(x) for x in np.arange(start_min, start_max + 1e-6, probe_stride).tolist()]
+
+            probe_scores: list[tuple[float, float]] = []
+            for s in probe_starts:
+                check_cancelled()
+                try:
+                    voc_p, _ = librosa.load(
+                        audio_vocals_path, sr=sample_rate, mono=True, offset=max(0.0, float(s)), duration=float(calib_window)
+                    )
+                    inst_p, _ = librosa.load(
+                        audio_instruments_path, sr=sample_rate, mono=True, offset=max(0.0, float(s)), duration=float(calib_window)
+                    )
+                except Exception:
+                    continue
+                if voc_p.size <= 0 or inst_p.size <= 0:
+                    continue
+                score = float(min(_active_rms(voc_p), _active_rms(inst_p)))
+                probe_scores.append((float(score), float(s)))
+
+            # Pick the best windows for full evaluation (with mix + scale fitting).
+            if probe_scores:
+                probe_scores.sort(key=lambda x: x[0], reverse=True)
+                # Keep only top-N unique-ish starts (avoid duplicates in very flat audio).
+                starts = [s for _score, s in probe_scores[: int(calib_windows)]]
+            else:
+                starts = [0.0]
+
+            samples: list[dict[str, float]] = []
+            for s in starts:
+                check_cancelled()
+                try:
+                    voc, _ = librosa.load(
+                        audio_vocals_path,
+                        sr=sample_rate,
+                        mono=True,
+                        offset=max(0.0, float(s)),
+                        duration=float(calib_window),
+                    )
+                    inst, _ = librosa.load(
+                        audio_instruments_path,
+                        sr=sample_rate,
+                        mono=True,
+                        offset=max(0.0, float(s)),
+                        duration=float(calib_window),
+                    )
+                    mix, _ = librosa.load(
+                        audio_mix_path,
+                        sr=sample_rate,
+                        mono=True,
+                        offset=max(0.0, float(s)),
+                        duration=float(calib_window),
+                    )
+                except Exception:
+                    continue
+
+                if voc.size <= 0 or inst.size <= 0 or mix.size <= 0:
+                    continue
+
+                a, b = _estimate_stem_scales(mix.astype(np.float32, copy=False), voc.astype(np.float32, copy=False), inst.astype(np.float32, copy=False))
+                voice_rms = _active_rms((voc.astype(np.float32, copy=False) * np.float32(a)))
+                bgm_rms = _active_rms((inst.astype(np.float32, copy=False) * np.float32(b)))
+
+                both_score = float(min(voice_rms, bgm_rms))
+                samples.append(
+                    {
+                        "start": float(s),
+                        "a": float(a),
+                        "b": float(b),
+                        "voice_rms": float(voice_rms),
+                        "bgm_rms": float(bgm_rms),
+                        "both": float(both_score),
+                    }
                 )
-                if inst_calib.size <= 0:
-                    inst_calib, _ = librosa.load(audio_instruments_path, sr=sample_rate, mono=True, duration=float(calib_dur))
 
-            mix_calib = np.zeros((0,), dtype=np.float32)
-            if os.path.exists(audio_mix_path):
-                mix_calib, _ = librosa.load(
-                    audio_mix_path, sr=sample_rate, mono=True, offset=float(calib_offset), duration=float(calib_dur)
-                )
-                if mix_calib.size <= 0:
-                    mix_calib, _ = librosa.load(audio_mix_path, sr=sample_rate, mono=True, duration=float(calib_dur))
+            if samples:
+                samples.sort(key=lambda x: float(x.get("both", 0.0)), reverse=True)
+                picked = samples[: min(int(topk), len(samples))]
 
-            if mix_calib.size > 0 and vocal_calib.size > 0 and inst_calib.size > 0:
-                stem_vocal_scale, stem_inst_scale = _estimate_stem_scales(mix_calib, vocal_calib, inst_calib)
-                logger.info(
-                    f"混音校准(对齐原音轨): stem_vocal_scale={stem_vocal_scale:.3f}, stem_instruments_scale={stem_inst_scale:.3f}"
-                )
+                stem_vocal_scale = float(np.median([x["a"] for x in picked]))
+                stem_inst_scale = float(np.median([x["b"] for x in picked]))
+                orig_voice_rms = float(np.median([x["voice_rms"] for x in picked]))
+                orig_bgm_rms = float(np.median([x["bgm_rms"] for x in picked]))
+                orig_ratio_db = _safe_db_ratio(float(orig_bgm_rms), float(orig_voice_rms))
 
-            # Match TTS loudness to (scaled) original vocals using active RMS.
-            vocal_target_rms = _active_rms((vocal_calib.astype(np.float32, copy=False) * np.float32(stem_vocal_scale)))
+                if orig_ratio_db is not None:
+                    logger.info(
+                        "原视频响度估计(Top窗口中位数): "
+                        f"voice_active_rms={orig_voice_rms:.4f}, bgm_active_rms={orig_bgm_rms:.4f}, "
+                        f"bgm_vs_voice={orig_ratio_db:.1f}dB, "
+                        f"stem_vocal_scale={stem_vocal_scale:.3f}, stem_instruments_scale={stem_inst_scale:.3f}, "
+                        f"windows_used={len(picked)}/{len(samples)}"
+                    )
+                else:
+                    logger.info(
+                        "原视频响度估计(Top窗口中位数): "
+                        f"voice_active_rms={orig_voice_rms:.4f}, bgm_active_rms={orig_bgm_rms:.4f}, "
+                        f"stem_vocal_scale={stem_vocal_scale:.3f}, stem_instruments_scale={stem_inst_scale:.3f}, "
+                        f"windows_used={len(picked)}/{len(samples)}"
+                    )
+
+            # Match TTS loudness to original voice (active RMS).
             tts_r = _active_rms(audio_tts)
-            if vocal_target_rms > 0.0 and tts_r > 0.0:
-                tts_scale = float(vocal_target_rms / tts_r)
-                # Keep within a safe range to avoid extreme results on odd inputs.
+            if orig_voice_rms is not None and orig_voice_rms > 0.0 and tts_r > 0.0:
+                tts_scale = float(float(orig_voice_rms) / float(tts_r))
                 tts_scale = float(max(0.2, min(tts_scale, 3.0)))
                 audio_tts = (audio_tts * np.float32(tts_scale)).astype(np.float32, copy=False)
-                logger.info(f"TTS 音量已匹配到原人声(active RMS) (scale={tts_scale:.3f})")
+                if orig_ratio_db is not None:
+                    logger.info(
+                        f"TTS 音量已匹配到原人声(active RMS): scale={tts_scale:.3f} "
+                        f"(原BGM/人声={orig_ratio_db:.1f}dB)"
+                    )
+                else:
+                    logger.info(f"TTS 音量已匹配到原人声(active RMS): scale={tts_scale:.3f}")
         except Exception as e:
             logger.warning(f"混音校准/匹配音量失败（将回退默认混音）: {e}")
 
