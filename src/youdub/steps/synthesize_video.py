@@ -11,6 +11,7 @@ from typing import Any
 
 import librosa
 import numpy as np
+from scipy.signal import butter, find_peaks, sosfiltfilt
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
@@ -1143,6 +1144,137 @@ def _atempo_chain(tempo: float) -> list[str]:
             continue
         out.append(f"atempo={float(p):.9f}")
     return out or ["atempo=1.0"]
+
+
+def _estimate_syllable_nuclei_count(
+    y: np.ndarray,
+    sr: int,
+    *,
+    analysis_sr: int = 16000,
+    frame_length_ms: float = 25.0,
+    hop_length_ms: float = 10.0,
+    bandpass: bool = True,
+    bandpass_low_hz: float = 500.0,
+    bandpass_high_hz: float = 4000.0,
+    ignorance_db: float = 2.0,
+    min_dip_db: float = 4.0,
+    min_distance_s: float = 0.10,
+    voiced_filter: bool = True,
+) -> int:
+    """
+    Estimate syllable nuclei count using an intensity-peaks heuristic (de Jong & Wempe style).
+
+    This is a best-effort statistic used to derive per-segment stretch ratios. It must be robust
+    (never crash the pipeline) rather than perfect.
+    """
+    yy = np.asarray(y, dtype=np.float32).reshape(-1)
+    if yy.size <= 0:
+        return 0
+
+    # Defensive cleanup: avoid NaNs/inf poisoning downstream median/peak detection.
+    if not np.isfinite(yy).all():
+        yy = np.nan_to_num(yy, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+    sr0 = int(sr) if int(sr) > 0 else 16000
+    sr_a = int(analysis_sr) if int(analysis_sr) > 0 else 16000
+
+    y_a = yy
+    sr_use = sr0
+    if sr0 != sr_a:
+        try:
+            y_a = librosa.resample(y_a, orig_sr=sr0, target_sr=sr_a).astype(np.float32, copy=False)
+            sr_use = sr_a
+        except Exception:
+            y_a = yy
+            sr_use = sr0
+
+    # Bandpass filtering improves robustness on mixed/noisy recordings.
+    if bandpass and sr_use > 0 and y_a.size > 32:
+        try:
+            nyq = 0.5 * float(sr_use)
+            lo = float(bandpass_low_hz) / nyq
+            hi = float(bandpass_high_hz) / nyq
+            lo = float(max(1e-5, min(lo, 0.999)))
+            hi = float(max(1e-5, min(hi, 0.999)))
+            if lo < hi:
+                sos = butter(4, [lo, hi], btype="bandpass", output="sos")
+                # sosfiltfilt can fail for very short arrays; best-effort only.
+                y_a = sosfiltfilt(sos, y_a).astype(np.float32, copy=False)
+        except Exception:
+            pass
+
+    # Intensity contour (RMS -> dB), roughly matching Praat defaults (10ms step).
+    fl = int(round(float(frame_length_ms) * 1e-3 * float(sr_use)))
+    hl = int(round(float(hop_length_ms) * 1e-3 * float(sr_use)))
+    hl = max(1, hl)
+    fl = max(hl + 1, fl)
+
+    try:
+        rms = librosa.feature.rms(y=y_a, frame_length=int(fl), hop_length=int(hl), center=False)[0]
+    except Exception:
+        return 0
+    if rms.size <= 0:
+        return 0
+
+    eps = 1e-10
+    intensity_db = (20.0 * np.log10(np.maximum(rms.astype(np.float32, copy=False), eps))).astype(np.float32, copy=False)
+    finite = np.isfinite(intensity_db)
+    if not bool(np.any(finite)):
+        return 0
+
+    med = float(np.median(intensity_db[finite]))
+    th = float(med + float(ignorance_db))
+
+    hop_s = float(hl) / float(sr_use) if sr_use > 0 else 0.01
+    dist_frames = int(round(float(min_distance_s) / max(1e-6, hop_s)))
+    dist_frames = max(1, dist_frames)
+
+    try:
+        peaks, _props = find_peaks(
+            intensity_db.astype(np.float64, copy=False),
+            height=float(th),
+            prominence=float(min_dip_db),
+            distance=int(dist_frames),
+        )
+    except Exception:
+        peaks = np.asarray([], dtype=np.int64)
+
+    peaks = np.asarray(peaks, dtype=np.int64)
+    if peaks.size <= 0:
+        return 0
+
+    # Optionally discard unvoiced peaks (reduces false positives on loud fricatives).
+    if voiced_filter:
+        try:
+            fmin = 50.0
+            fmax = min(500.0, max(fmin + 10.0, float(sr_use) * 0.5 - 1.0))
+            if fmax > fmin:
+                # `pyin` needs at least ~2 periods of fmin within a frame.
+                # Keep hop_length consistent with the intensity contour; allow a larger frame_length here.
+                # Round up to a power-of-two (faster STFT, avoids librosa warnings).
+                py_min = int(math.ceil(2.0 * float(sr_use) / float(fmin)) + 1.0)
+                py_fl = int(max(int(fl), int(py_min)))
+                py_fl = int(1 << int(max(1, py_fl - 1)).bit_length())
+                py_fl = int(max(128, min(py_fl, 8192)))
+                _f0, voiced_flag, _voiced_prob = librosa.pyin(
+                    y_a,
+                    fmin=float(fmin),
+                    fmax=float(fmax),
+                    sr=int(sr_use),
+                    frame_length=int(py_fl),
+                    hop_length=int(hl),
+                    center=False,
+                )
+                if voiced_flag is not None:
+                    vf = np.asarray(voiced_flag, dtype=bool)
+                    m = int(min(vf.shape[0], intensity_db.shape[0]))
+                    if m > 0:
+                        peaks = peaks[peaks < m]
+                        peaks = peaks[vf[:m][peaks]]
+        except Exception:
+            pass
+
+    return int(peaks.size)
 
 
 def _run_process_with_cancel(cmd: list[str]) -> None:
