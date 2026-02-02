@@ -1606,6 +1606,8 @@ def _ensure_audio_combined(
         vocals_src = os.path.join(folder, "audio_vocals.wav")
         mix_src = os.path.join(folder, "audio.wav")
         src_audio_path = vocals_src if os.path.exists(vocals_src) else (mix_src if os.path.exists(mix_src) else "")
+        syllable_ratio_samples: list[float] = []
+        syllable_ratio_median: float | None = None
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1683,6 +1685,19 @@ def _ensure_audio_combined(
             ratio_method = "syllables"
             if src_syll > 0 and tts_syll > 0:
                 ratio = float(tts_syll) / float(max(1, src_syll))
+                # Keep a running median for fallback on segments where syllable counting fails.
+                if 0.05 <= ratio <= 20.0:
+                    syllable_ratio_samples.append(float(ratio))
+                    if len(syllable_ratio_samples) >= 3:
+                        try:
+                            syllable_ratio_median = float(
+                                np.median(np.asarray(syllable_ratio_samples, dtype=np.float32))
+                            )
+                        except Exception:
+                            pass
+            elif syllable_ratio_median is not None:
+                ratio_method = "median_syllables"
+                ratio = float(syllable_ratio_median)
             else:
                 ratio_method = "duration"
                 ratio = float(tts_raw_dur) / float(max(0.001, src_dur)) if tts_raw_dur > 0 else 1.0
