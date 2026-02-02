@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import subprocess
@@ -40,7 +41,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
 # v10: keep 1080p landscape at ~36; portrait slightly smaller
 # v11: increase 1080p landscape subtitle size (~49) to match expected readability
-_VIDEO_META_VERSION = 11
+# v12: bilingual subtitles no longer truncate source text to first sentence
+_VIDEO_META_VERSION = 12
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -663,36 +665,197 @@ def _calc_subtitle_style_params(
     return int(font_size), int(outline), int(margin_v), int(max_chars_zh), int(max_chars_en)
 
 
-def _first_sentence(text: str, *, max_chars: int = 220) -> str:
+_TOKEN_RE = re.compile(r"[0-9A-Za-z_]+(?:['’][0-9A-Za-z_]+)?")
+
+
+def _normalize_ws(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _tokenize_for_count(text: str) -> list[str]:
+    # Normalize apostrophes so tokenization is stable.
+    s = _normalize_ws(text).replace("’", "'")
+    return [m.group(0).lower() for m in _TOKEN_RE.finditer(s)]
+
+
+def _unit_weight(text: str) -> int:
     """
-    Return a short preview of source text for bilingual subtitles.
-    We intentionally keep ONLY one sentence to avoid dumping long paragraphs on screen.
+    Weight for balancing clause grouping.
+
+    Prefer ASCII token count (English-like); fallback to character length for CJK/others.
+    """
+    toks = _tokenize_for_count(text)
+    if toks:
+        return int(len(toks))
+    s = _normalize_ws(text)
+    return int(max(1, len(s)))
+
+
+def _split_words_to_count(text: str, target_count: int) -> list[str]:
+    """Fallback: split by words as evenly as possible."""
+    if target_count <= 0:
+        return []
+    s = _normalize_ws(text)
+    if not s:
+        return [""] * target_count
+    if target_count == 1:
+        return [s]
+
+    words = s.split(" ")
+    if not words:
+        return [""] * target_count
+
+    base = len(words) // target_count
+    rem = len(words) % target_count
+    out: list[str] = []
+    idx = 0
+    for i in range(target_count):
+        size = base + (1 if i < rem else 0)
+        if size <= 0:
+            out.append("")
+            continue
+        out.append(" ".join(words[idx : idx + size]).strip())
+        idx += size
+    return out
+
+
+def _group_clauses_evenly(clauses: list[str], target_count: int) -> list[str]:
+    """Group clauses in order so each group has similar weight."""
+    cleaned = [c.strip() for c in clauses if c and c.strip()]
+    if target_count <= 1:
+        return [" ".join(cleaned).strip()] if cleaned else []
+    if not cleaned:
+        return [""] * target_count
+    if len(cleaned) < target_count:
+        # Not enough clauses to make target_count groups.
+        return []
+
+    weights = [_unit_weight(c) for c in cleaned]
+    total = sum(weights) or 1
+    target = float(total) / float(target_count)
+
+    out: list[str] = []
+    buf: list[str] = []
+    buf_cnt = 0
+    remaining_groups = int(target_count)
+
+    for i, clause in enumerate(cleaned):
+        w = int(weights[i])
+        remaining_clauses = len(cleaned) - i
+
+        # If remaining clauses == remaining groups, we must allocate 1 clause per group.
+        if buf and remaining_clauses == remaining_groups:
+            out.append(" ".join(buf).strip())
+            buf = [clause]
+            buf_cnt = w
+            remaining_groups -= 1
+            continue
+
+        if not buf:
+            buf = [clause]
+            buf_cnt = w
+            continue
+
+        # Last group: take everything remaining.
+        if remaining_groups <= 1:
+            buf.append(clause)
+            buf_cnt += w
+            continue
+
+        # Close group when reaching target.
+        if float(buf_cnt) >= target:
+            out.append(" ".join(buf).strip())
+            buf = [clause]
+            buf_cnt = w
+            remaining_groups -= 1
+            continue
+
+        # If adding this clause overshoots target a lot, close early if current buf isn't too small.
+        if (float(buf_cnt + w) > target) and (buf_cnt >= max(3, int(target * 0.6))):
+            out.append(" ".join(buf).strip())
+            buf = [clause]
+            buf_cnt = w
+            remaining_groups -= 1
+            continue
+
+        buf.append(clause)
+        buf_cnt += w
+
+    if buf:
+        out.append(" ".join(buf).strip())
+
+    # Defensive: if grouping drifted, signal failure so caller can fallback.
+    if len(out) != int(target_count):
+        return []
+    return out
+
+
+def _bilingual_source_text(
+    text: str,
+    *,
+    max_words: int = 18,
+    max_chars: int = 110,
+) -> str:
+    """
+    Source text rendering for bilingual subtitles.
+
+    Strategy (mirrors `scripts/resplit_by_diarization.py` step 6):
+    - Split by sentence terminators (.?! and Chinese equivalents).
+    - If a single sentence is too long, split into clause groups as evenly as possible.
+    - Unlike the legacy logic, we do NOT truncate to the first sentence.
     """
     raw = str(text or "").replace("\r", "").strip()
     if not raw:
         return ""
 
-    # Keep first non-empty line only.
-    first_line = ""
-    for ln in raw.splitlines():
-        ln = ln.strip()
-        if ln:
-            first_line = ln
-            break
-    if not first_line:
-        return ""
-
-    s = " ".join(first_line.split()).strip()
+    s = _normalize_ws(raw)
     if not s:
         return ""
 
-    # Sentence terminators. For '.' we require a following whitespace/end/quote/bracket to avoid decimals.
-    m = re.search(r'(?:[。！？!?]|\.)(?=(?:\s|$|["\')\]]))', s)
-    if m:
-        return s[: m.end()].strip()
-    if len(s) > int(max_chars):
-        return s[: int(max_chars)].rstrip()
-    return s
+    # Lazy import to avoid pulling translation stack unless needed.
+    try:
+        from .translate import _split_source_text_into_sentences, _split_source_text_relaxed
+    except Exception:
+        return s
+
+    sentences = [x.strip() for x in _split_source_text_into_sentences(s) if str(x).strip()]
+    if not sentences:
+        sentences = [s]
+
+    rendered: list[str] = []
+    for sent in sentences:
+        sent = _normalize_ws(sent)
+        if not sent:
+            continue
+
+        # Prefer token-based counting for English. If no tokens (e.g. CJK), fall back to chars.
+        token_count = len(_tokenize_for_count(sent))
+        wc = int(token_count) if token_count > 0 else int(len(sent.split()))
+        if wc <= 0:
+            wc = 1
+
+        too_long = (max_words > 0 and wc > int(max_words)) or (max_chars > 0 and len(sent) > int(max_chars))
+        if not too_long:
+            rendered.append(sent)
+            continue
+
+        # Decide how many chunks we need.
+        target_count = 2
+        if max_words > 0:
+            target_count = max(target_count, int(math.ceil(float(wc) / float(max_words))))
+        if max_chars > 0:
+            target_count = max(target_count, int(math.ceil(float(len(sent)) / float(max_chars))))
+
+        clauses = [c.strip() for c in _split_source_text_relaxed(sent) if str(c).strip()]
+        grouped = _group_clauses_evenly(clauses, target_count)
+        if grouped:
+            rendered.append("\n".join(grouped).strip())
+            continue
+
+        # Fallback: word-based even split (guarantees count).
+        rendered.append("\n".join([p for p in _split_words_to_count(sent, target_count) if p.strip()]).strip())
+
+    return " ".join([x for x in rendered if x]).strip()
 
 
 def _generate_ass_header(
@@ -808,7 +971,7 @@ def generate_bilingual_ass(
     for seg in translation:
         check_cancelled()
         zh_raw = str(seg.get("translation") or "").strip()
-        en_raw = _first_sentence(str(seg.get("text") or ""))
+        en_raw = _bilingual_source_text(str(seg.get("text") or ""))
         if not zh_raw and not en_raw:
             continue
 
@@ -864,7 +1027,11 @@ def generate_srt(
             start = format_timestamp(line['start'] / speed_up)
             end = format_timestamp(line['end'] / speed_up)
             tr_text = str(line.get('translation', '') or '').strip()
-            src_text = _first_sentence(str(line.get("text", "") or "")) if bilingual_subtitle else str(line.get('text', '') or '').strip()
+            src_text = (
+                _bilingual_source_text(str(line.get("text", "") or ""))
+                if bilingual_subtitle
+                else str(line.get("text", "") or "").strip()
+            )
 
             if not tr_text and not (bilingual_subtitle and src_text):
                 continue

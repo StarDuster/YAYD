@@ -434,10 +434,34 @@ def load_diarize_model(
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    def _read_float_env(name: str) -> float | None:
+        raw = os.getenv(name)
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            logger.warning(f"环境变量 {name} 不是有效浮点数，将忽略: {raw!r}")
+            return None
+
+    # Optional: allow users to tune diarization hyperparameters without code changes.
+    # These names intentionally match pipeline.parameters() keys:
+    # - segmentation.min_duration_off
+    # - clustering.threshold
+    seg_min_off = _read_float_env("PYANNOTE_SEGMENTATION_MIN_DURATION_OFF")
+    clust_thr = _read_float_env("PYANNOTE_CLUSTERING_THRESHOLD")
+
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     diar_dir_str = str(diar_dir) if diar_dir else ""
     cache_dir = diar_dir_str or None
-    key = f"{device}|{diar_dir_str}|{_PYANNOTE_DIARIZATION_MODEL_ID}"
+    key = (
+        f"{device}|{diar_dir_str}|{_PYANNOTE_DIARIZATION_MODEL_ID}"
+        f"|seg_min_off={seg_min_off if seg_min_off is not None else 'default'}"
+        f"|clust_thr={clust_thr if clust_thr is not None else 'default'}"
+    )
     if _DIARIZATION_PIPELINE is not None and _DIARIZATION_KEY == key:
         return
 
@@ -480,6 +504,18 @@ def load_diarize_model(
     logger.info(f"说话人分离管道加载完成，耗时 {time.time() - t0:.2f}秒")
 
     pipeline.to(torch.device(device))
+    # Apply user-provided hyperparameters (best-effort).
+    if seg_min_off is not None or clust_thr is not None:
+        params: dict[str, dict[str, float]] = {}
+        if seg_min_off is not None:
+            params.setdefault("segmentation", {})["min_duration_off"] = float(seg_min_off)
+        if clust_thr is not None:
+            params.setdefault("clustering", {})["threshold"] = float(clust_thr)
+        try:
+            pipeline.instantiate(params)
+            logger.info(f"已应用说话人分离参数: {params}")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"应用说话人分离参数失败（忽略，使用默认值）: {exc}")
     _DIARIZATION_PIPELINE = pipeline
     _DIARIZATION_KEY = key
 
