@@ -11,6 +11,7 @@ from typing import Any
 
 import librosa
 import numpy as np
+from audiostretchy.stretch import stretch_audio
 from scipy.signal import butter, find_peaks, sosfiltfilt
 from loguru import logger
 
@@ -29,7 +30,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 #     log original voice/BGM loudness + ratio to make debugging easy.
 # v6: improve window search by probing stems first (avoid missing music-heavy moments).
 # v7: adaptive mode aligns instruments per adaptive_plan (fix BGM drift vs stretched video).
-_AUDIO_COMBINED_MIX_VERSION = 7
+# v8: adaptive mode derives per-segment targets from syllable stats and stretches TTS per segment.
+_AUDIO_COMBINED_MIX_VERSION = 8
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -1277,6 +1279,95 @@ def _estimate_syllable_nuclei_count(
     return int(peaks.size)
 
 
+def _load_audio_slice(path: str, *, sr: int, start: float, end: float) -> np.ndarray:
+    if not path or not os.path.exists(path):
+        return np.zeros((0,), dtype=np.float32)
+    try:
+        s0 = float(start)
+        s1 = float(end)
+    except Exception:
+        return np.zeros((0,), dtype=np.float32)
+    if s1 < s0:
+        s0, s1 = s1, s0
+    s0 = max(0.0, float(s0))
+    s1 = max(0.0, float(s1))
+    dur = float(s1 - s0)
+    if not (dur > 1e-6):
+        return np.zeros((0,), dtype=np.float32)
+    try:
+        y, _ = librosa.load(path, sr=int(sr), mono=True, offset=float(s0), duration=float(dur))
+        return y.astype(np.float32, copy=False)
+    except Exception:
+        return np.zeros((0,), dtype=np.float32)
+
+
+def _stretch_audio_to_samples(
+    folder: str,
+    y: np.ndarray,
+    *,
+    sample_rate: int,
+    target_samples: int,
+) -> np.ndarray:
+    n_target = int(target_samples)
+    if n_target <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    yy = np.asarray(y, dtype=np.float32).reshape(-1)
+    if yy.size <= 0:
+        return np.zeros((n_target,), dtype=np.float32)
+    if yy.size == n_target:
+        return yy.astype(np.float32, copy=False)
+
+    ratio = float(n_target) / float(yy.size)
+    ratio = float(max(0.01, min(ratio, 100.0)))
+
+    tag = f"{time.time_ns()}_{threading.get_ident()}"
+    in_path = os.path.join(folder, f".tts_stretch_in_{tag}.wav")
+    out_path = os.path.join(folder, f".tts_stretch_out_{tag}.wav")
+
+    y_out: np.ndarray | None = None
+    try:
+        y_save = yy
+        # Avoid int16 overflow when writing temp WAVs.
+        try:
+            peak = max(abs(float(np.max(y_save))), abs(float(np.min(y_save)))) if y_save.size > 0 else 0.0
+            if peak > 0.99:
+                y_save = (y_save * np.float32(0.99 / peak)).astype(np.float32, copy=False)
+        except Exception:
+            pass
+
+        save_wav(y_save.astype(np.float32, copy=False), in_path, sample_rate=int(sample_rate))
+        stretch_audio(in_path, out_path, ratio=float(ratio), sample_rate=int(sample_rate))
+        y_out, _ = librosa.load(out_path, sr=int(sample_rate), mono=True)
+        y_out = y_out.astype(np.float32, copy=False)
+    except Exception:
+        # Fallback: in-memory time-stretch via librosa (phase vocoder).
+        try:
+            rate = float(1.0 / ratio) if ratio > 0 else 1.0
+            rate = float(max(0.01, min(rate, 100.0)))
+            y_out = librosa.effects.time_stretch(yy.astype(np.float32, copy=False), rate=rate).astype(np.float32, copy=False)
+        except Exception:
+            y_out = yy.astype(np.float32, copy=False)
+    finally:
+        # Best-effort cleanup of temp files.
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+    if y_out is None:
+        y_out = yy.astype(np.float32, copy=False)
+
+    # Ensure exact samples to keep timeline stable.
+    if y_out.shape[0] < n_target:
+        y_out = np.pad(y_out, (0, n_target - y_out.shape[0]), mode="constant")
+    else:
+        y_out = y_out[:n_target]
+    return y_out.astype(np.float32, copy=False)
+
+
 def _run_process_with_cancel(cmd: list[str]) -> None:
     """
     Run a subprocess while keeping cancellation responsive.
@@ -1454,9 +1545,10 @@ def _ensure_audio_combined(
     生成 audio_combined.wav 和 audio_tts.wav
     
     如果 adaptive_segment_stretch=True:
-        - 不对 TTS 做相位声码器 time_stretch（避免“回音/空洞”感）
-        - 逐段拼接（可裁剪首尾静音）并插入短停顿，生成 translation_adaptive.json
-        - 同时生成 adaptive_plan.json，用于逐段拉伸/裁剪原视频并 concat
+        - 逐段裁剪 TTS 首尾静音，并基于“音节核”统计估计每段目标时长
+        - 逐段拉伸/压缩 TTS 到目标时长（优先 audiostretchy；失败回退 librosa）
+        - 插入短停顿，生成 translation_adaptive.json（输出时间轴）
+        - 同时生成 adaptive_plan.json（speech + pause），用于视频/BGM 逐段对齐并 concat
     否则:
         - 按顺序拼接TTS音频片段
     """
@@ -1501,11 +1593,19 @@ def _ensure_audio_combined(
         )
     
     if adaptive_segment_stretch:
-        # 自适应模式：保持 TTS 基本原速（仅做静音裁剪），通过“拉伸视频段”来匹配每段音频时长。
+        # 自适应模式：逐段裁剪 + 按音节统计估计 target_duration，并将 TTS 逐段变速到该时长。
         trim_top_db = 35.0
         gap_default_s = 0.12
         gap_clause_s = 0.18
         gap_sentence_s = 0.25
+        analysis_sr = 16000
+        ratio_min = 0.7
+        ratio_max = 2.2
+        use_voiced_filter = False
+
+        vocals_src = os.path.join(folder, "audio_vocals.wav")
+        mix_src = os.path.join(folder, "audio.wav")
+        src_audio_path = vocals_src if os.path.exists(vocals_src) else (mix_src if os.path.exists(mix_src) else "")
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1560,12 +1660,44 @@ def _ensure_audio_combined(
             if orig_end < orig_start:
                 orig_start, orig_end = orig_end, orig_start
 
-            # Output speech duration is exactly the (trimmed) TTS segment duration.
-            target_samples = int(tts_audio.shape[0])
-            target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
+            # Derive target duration from syllable-count statistics (best-effort).
+            src_dur = float(orig_end - orig_start)
+            if not (src_dur > 1e-6):
+                src_dur = 0.001
 
+            tts_raw_samples = int(tts_audio.shape[0])
+            tts_raw_dur = float(tts_raw_samples) / float(sample_rate) if tts_raw_samples > 0 else 0.0
+
+            src_syll = 0
+            if src_audio_path:
+                src_y = _load_audio_slice(src_audio_path, sr=int(analysis_sr), start=float(orig_start), end=float(orig_end))
+                if src_y.size > 0:
+                    src_syll = _estimate_syllable_nuclei_count(
+                        src_y, int(analysis_sr), voiced_filter=bool(use_voiced_filter)
+                    )
+
+            tts_syll = (
+                _estimate_syllable_nuclei_count(tts_audio, int(sample_rate), voiced_filter=False) if tts_raw_samples > 0 else 0
+            )
+
+            ratio_method = "syllables"
+            if src_syll > 0 and tts_syll > 0:
+                ratio = float(tts_syll) / float(max(1, src_syll))
+            else:
+                ratio_method = "duration"
+                ratio = float(tts_raw_dur) / float(max(0.001, src_dur)) if tts_raw_dur > 0 else 1.0
+
+            ratio = float(max(float(ratio_min), min(float(ratio), float(ratio_max))))
+            target_samples = int(round(float(src_dur) * float(ratio) * float(sample_rate)))
+            if target_samples <= 0:
+                target_samples = int(round(0.001 * float(sample_rate)))
+            target_duration = float(target_samples) / float(sample_rate)
+
+            tts_stretched = _stretch_audio_to_samples(
+                folder, tts_audio, sample_rate=int(sample_rate), target_samples=int(target_samples)
+            )
             if target_samples > 0:
-                audio_chunks.append(tts_audio.astype(np.float32, copy=False))
+                audio_chunks.append(tts_stretched.astype(np.float32, copy=False))
 
             # Record adaptive translation (speech segments only).
             start_s = float(t_cursor_samples) / float(sample_rate)
@@ -1584,6 +1716,13 @@ def _ensure_audio_combined(
                     "src_end": round(orig_end, 6),
                     "target_duration": round(target_duration, 6),
                     "target_samples": int(target_samples),
+                    "src_syllables": int(src_syll),
+                    "tts_syllables": int(tts_syll),
+                    "syllable_ratio": round(float(ratio), 6),
+                    "ratio_method": str(ratio_method),
+                    "tts_raw_duration": round(float(tts_raw_dur), 6),
+                    "tts_raw_samples": int(tts_raw_samples),
+                    "tts_stretch_ratio": round(float(target_samples) / float(max(1, tts_raw_samples)), 6),
                 }
             )
 
