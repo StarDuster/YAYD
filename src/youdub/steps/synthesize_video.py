@@ -1517,7 +1517,7 @@ def _ensure_audio_combined(
 
                 if en_words:
                     try:
-                        en_stats = compute_en_speech_rate(en_words)
+                        en_stats = compute_en_speech_rate(en_words, segment_start=orig_start, segment_end=orig_end)
                     except Exception as exc:
                         logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
                         en_stats = None
