@@ -32,7 +32,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v7: adaptive mode aligns instruments per adaptive_plan (fix BGM drift vs stretched video).
 # v8: adaptive mode optionally applies speech-rate based TTS time-scale modification (TSM) per segment.
 # v9: refine speech-rate alignment metadata and clamp behavior.
-_AUDIO_COMBINED_MIX_VERSION = 9
+# v10: refine EN stats by using segment start/end bounds (affects speech-rate alignment output).
+_AUDIO_COMBINED_MIX_VERSION = 10
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
