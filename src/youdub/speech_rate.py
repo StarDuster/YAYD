@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
+import re
 import tempfile
+import threading
+import time
+import uuid
 from typing import Any
 
 import librosa
@@ -12,123 +17,186 @@ from loguru import logger
 from .utils import save_wav
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    if lo > hi:
-        lo, hi = hi, lo
-    return float(min(max(float(x), float(lo)), float(hi)))
+def _clamp(v: float, lo: float, hi: float) -> float:
+    x = float(v)
+    a = float(lo)
+    b = float(hi)
+    if a > b:
+        a, b = b, a
+    return float(max(a, min(b, x)))
 
 
-def _safe_div(num: float, den: float, default: float = 0.0) -> float:
-    den_f = float(den)
-    if not (den_f > 0.0):
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+    except Exception:
         return float(default)
-    return float(num) / den_f
+    if not math.isfinite(x):
+        return float(default)
+    return float(x)
 
 
-def _count_zh_chars(text: str) -> int:
-    # "字≈音节" 的粗近似：过滤空白/标点，仅保留字母数字（含 CJK 字符）。
-    return int(sum(1 for ch in (text or "") if ch.isalnum()))
+def _is_word_like(token: str) -> bool:
+    s = (token or "").strip()
+    if not s:
+        return False
+    # Keep anything that contains at least one alphanumeric char.
+    return any(ch.isalnum() for ch in s)
 
 
-def compute_en_speech_rate(words: list[dict[str, Any]]) -> dict[str, Any]:
+def _count_zh_units(text: str) -> int:
     """
-    从词级时间戳计算英文语速统计。
+    Count "syllable-like" units for Chinese TTS.
 
-    说明：
-    - total_duration 仅由 words 的 min(start)~max(end) 估计（不含段落边界外静音）。
-    - voiced_duration 用 sum(word_dur) 估计（近似发声时长）。
+    Practical heuristic:
+    - remove whitespace
+    - count alphanumeric unicode characters
+    This counts CJK chars, latin letters, and digits; skips punctuation.
     """
-    if not isinstance(words, list) or not words:
-        return {
-            "word_count": 0,
-            "voiced_duration": 0.0,
-            "total_duration": 0.0,
-            "silence_duration": 0.0,
-            "speech_rate": 0.0,
-            "syllable_rate": 0.0,
-            "pause_ratio": 0.0,
-        }
+    s = re.sub(r"\s+", "", str(text or ""))
+    if not s:
+        return 0
+    return int(sum(1 for ch in s if ch.isalnum()))
 
-    starts: list[float] = []
-    ends: list[float] = []
-    voiced = 0.0
-    count = 0
-    for w in words:
+
+def compute_en_speech_rate(
+    words: list[dict[str, Any]],
+    *,
+    segment_start: float | None = None,
+    segment_end: float | None = None,
+    syllables_per_word: float = 1.5,
+) -> dict[str, Any]:
+    """
+    Compute English speech stats from faster-whisper word timestamps.
+
+    Notes:
+    - `words` entries are expected to have absolute timestamps (seconds): {start, end, word, probability}.
+    - When `segment_start/segment_end` are provided, only words whose midpoint falls within the window are counted.
+    """
+    seg_s = _safe_float(segment_start, default=float("nan")) if segment_start is not None else float("nan")
+    seg_e = _safe_float(segment_end, default=float("nan")) if segment_end is not None else float("nan")
+    if math.isfinite(seg_s) and math.isfinite(seg_e) and seg_e < seg_s:
+        seg_s, seg_e = seg_e, seg_s
+
+    kept: list[tuple[float, float]] = []
+    word_count = 0
+
+    for w in (words or []):
         if not isinstance(w, dict):
             continue
-        try:
-            s = float(w.get("start", 0.0) or 0.0)
-            e = float(w.get("end", 0.0) or 0.0)
-        except Exception:
+        ws = _safe_float(w.get("start", 0.0), default=0.0)
+        we = _safe_float(w.get("end", 0.0), default=0.0)
+        if we <= ws:
             continue
-        if not (e > s):
+        token = str(w.get("word", "") or "")
+        if not _is_word_like(token):
             continue
-        starts.append(s)
-        ends.append(e)
-        voiced += float(e - s)
-        count += 1
+        if math.isfinite(seg_s) and math.isfinite(seg_e):
+            mid = 0.5 * (ws + we)
+            if mid < seg_s or mid > seg_e:
+                continue
+        kept.append((ws, we))
+        word_count += 1
 
-    if count <= 0 or not starts or not ends:
-        return {
-            "word_count": 0,
-            "voiced_duration": 0.0,
-            "total_duration": 0.0,
-            "silence_duration": 0.0,
-            "speech_rate": 0.0,
-            "syllable_rate": 0.0,
-            "pause_ratio": 0.0,
-        }
+    # Voiced duration: sum of word durations (simple; words should not overlap).
+    voiced_duration = float(sum((we - ws) for ws, we in kept))
+    voiced_duration = float(max(0.0, voiced_duration))
 
-    total = float(max(ends) - min(starts))
-    if total < 0.0:
-        total = 0.0
-    # Prevent pathological overlap (shouldn't happen, but be defensive).
-    voiced = float(min(voiced, total)) if total > 0.0 else float(voiced)
-    silence = float(max(0.0, total - voiced))
+    if math.isfinite(seg_s) and math.isfinite(seg_e):
+        total_duration = float(max(0.0, seg_e - seg_s))
+    elif kept:
+        total_duration = float(max(0.0, max(we for _ws, we in kept) - min(ws for ws, _we in kept)))
+    else:
+        total_duration = 0.0
 
-    word_rate = _safe_div(float(count), voiced, default=0.0)
-    syll_rate = float(word_rate * 1.5)
-    pause_ratio = _safe_div(silence, total, default=0.0)
+    silence_duration = float(max(0.0, total_duration - voiced_duration))
+    pause_ratio = float(silence_duration / total_duration) if total_duration > 0 else 0.0
+    speech_rate = float(word_count / voiced_duration) if voiced_duration > 0 else 0.0
+
+    spw = _safe_float(syllables_per_word, default=1.5)
+    spw = float(max(0.1, min(spw, 10.0)))
+    syllable_rate = float(speech_rate * spw) if speech_rate > 0 else 0.0
+
     return {
-        "word_count": int(count),
-        "voiced_duration": float(voiced),
-        "total_duration": float(total),
-        "silence_duration": float(silence),
-        "speech_rate": float(word_rate),
-        "syllable_rate": float(syll_rate),
-        "pause_ratio": float(pause_ratio),
+        "word_count": int(word_count),
+        "voiced_duration": float(voiced_duration),
+        "total_duration": float(total_duration),
+        "silence_duration": float(silence_duration),
+        "speech_rate": float(speech_rate),  # words/s over voiced duration
+        "syllable_rate": float(syllable_rate),  # approx syllables/s over voiced duration
+        "pause_ratio": float(_clamp(pause_ratio, 0.0, 1.0)),
     }
 
 
-def compute_zh_speech_rate(audio: np.ndarray, sr: int, text: str, *, top_db: float = 30.0) -> dict[str, Any]:
-    """从 TTS 音频与文本粗估中文语速（字≈音节）。"""
-    y = np.asarray(audio, dtype=np.float32).reshape(-1)
-    sr_i = int(sr)
-    if sr_i <= 0:
-        sr_i = 24000
+def compute_zh_speech_rate(
+    audio: np.ndarray,
+    sr: int,
+    text: str,
+    *,
+    vad_top_db: float = 30.0,
+) -> dict[str, Any]:
+    """
+    Compute Chinese TTS speech stats from audio + text.
+    """
+    sample_rate = int(sr or 0)
+    if sample_rate <= 0:
+        return {
+            "char_count": int(_count_zh_units(text)),
+            "voiced_duration": 0.0,
+            "total_duration": 0.0,
+            "silence_duration": 0.0,
+            "speech_rate": 0.0,
+            "syllable_rate": 0.0,
+            "pause_ratio": 0.0,
+        }
 
-    total = float(y.shape[0]) / float(sr_i) if y.size > 0 else 0.0
-    voiced = 0.0
-    if y.size > 0:
-        try:
-            intervals = librosa.effects.split(y, top_db=float(top_db))
-            voiced = float(sum((int(e) - int(s)) for s, e in intervals)) / float(sr_i)
-        except Exception:
-            voiced = 0.0
-    voiced = float(min(max(voiced, 0.0), total)) if total > 0.0 else float(max(voiced, 0.0))
-    silence = float(max(0.0, total - voiced))
+    y = np.asarray(audio, dtype=np.float32)
+    total_samples = int(y.shape[0] if y.ndim == 1 else (y.reshape(-1).shape[0]))
+    if total_samples <= 0:
+        return {
+            "char_count": int(_count_zh_units(text)),
+            "voiced_duration": 0.0,
+            "total_duration": 0.0,
+            "silence_duration": 0.0,
+            "speech_rate": 0.0,
+            "syllable_rate": 0.0,
+            "pause_ratio": 0.0,
+        }
 
-    char_count = _count_zh_chars(text)
-    char_rate = _safe_div(float(char_count), voiced, default=0.0)
-    pause_ratio = _safe_div(silence, total, default=0.0)
+    y = y.reshape(-1)
+    total_duration = float(total_samples) / float(sample_rate)
+
+    try:
+        intervals = librosa.effects.split(y, top_db=float(vad_top_db))
+    except Exception:
+        intervals = np.zeros((0, 2), dtype=np.int64)
+
+    voiced_samples = 0
+    try:
+        for st, ed in intervals:
+            st_i = int(st)
+            ed_i = int(ed)
+            if ed_i > st_i:
+                voiced_samples += (ed_i - st_i)
+    except Exception:
+        voiced_samples = 0
+
+    voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
+    silence_duration = float(max(0.0, total_duration - voiced_duration))
+    pause_ratio = float(silence_duration / total_duration) if total_duration > 0 else 0.0
+
+    char_count = int(_count_zh_units(text))
+    speech_rate = float(char_count / voiced_duration) if voiced_duration > 0 else 0.0
+    syllable_rate = float(speech_rate)
+
     return {
         "char_count": int(char_count),
-        "voiced_duration": float(voiced),
-        "total_duration": float(total),
-        "silence_duration": float(silence),
-        "speech_rate": float(char_rate),
-        "syllable_rate": float(char_rate),
-        "pause_ratio": float(pause_ratio),
+        "voiced_duration": float(voiced_duration),
+        "total_duration": float(total_duration),
+        "silence_duration": float(silence_duration),
+        "speech_rate": float(speech_rate),  # chars/s over voiced duration
+        "syllable_rate": float(syllable_rate),  # approx syllables/s over voiced duration
+        "pause_ratio": float(_clamp(pause_ratio, 0.0, 1.0)),
     }
 
 
@@ -145,152 +213,157 @@ def compute_scaling_ratio(
     overall_max: float = 2.0,
 ) -> dict[str, Any]:
     """
-    计算缩放比例，并应用约束。
+    Compute scaling ratios to match ZH speech rate to EN speech rate.
 
-    ratio 定义：new_duration = ratio * old_duration
-    - ratio < 1: 加速（压缩时长）
-    - ratio > 1: 减速（拉伸时长）
+    ratio definition:
+        ratio = new_duration / old_duration
     """
-    mode_s = str(mode or "single").strip().lower()
-    if mode_s not in {"single", "two_stage", "two-stage"}:
-        mode_s = "single"
-    mode_s = "two_stage" if mode_s in {"two_stage", "two-stage"} else "single"
+    mode_norm = str(mode or "single").strip().lower()
+    if mode_norm not in {"single", "two_stage"}:
+        mode_norm = "single"
 
-    en_syll = float(en_stats.get("syllable_rate", 0.0) or 0.0) if isinstance(en_stats, dict) else 0.0
-    zh_syll = float(zh_stats.get("syllable_rate", 0.0) or 0.0) if isinstance(zh_stats, dict) else 0.0
-
-    voice_raw = _safe_div(zh_syll, en_syll, default=1.0) if (en_syll > 0.0 and zh_syll > 0.0) else 1.0
-    voice = _clamp(voice_raw, float(voice_min), float(voice_max))
-
-    # single: pause scaling == voice scaling
-    if mode_s == "single":
-        overall = _clamp(voice, float(overall_min), float(overall_max))
-        voice = _clamp(overall, float(voice_min), float(voice_max))
-        silence = voice
+    en_rate = _safe_float(en_stats.get("syllable_rate", 0.0), default=0.0)
+    zh_rate = _safe_float(zh_stats.get("syllable_rate", 0.0), default=0.0)
+    if not (en_rate > 0.0 and zh_rate > 0.0):
         return {
-            "mode": "single",
-            "voice_ratio": float(voice),
-            "silence_ratio": float(silence),
-            "overall_ratio": float(voice),
-            "voice_ratio_raw": float(voice_raw),
-            "silence_ratio_raw": float(voice_raw),
-            "clamped": bool(abs(float(voice) - float(voice_raw)) > 1e-6),
+            "voice_ratio": 1.0,
+            "silence_ratio": 1.0,
+            "overall_ratio": 1.0,
+            "voice_ratio_raw": 1.0,
+            "silence_ratio_raw": 1.0,
+            "clamped": False,
         }
 
-    # two-stage: compute pause ratio + solve for silence scaling
-    p_en = float(en_stats.get("pause_ratio", 0.0) or 0.0) if isinstance(en_stats, dict) else 0.0
-    p_en = float(_clamp(p_en, 0.0, 1.0))
+    voice_ratio_raw = float(zh_rate / en_rate)
+    voice_ratio = _clamp(voice_ratio_raw, float(voice_min), float(voice_max))
 
-    v_zh = float(zh_stats.get("voiced_duration", 0.0) or 0.0) if isinstance(zh_stats, dict) else 0.0
-    s_zh = float(zh_stats.get("silence_duration", 0.0) or 0.0) if isinstance(zh_stats, dict) else 0.0
-    t_zh = float(zh_stats.get("total_duration", 0.0) or 0.0) if isinstance(zh_stats, dict) else 0.0
-    if t_zh <= 0.0:
-        t_zh = float(max(v_zh + s_zh, 0.0))
+    V_zh = _safe_float(zh_stats.get("voiced_duration", 0.0), default=0.0)
+    S_zh = _safe_float(zh_stats.get("silence_duration", 0.0), default=0.0)
+    T_zh = float(max(0.0, V_zh + S_zh))
 
-    silence_raw = 1.0
-    if (s_zh > 1e-6) and (0.0 < p_en < 1.0):
-        silence_raw = float((p_en * voice_raw * v_zh) / ((1.0 - p_en) * s_zh))
-    silence = _clamp(silence_raw, float(silence_min), float(silence_max))
+    silence_ratio_raw = float(voice_ratio_raw)
+    silence_ratio = float(voice_ratio)
 
-    def _overall_ratio(v_ratio: float, s_ratio: float) -> float:
-        if t_zh <= 0.0:
-            return float(v_ratio)
-        return float((float(v_ratio) * float(v_zh) + float(s_ratio) * float(s_zh)) / float(t_zh))
+    clamped = (abs(voice_ratio - voice_ratio_raw) > 1e-9)
 
-    overall = _overall_ratio(voice, silence)
+    if mode_norm == "two_stage":
+        p_en = _safe_float(en_stats.get("pause_ratio", 0.0), default=0.0)
+        p_en = float(_clamp(p_en, 0.0, 1.0))
+        if S_zh <= 1e-6:
+            silence_ratio_raw = float(voice_ratio_raw)
+            silence_ratio = float(voice_ratio)
+        else:
+            denom = float(max(1e-6, (1.0 - p_en) * S_zh))
+            silence_ratio_raw = float((p_en * voice_ratio * V_zh) / denom) if p_en > 0 else 0.0
+            silence_ratio = _clamp(silence_ratio_raw, float(silence_min), float(silence_max))
+            if abs(silence_ratio - silence_ratio_raw) > 1e-9:
+                clamped = True
 
-    # Try to satisfy overall bounds by adjusting silence first (voice is more fragile perceptually).
-    overall_lo = float(min(float(overall_min), float(overall_max)))
-    overall_hi = float(max(float(overall_min), float(overall_max)))
-    if (overall < overall_lo - 1e-9) or (overall > overall_hi + 1e-9):
-        target = float(_clamp(overall, overall_lo, overall_hi))
-        if s_zh > 1e-6 and t_zh > 0.0:
-            need_s = _safe_div(target * t_zh - voice * v_zh, s_zh, default=silence)
-            silence = _clamp(need_s, float(silence_min), float(silence_max))
-            overall = _overall_ratio(voice, silence)
-        if (overall < overall_lo - 1e-9) or (overall > overall_hi + 1e-9):
-            if v_zh > 1e-6 and t_zh > 0.0:
-                need_v = _safe_div(target * t_zh - silence * s_zh, v_zh, default=voice)
-                voice = _clamp(need_v, float(voice_min), float(voice_max))
-                overall = _overall_ratio(voice, silence)
-        overall = float(_clamp(overall, overall_lo, overall_hi))
+    if T_zh <= 1e-6:
+        overall_ratio = float(voice_ratio)
+    else:
+        overall_ratio = float((voice_ratio * V_zh + silence_ratio * S_zh) / T_zh)
 
-    clamped = bool(
-        abs(float(voice) - float(voice_raw)) > 1e-6
-        or abs(float(silence) - float(silence_raw)) > 1e-6
-        or (overall < overall_lo - 1e-6)
-        or (overall > overall_hi + 1e-6)
-    )
+    # Enforce overall bounds by adjusting silence ratio first (voice ratio is the critical one).
+    if overall_ratio > float(overall_max) + 1e-9:
+        if S_zh > 1e-6 and T_zh > 1e-6:
+            target = float(overall_max)
+            needed = float((target * T_zh - voice_ratio * V_zh) / S_zh)
+            new_silence = _clamp(needed, float(silence_min), float(silence_max))
+            if abs(new_silence - silence_ratio) > 1e-9:
+                silence_ratio = float(new_silence)
+                clamped = True
+                overall_ratio = float((voice_ratio * V_zh + silence_ratio * S_zh) / T_zh)
+        else:
+            # No silence to adjust: clamp voice ratio within the overall bounds.
+            new_voice = _clamp(voice_ratio, float(max(voice_min, overall_min)), float(min(voice_max, overall_max)))
+            if abs(new_voice - voice_ratio) > 1e-9:
+                voice_ratio = float(new_voice)
+                clamped = True
+            overall_ratio = float(voice_ratio)
+
+    if overall_ratio < float(overall_min) - 1e-9:
+        if S_zh > 1e-6 and T_zh > 1e-6:
+            target = float(overall_min)
+            needed = float((target * T_zh - voice_ratio * V_zh) / S_zh)
+            new_silence = _clamp(needed, float(silence_min), float(silence_max))
+            if abs(new_silence - silence_ratio) > 1e-9:
+                silence_ratio = float(new_silence)
+                clamped = True
+                overall_ratio = float((voice_ratio * V_zh + silence_ratio * S_zh) / T_zh)
+        else:
+            new_voice = _clamp(voice_ratio, float(max(voice_min, overall_min)), float(min(voice_max, overall_max)))
+            if abs(new_voice - voice_ratio) > 1e-9:
+                voice_ratio = float(new_voice)
+                clamped = True
+            overall_ratio = float(voice_ratio)
+
     return {
-        "mode": "two_stage",
-        "voice_ratio": float(voice),
-        "silence_ratio": float(silence),
-        "overall_ratio": float(overall),
-        "voice_ratio_raw": float(voice_raw),
-        "silence_ratio_raw": float(silence_raw),
+        "voice_ratio": float(voice_ratio),
+        "silence_ratio": float(silence_ratio),
+        "overall_ratio": float(overall_ratio),
+        "voice_ratio_raw": float(voice_ratio_raw),
+        "silence_ratio_raw": float(silence_ratio_raw),
         "clamped": bool(clamped),
     }
 
 
-def _read_env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return float(default)
-    s = str(raw).strip()
-    if not s:
-        return float(default)
-    try:
-        return float(s)
-    except Exception:
-        return float(default)
-
-
-def _fade_edges(y: np.ndarray, sr: int, *, fade_ms: float = 5.0) -> np.ndarray:
-    out = np.asarray(y, dtype=np.float32).reshape(-1)
-    n = int(round(float(sr) * float(fade_ms) / 1000.0))
-    if out.size <= 0 or n <= 0:
-        return out
-    n = int(min(n, out.size // 2))
+def _apply_fade(wav: np.ndarray, sr: int, *, fade_ms: float = 5.0) -> np.ndarray:
+    y = np.asarray(wav, dtype=np.float32)
+    n = int(y.shape[0])
     if n <= 0:
-        return out
-    ramp = np.linspace(0.0, 1.0, num=n, dtype=np.float32)
-    out[:n] *= ramp
-    out[-n:] *= ramp[::-1]
-    return out
+        return y
+    fade_n = int(round(float(sr) * float(fade_ms) / 1000.0))
+    fade_n = int(max(0, min(fade_n, n // 4, 2048)))
+    if fade_n <= 1:
+        return y
+    ramp = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+    y[:fade_n] *= ramp
+    y[-fade_n:] *= ramp[::-1]
+    return y
 
 
-def _stretch_audio_array(y: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+def _time_stretch(y: np.ndarray, sr: int, ratio: float) -> np.ndarray:
     """
-    TSM: new_duration = ratio * old_duration.
-    Prefer audiostretchy; fallback to librosa phase-vocoder when needed.
-    """
-    y0 = np.asarray(y, dtype=np.float32).reshape(-1)
-    if y0.size <= 0:
-        return y0
-    ratio_f = float(ratio)
-    if not (ratio_f > 0.0):
-        return y0
-    if abs(ratio_f - 1.0) < 1e-6:
-        return y0
+    TSM with pitch preservation.
 
-    # audiostretchy works on WAV files (via stdlib wave); write PCM16 temp WAV for compatibility.
-    with tempfile.TemporaryDirectory(prefix="youdub_speechrate_") as tmpdir:
-        in_path = os.path.join(tmpdir, "in.wav")
-        out_path = os.path.join(tmpdir, "out.wav")
+    Prefer audiostretchy (quality), fallback to librosa (in-memory).
+    """
+    r = _safe_float(ratio, default=1.0)
+    if not (r > 0.0):
+        r = 1.0
+    r = float(_clamp(r, 0.01, 100.0))
+
+    if abs(r - 1.0) <= 1e-6:
+        return np.asarray(y, dtype=np.float32).reshape(-1)
+
+    tag = f"youdub_tsm_{int(time.time() * 1000)}_{threading.get_ident()}_{uuid.uuid4().hex}"
+    tmp_dir = tempfile.gettempdir()
+    in_path = os.path.join(tmp_dir, f"{tag}_in.wav")
+    out_path = os.path.join(tmp_dir, f"{tag}_out.wav")
+
+    try:
+        save_wav(np.asarray(y, dtype=np.float32).reshape(-1), in_path, sample_rate=int(sr))
+        stretch_audio(in_path, out_path, ratio=float(r), sample_rate=int(sr))
+        y2, _ = librosa.load(out_path, sr=int(sr), mono=True)
+        return np.asarray(y2, dtype=np.float32).reshape(-1)
+    except Exception as exc:
+        logger.warning(f"TSM失败（audiostretchy），回退到librosa: {exc}")
         try:
-            save_wav(y0, in_path, sample_rate=int(sr))
-            stretch_audio(in_path, out_path, ratio=ratio_f, sample_rate=int(sr))
-            y1, _ = librosa.load(out_path, sr=int(sr), mono=True)
-            return np.asarray(y1, dtype=np.float32).reshape(-1)
-        except Exception as exc:
-            logger.warning(f"audiostretchy 拉伸失败 (ratio={ratio_f:.3f}): {exc} (回退到librosa)")
+            # librosa: new_duration = old_duration / rate  => rate = 1 / ratio
+            rate = float(1.0 / max(float(r), 1e-6))
+            y2 = librosa.effects.time_stretch(np.asarray(y, dtype=np.float32).reshape(-1), rate=rate)
+            return np.asarray(y2, dtype=np.float32).reshape(-1)
+        except Exception as exc2:
+            logger.warning(f"TSM失败（librosa），返回原音频: {exc2}")
+            return np.asarray(y, dtype=np.float32).reshape(-1)
+    finally:
+        for p in (in_path, out_path):
             try:
-                rate = float(1.0 / max(ratio_f, 1e-6))
-                y1 = librosa.effects.time_stretch(y0.astype(np.float32, copy=False), rate=rate)
-                return np.asarray(y1, dtype=np.float32).reshape(-1)
-            except Exception as exc2:
-                logger.warning(f"librosa 拉伸失败 (ratio={ratio_f:.3f}): {exc2} (回退到原音频)")
-                return y0
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 
 def apply_scaling_ratio(
@@ -299,83 +372,118 @@ def apply_scaling_ratio(
     ratio: dict[str, Any],
     *,
     mode: str = "single",
+    vad_top_db: float = 30.0,
+    fade_ms: float = 5.0,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
-    对音频应用缩放比例。
-    - single: 整段 TSM
-    - two_stage: 发声段 TSM，静音段按比例裁剪/扩展（用零填充）
+    Apply scaling ratios to audio.
+
+    - single: global TSM with voice_ratio
+    - two_stage:
+        1) global TSM with voice_ratio
+        2) rebuild timeline by re-scaling detected silence spans to silence_ratio
     """
-    y = np.asarray(audio, dtype=np.float32).reshape(-1)
-    sr_i = int(sr)
-    if sr_i <= 0:
-        sr_i = 24000
-
-    voice_ratio = float(ratio.get("voice_ratio", 1.0) or 1.0) if isinstance(ratio, dict) else 1.0
-    silence_ratio = float(ratio.get("silence_ratio", voice_ratio) or voice_ratio) if isinstance(ratio, dict) else voice_ratio
-    mode_s = str(mode or ratio.get("mode", "single") if isinstance(ratio, dict) else "single").strip().lower()
-    mode_s = "two_stage" if mode_s in {"two_stage", "two-stage"} else "single"
-
-    original_duration = float(y.size) / float(sr_i) if y.size > 0 else 0.0
-
-    if mode_s == "single":
-        y1 = _stretch_audio_array(y, sr_i, voice_ratio)
-        target_samples = int(round(float(y.size) * float(voice_ratio)))
-        if target_samples <= 0:
-            y1 = np.zeros((0,), dtype=np.float32)
-        elif y1.size < target_samples:
-            y1 = np.pad(y1, (0, target_samples - int(y1.size)), mode="constant")
-        else:
-            y1 = y1[:target_samples]
-        scaled_duration = float(y1.size) / float(sr_i) if y1.size > 0 else 0.0
-        return y1.astype(np.float32, copy=False), {
-            "original_duration": float(original_duration),
-            "scaled_duration": float(scaled_duration),
-            "voice_ratio_applied": float(voice_ratio),
-            "silence_ratio_applied": float(voice_ratio),
+    sample_rate = int(sr or 0)
+    y0 = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if sample_rate <= 0 or y0.size <= 0:
+        return y0, {
+            "original_duration": 0.0,
+            "scaled_duration": 0.0,
+            "voice_ratio_applied": 1.0,
+            "silence_ratio_applied": 1.0,
         }
 
-    # two-stage
-    top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
-    intervals: np.ndarray
+    voice_ratio = _safe_float(ratio.get("voice_ratio", 1.0), default=1.0)
+    silence_ratio = _safe_float(ratio.get("silence_ratio", voice_ratio), default=voice_ratio)
+    mode_norm = str(mode or "single").strip().lower()
+    if mode_norm not in {"single", "two_stage"}:
+        mode_norm = "single"
+
+    original_duration = float(y0.shape[0]) / float(sample_rate)
+
+    # Always do one global TSM for the voice ratio.
+    y_voice = _time_stretch(y0, sample_rate, voice_ratio)
+    y_voice = np.asarray(y_voice, dtype=np.float32).reshape(-1)
+    scaled_duration = float(y_voice.shape[0]) / float(sample_rate) if y_voice.size > 0 else 0.0
+    voice_ratio_applied = float(y_voice.shape[0]) / float(y0.shape[0]) if y0.shape[0] > 0 else float(voice_ratio)
+
+    if mode_norm == "single" or abs(float(silence_ratio) - float(voice_ratio)) <= 1e-6:
+        return y_voice, {
+            "original_duration": float(original_duration),
+            "scaled_duration": float(scaled_duration),
+            "voice_ratio_applied": float(voice_ratio_applied),
+            "silence_ratio_applied": float(voice_ratio_applied),
+        }
+
+    # two_stage: adjust silence spans
     try:
-        intervals = librosa.effects.split(y, top_db=float(top_db))
+        intervals = librosa.effects.split(y0, top_db=float(vad_top_db))
     except Exception:
         intervals = np.zeros((0, 2), dtype=np.int64)
 
-    chunks: list[np.ndarray] = []
-    pos = 0
-    for s, e in intervals:
-        s_i = int(max(0, int(s)))
-        e_i = int(min(int(y.size), int(e)))
-        if e_i <= s_i:
+    segments: list[tuple[str, int, int]] = []
+    cursor = 0
+    try:
+        for st, ed in intervals:
+            st_i = int(st)
+            ed_i = int(ed)
+            if ed_i <= st_i:
+                continue
+            if st_i > cursor:
+                segments.append(("silence", int(cursor), int(st_i)))
+            segments.append(("voice", int(st_i), int(ed_i)))
+            cursor = int(ed_i)
+    except Exception:
+        segments = []
+        cursor = 0
+
+    if cursor < int(y0.shape[0]):
+        segments.append(("silence", int(cursor), int(y0.shape[0])))
+
+    if not segments:
+        # All silence: just return scaled silence (zeros) by silence_ratio.
+        target = int(round(float(y0.shape[0]) * float(silence_ratio)))
+        target = int(max(0, target))
+        return np.zeros((target,), dtype=np.float32), {
+            "original_duration": float(original_duration),
+            "scaled_duration": float(target) / float(sample_rate) if sample_rate > 0 else 0.0,
+            "voice_ratio_applied": float(voice_ratio_applied),
+            "silence_ratio_applied": float(silence_ratio),
+        }
+
+    # Map original sample indices to y_voice indices using the actually produced global scaling.
+    idx_scale = float(y_voice.shape[0]) / float(y0.shape[0]) if y0.shape[0] > 0 else float(voice_ratio)
+    idx_scale = float(max(1e-6, idx_scale))
+
+    out_chunks: list[np.ndarray] = []
+    for kind, s0, s1 in segments:
+        s0 = int(max(0, min(s0, int(y0.shape[0]))))
+        s1 = int(max(0, min(s1, int(y0.shape[0]))))
+        if s1 <= s0:
             continue
+        orig_len = int(s1 - s0)
 
-        if s_i > pos:
-            sil = y[pos:s_i]
-            new_n = int(round(float(sil.size) * float(silence_ratio)))
-            chunks.append(np.zeros((max(0, new_n),), dtype=np.float32))
-        voice = y[s_i:e_i]
-        voice_stretched = _stretch_audio_array(voice, sr_i, voice_ratio)
-        voice_target = int(round(float(voice.size) * float(voice_ratio)))
-        if voice_target > 0:
-            if voice_stretched.size < voice_target:
-                voice_stretched = np.pad(voice_stretched, (0, voice_target - int(voice_stretched.size)), mode="constant")
-            else:
-                voice_stretched = voice_stretched[:voice_target]
-        chunks.append(_fade_edges(voice_stretched, sr_i, fade_ms=5.0))
-        pos = e_i
+        if kind == "voice":
+            vs = int(round(float(s0) * idx_scale))
+            ve = int(round(float(s1) * idx_scale))
+            vs = int(max(0, min(vs, int(y_voice.shape[0]))))
+            ve = int(max(0, min(ve, int(y_voice.shape[0]))))
+            if ve <= vs:
+                continue
+            chunk = y_voice[vs:ve].astype(np.float32, copy=False)
+            chunk = _apply_fade(chunk, sample_rate, fade_ms=float(fade_ms))
+            out_chunks.append(chunk)
+        else:
+            # Silence: generate clean zeros at the desired scaled length.
+            n = int(round(float(orig_len) * float(silence_ratio)))
+            if n <= 0:
+                continue
+            out_chunks.append(np.zeros((n,), dtype=np.float32))
 
-    if pos < int(y.size):
-        sil = y[pos:]
-        new_n = int(round(float(sil.size) * float(silence_ratio)))
-        chunks.append(np.zeros((max(0, new_n),), dtype=np.float32))
-
-    y1 = np.concatenate(chunks) if chunks else np.zeros((0,), dtype=np.float32)
-    scaled_duration = float(y1.size) / float(sr_i) if y1.size > 0 else 0.0
-    return y1.astype(np.float32, copy=False), {
+    y_out = np.concatenate(out_chunks).astype(np.float32, copy=False) if out_chunks else np.zeros((0,), dtype=np.float32)
+    return y_out, {
         "original_duration": float(original_duration),
-        "scaled_duration": float(scaled_duration),
-        "voice_ratio_applied": float(voice_ratio),
+        "scaled_duration": float(y_out.shape[0]) / float(sample_rate) if sample_rate > 0 else 0.0,
+        "voice_ratio_applied": float(voice_ratio_applied),
         "silence_ratio_applied": float(silence_ratio),
     }
-
