@@ -133,7 +133,8 @@ def compute_zh_speech_rate(
     sr: int,
     text: str,
     *,
-    vad_top_db: float = 30.0,
+    top_db: float = 30.0,
+    vad_top_db: float | None = None,
 ) -> dict[str, Any]:
     """
     Compute Chinese TTS speech stats from audio + text.
@@ -166,8 +167,10 @@ def compute_zh_speech_rate(
     y = y.reshape(-1)
     total_duration = float(total_samples) / float(sample_rate)
 
+    if vad_top_db is not None:
+        top_db = float(vad_top_db)
     try:
-        intervals = librosa.effects.split(y, top_db=float(vad_top_db))
+        intervals = librosa.effects.split(y, top_db=float(top_db))
     except Exception:
         intervals = np.zeros((0, 2), dtype=np.int64)
 
@@ -219,6 +222,8 @@ def compute_scaling_ratio(
         ratio = new_duration / old_duration
     """
     mode_norm = str(mode or "single").strip().lower()
+    if mode_norm in {"two_stage", "two-stage"}:
+        mode_norm = "two_stage"
     if mode_norm not in {"single", "two_stage"}:
         mode_norm = "single"
 
@@ -226,6 +231,7 @@ def compute_scaling_ratio(
     zh_rate = _safe_float(zh_stats.get("syllable_rate", 0.0), default=0.0)
     if not (en_rate > 0.0 and zh_rate > 0.0):
         return {
+            "mode": mode_norm,
             "voice_ratio": 1.0,
             "silence_ratio": 1.0,
             "overall_ratio": 1.0,
@@ -299,6 +305,7 @@ def compute_scaling_ratio(
             overall_ratio = float(voice_ratio)
 
     return {
+        "mode": mode_norm,
         "voice_ratio": float(voice_ratio),
         "silence_ratio": float(silence_ratio),
         "overall_ratio": float(overall_ratio),
@@ -401,11 +408,20 @@ def apply_scaling_ratio(
 
     original_duration = float(y0.shape[0]) / float(sample_rate)
 
-    # Always do one global TSM for the voice ratio.
+    # Always do one global TSM for the voice ratio, then pad/trim to exact target samples.
+    target_voice_samples = int(round(float(y0.shape[0]) * float(voice_ratio)))
+    target_voice_samples = int(max(0, target_voice_samples))
     y_voice = _time_stretch(y0, sample_rate, voice_ratio)
     y_voice = np.asarray(y_voice, dtype=np.float32).reshape(-1)
+    if target_voice_samples <= 0:
+        y_voice = np.zeros((0,), dtype=np.float32)
+    elif y_voice.shape[0] < target_voice_samples:
+        y_voice = np.pad(y_voice, (0, target_voice_samples - int(y_voice.shape[0])), mode="constant")
+    else:
+        y_voice = y_voice[:target_voice_samples]
+
     scaled_duration = float(y_voice.shape[0]) / float(sample_rate) if y_voice.size > 0 else 0.0
-    voice_ratio_applied = float(y_voice.shape[0]) / float(y0.shape[0]) if y0.shape[0] > 0 else float(voice_ratio)
+    voice_ratio_applied = float(voice_ratio)
 
     if mode_norm == "single" or abs(float(silence_ratio) - float(voice_ratio)) <= 1e-6:
         return y_voice, {
