@@ -542,6 +542,13 @@ def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~
 
         buffer["text"] = (str(buffer.get("text", "")).strip() + " " + str(segment.get("text", "")).strip()).strip()
         buffer["end"] = segment.get("end", buffer.get("end"))
+        # Merge word-level timestamps only when both sides have them.
+        buf_words = buffer.get("words")
+        seg_words = segment.get("words")
+        if buf_words is None or seg_words is None:
+            buffer["words"] = None
+        else:
+            buffer["words"] = list(buf_words) + list(seg_words)
 
     if buffer is not None:
         merged.append(buffer)
@@ -912,12 +919,32 @@ def transcribe_audio(
             text = (getattr(seg, "text", "") or "").strip()
             if not text:
                 continue
+            words = getattr(seg, "words", None)
+            words_data: list[dict[str, Any]] | None = None
+            if words:
+                words_data = []
+                for w in words:
+                    if w is None:
+                        continue
+                    words_data.append(
+                        {
+                            "start": float(getattr(w, "start", 0.0) or 0.0),
+                            "end": float(getattr(w, "end", 0.0) or 0.0),
+                            "word": str(getattr(w, "word", "") or ""),
+                            "probability": (
+                                float(getattr(w, "probability", 0.0) or 0.0)
+                                if getattr(w, "probability", None) is not None
+                                else None
+                            ),
+                        }
+                    )
             transcript.append(
                 {
                     "start": float(getattr(seg, "start", 0.0)),
                     "end": float(getattr(seg, "end", 0.0)),
                     "text": text,
                     "speaker": "SPEAKER_00",
+                    "words": words_data,
                 }
             )
 
