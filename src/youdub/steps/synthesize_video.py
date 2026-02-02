@@ -5,17 +5,17 @@ import re
 import subprocess
 import threading
 import time
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
 
 import librosa
 import numpy as np
-from audiostretchy.stretch import stretch_audio
-from scipy.signal import butter, find_peaks, sosfiltfilt
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
+from ..speech_rate import apply_scaling_ratio, compute_en_speech_rate, compute_scaling_ratio, compute_zh_speech_rate
 from ..utils import save_wav, save_wav_norm, valid_file
 
 
@@ -30,8 +30,9 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 #     log original voice/BGM loudness + ratio to make debugging easy.
 # v6: improve window search by probing stems first (avoid missing music-heavy moments).
 # v7: adaptive mode aligns instruments per adaptive_plan (fix BGM drift vs stretched video).
-# v8: adaptive mode derives per-segment targets from syllable stats and stretches TTS per segment.
-_AUDIO_COMBINED_MIX_VERSION = 8
+# v8: adaptive mode optionally applies speech-rate based TTS time-scale modification (TSM) per segment.
+# v9: refine speech-rate alignment metadata and clamp behavior.
+_AUDIO_COMBINED_MIX_VERSION = 9
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -1148,226 +1149,6 @@ def _atempo_chain(tempo: float) -> list[str]:
     return out or ["atempo=1.0"]
 
 
-def _estimate_syllable_nuclei_count(
-    y: np.ndarray,
-    sr: int,
-    *,
-    analysis_sr: int = 16000,
-    frame_length_ms: float = 25.0,
-    hop_length_ms: float = 10.0,
-    bandpass: bool = True,
-    bandpass_low_hz: float = 500.0,
-    bandpass_high_hz: float = 4000.0,
-    ignorance_db: float = 2.0,
-    min_dip_db: float = 4.0,
-    min_distance_s: float = 0.10,
-    voiced_filter: bool = True,
-) -> int:
-    """
-    Estimate syllable nuclei count using an intensity-peaks heuristic (de Jong & Wempe style).
-
-    This is a best-effort statistic used to derive per-segment stretch ratios. It must be robust
-    (never crash the pipeline) rather than perfect.
-    """
-    yy = np.asarray(y, dtype=np.float32).reshape(-1)
-    if yy.size <= 0:
-        return 0
-
-    # Defensive cleanup: avoid NaNs/inf poisoning downstream median/peak detection.
-    if not np.isfinite(yy).all():
-        yy = np.nan_to_num(yy, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-
-    sr0 = int(sr) if int(sr) > 0 else 16000
-    sr_a = int(analysis_sr) if int(analysis_sr) > 0 else 16000
-
-    y_a = yy
-    sr_use = sr0
-    if sr0 != sr_a:
-        try:
-            y_a = librosa.resample(y_a, orig_sr=sr0, target_sr=sr_a).astype(np.float32, copy=False)
-            sr_use = sr_a
-        except Exception:
-            y_a = yy
-            sr_use = sr0
-
-    # Bandpass filtering improves robustness on mixed/noisy recordings.
-    if bandpass and sr_use > 0 and y_a.size > 32:
-        try:
-            nyq = 0.5 * float(sr_use)
-            lo = float(bandpass_low_hz) / nyq
-            hi = float(bandpass_high_hz) / nyq
-            lo = float(max(1e-5, min(lo, 0.999)))
-            hi = float(max(1e-5, min(hi, 0.999)))
-            if lo < hi:
-                sos = butter(4, [lo, hi], btype="bandpass", output="sos")
-                # sosfiltfilt can fail for very short arrays; best-effort only.
-                y_a = sosfiltfilt(sos, y_a).astype(np.float32, copy=False)
-        except Exception:
-            pass
-
-    # Intensity contour (RMS -> dB), roughly matching Praat defaults (10ms step).
-    fl = int(round(float(frame_length_ms) * 1e-3 * float(sr_use)))
-    hl = int(round(float(hop_length_ms) * 1e-3 * float(sr_use)))
-    hl = max(1, hl)
-    fl = max(hl + 1, fl)
-
-    try:
-        rms = librosa.feature.rms(y=y_a, frame_length=int(fl), hop_length=int(hl), center=False)[0]
-    except Exception:
-        return 0
-    if rms.size <= 0:
-        return 0
-
-    eps = 1e-10
-    intensity_db = (20.0 * np.log10(np.maximum(rms.astype(np.float32, copy=False), eps))).astype(np.float32, copy=False)
-    finite = np.isfinite(intensity_db)
-    if not bool(np.any(finite)):
-        return 0
-
-    med = float(np.median(intensity_db[finite]))
-    th = float(med + float(ignorance_db))
-
-    hop_s = float(hl) / float(sr_use) if sr_use > 0 else 0.01
-    dist_frames = int(round(float(min_distance_s) / max(1e-6, hop_s)))
-    dist_frames = max(1, dist_frames)
-
-    try:
-        peaks, _props = find_peaks(
-            intensity_db.astype(np.float64, copy=False),
-            height=float(th),
-            prominence=float(min_dip_db),
-            distance=int(dist_frames),
-        )
-    except Exception:
-        peaks = np.asarray([], dtype=np.int64)
-
-    peaks = np.asarray(peaks, dtype=np.int64)
-    if peaks.size <= 0:
-        return 0
-
-    # Optionally discard unvoiced peaks (reduces false positives on loud fricatives).
-    if voiced_filter:
-        try:
-            fmin = 50.0
-            fmax = min(500.0, max(fmin + 10.0, float(sr_use) * 0.5 - 1.0))
-            if fmax > fmin:
-                # `pyin` needs at least ~2 periods of fmin within a frame.
-                # Keep hop_length consistent with the intensity contour; allow a larger frame_length here.
-                # Round up to a power-of-two (faster STFT, avoids librosa warnings).
-                py_min = int(math.ceil(2.0 * float(sr_use) / float(fmin)) + 1.0)
-                py_fl = int(max(int(fl), int(py_min)))
-                py_fl = int(1 << int(max(1, py_fl - 1)).bit_length())
-                py_fl = int(max(128, min(py_fl, 8192)))
-                _f0, voiced_flag, _voiced_prob = librosa.pyin(
-                    y_a,
-                    fmin=float(fmin),
-                    fmax=float(fmax),
-                    sr=int(sr_use),
-                    frame_length=int(py_fl),
-                    hop_length=int(hl),
-                    center=False,
-                )
-                if voiced_flag is not None:
-                    vf = np.asarray(voiced_flag, dtype=bool)
-                    m = int(min(vf.shape[0], intensity_db.shape[0]))
-                    if m > 0:
-                        peaks = peaks[peaks < m]
-                        peaks = peaks[vf[:m][peaks]]
-        except Exception:
-            pass
-
-    return int(peaks.size)
-
-
-def _load_audio_slice(path: str, *, sr: int, start: float, end: float) -> np.ndarray:
-    if not path or not os.path.exists(path):
-        return np.zeros((0,), dtype=np.float32)
-    try:
-        s0 = float(start)
-        s1 = float(end)
-    except Exception:
-        return np.zeros((0,), dtype=np.float32)
-    if s1 < s0:
-        s0, s1 = s1, s0
-    s0 = max(0.0, float(s0))
-    s1 = max(0.0, float(s1))
-    dur = float(s1 - s0)
-    if not (dur > 1e-6):
-        return np.zeros((0,), dtype=np.float32)
-    try:
-        y, _ = librosa.load(path, sr=int(sr), mono=True, offset=float(s0), duration=float(dur))
-        return y.astype(np.float32, copy=False)
-    except Exception:
-        return np.zeros((0,), dtype=np.float32)
-
-
-def _stretch_audio_to_samples(
-    folder: str,
-    y: np.ndarray,
-    *,
-    sample_rate: int,
-    target_samples: int,
-) -> np.ndarray:
-    n_target = int(target_samples)
-    if n_target <= 0:
-        return np.zeros((0,), dtype=np.float32)
-
-    yy = np.asarray(y, dtype=np.float32).reshape(-1)
-    if yy.size <= 0:
-        return np.zeros((n_target,), dtype=np.float32)
-    if yy.size == n_target:
-        return yy.astype(np.float32, copy=False)
-
-    ratio = float(n_target) / float(yy.size)
-    ratio = float(max(0.01, min(ratio, 100.0)))
-
-    tag = f"{time.time_ns()}_{threading.get_ident()}"
-    in_path = os.path.join(folder, f".tts_stretch_in_{tag}.wav")
-    out_path = os.path.join(folder, f".tts_stretch_out_{tag}.wav")
-
-    y_out: np.ndarray | None = None
-    try:
-        y_save = yy
-        # Avoid int16 overflow when writing temp WAVs.
-        try:
-            peak = max(abs(float(np.max(y_save))), abs(float(np.min(y_save)))) if y_save.size > 0 else 0.0
-            if peak > 0.99:
-                y_save = (y_save * np.float32(0.99 / peak)).astype(np.float32, copy=False)
-        except Exception:
-            pass
-
-        save_wav(y_save.astype(np.float32, copy=False), in_path, sample_rate=int(sample_rate))
-        stretch_audio(in_path, out_path, ratio=float(ratio), sample_rate=int(sample_rate))
-        y_out, _ = librosa.load(out_path, sr=int(sample_rate), mono=True)
-        y_out = y_out.astype(np.float32, copy=False)
-    except Exception:
-        # Fallback: in-memory time-stretch via librosa (phase vocoder).
-        try:
-            rate = float(1.0 / ratio) if ratio > 0 else 1.0
-            rate = float(max(0.01, min(rate, 100.0)))
-            y_out = librosa.effects.time_stretch(yy.astype(np.float32, copy=False), rate=rate).astype(np.float32, copy=False)
-        except Exception:
-            y_out = yy.astype(np.float32, copy=False)
-    finally:
-        # Best-effort cleanup of temp files.
-        for p in (in_path, out_path):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-
-    if y_out is None:
-        y_out = yy.astype(np.float32, copy=False)
-
-    # Ensure exact samples to keep timeline stable.
-    if y_out.shape[0] < n_target:
-        y_out = np.pad(y_out, (0, n_target - y_out.shape[0]), mode="constant")
-    else:
-        y_out = y_out[:n_target]
-    return y_out.astype(np.float32, copy=False)
-
-
 def _run_process_with_cancel(cmd: list[str]) -> None:
     """
     Run a subprocess while keeping cancellation responsive.
@@ -1545,10 +1326,9 @@ def _ensure_audio_combined(
     生成 audio_combined.wav 和 audio_tts.wav
     
     如果 adaptive_segment_stretch=True:
-        - 逐段裁剪 TTS 首尾静音，并基于“音节核”统计估计每段目标时长
-        - 逐段拉伸/压缩 TTS 到目标时长（优先 audiostretchy；失败回退 librosa）
-        - 插入短停顿，生成 translation_adaptive.json（输出时间轴）
-        - 同时生成 adaptive_plan.json（speech + pause），用于视频/BGM 逐段对齐并 concat
+        - 不使用相位声码器 time_stretch（避免“回音/空洞”感）；可选使用 audiostretchy 做 TSM 语速对齐
+        - 逐段拼接（可裁剪首尾静音）并插入短停顿，生成 translation_adaptive.json
+        - 同时生成 adaptive_plan.json，用于逐段拉伸/裁剪原视频并 concat
     否则:
         - 按顺序拼接TTS音频片段
     """
@@ -1593,21 +1373,73 @@ def _ensure_audio_combined(
         )
     
     if adaptive_segment_stretch:
-        # 自适应模式：逐段裁剪 + 按音节统计估计 target_duration，并将 TTS 逐段变速到该时长。
+        # 自适应模式：保持 TTS 基本原速（仅做静音裁剪），通过“拉伸视频段”来匹配每段音频时长。
         trim_top_db = 35.0
         gap_default_s = 0.12
         gap_clause_s = 0.18
         gap_sentence_s = 0.25
-        analysis_sr = 16000
-        ratio_min = 0.7
-        ratio_max = 2.2
-        use_voiced_filter = False
 
-        vocals_src = os.path.join(folder, "audio_vocals.wav")
-        mix_src = os.path.join(folder, "audio.wav")
-        src_audio_path = vocals_src if os.path.exists(vocals_src) else (mix_src if os.path.exists(mix_src) else "")
-        syllable_ratio_samples: list[float] = []
-        syllable_ratio_median: float | None = None
+        def _read_env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return bool(default)
+            s = str(raw).strip().lower()
+            if not s:
+                return bool(default)
+            return s not in {"0", "false", "no", "off"}
+
+        def _read_env_float(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return float(default)
+            s = str(raw).strip()
+            if not s:
+                return float(default)
+            try:
+                return float(s)
+            except Exception:
+                return float(default)
+
+        # Optional: speech-rate based TTS time-scale modification (TSM) to match EN pacing.
+        align_enabled = _read_env_bool("SPEECH_RATE_ALIGN_ENABLED", True)
+        align_mode = str(os.getenv("SPEECH_RATE_ALIGN_MODE", "single") or "single").strip().lower()
+        voice_min = _read_env_float("SPEECH_RATE_VOICE_MIN_RATIO", 0.7)
+        voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.3)
+        silence_min = _read_env_float("SPEECH_RATE_SILENCE_MIN_RATIO", 0.3)
+        silence_max = _read_env_float("SPEECH_RATE_SILENCE_MAX_RATIO", 3.0)
+        overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
+        overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
+        align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
+        zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
+
+        # Build an index of ASR word-level timestamps from transcript.json (if available).
+        transcript_words: list[dict[str, Any]] = []
+        transcript_word_starts: list[float] = []
+        if align_enabled:
+            transcript_path = os.path.join(folder, "transcript.json")
+            if os.path.exists(transcript_path):
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as f:
+                        transcript_src = json.load(f)
+                    if isinstance(transcript_src, list):
+                        for item in transcript_src:
+                            if not isinstance(item, dict):
+                                continue
+                            words = item.get("words")
+                            if not isinstance(words, list):
+                                continue
+                            for w in words:
+                                if not isinstance(w, dict):
+                                    continue
+                                if "start" not in w or "end" not in w:
+                                    continue
+                                transcript_words.append(w)
+                    transcript_words.sort(key=lambda w: float(w.get("start", 0.0) or 0.0))
+                    transcript_word_starts = [float(w.get("start", 0.0) or 0.0) for w in transcript_words]
+                except Exception as exc:
+                    logger.warning(f"读取 transcript.json 的词级时间戳失败，将跳过语速对齐: {exc}")
+                    transcript_words = []
+                    transcript_word_starts = []
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1662,57 +1494,73 @@ def _ensure_audio_combined(
             if orig_end < orig_start:
                 orig_start, orig_end = orig_end, orig_start
 
-            # Derive target duration from syllable-count statistics (best-effort).
-            src_dur = float(orig_end - orig_start)
-            if not (src_dur > 1e-6):
-                src_dur = 0.001
+            ratio_info: dict[str, Any] | None = None
+            en_stats: dict[str, Any] | None = None
+            zh_stats: dict[str, Any] | None = None
 
-            tts_raw_samples = int(tts_audio.shape[0])
-            tts_raw_dur = float(tts_raw_samples) / float(sample_rate) if tts_raw_samples > 0 else 0.0
+            # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
+            if align_enabled and transcript_words and tts_audio.size > 0:
+                # Collect words that overlap this segment's [orig_start, orig_end).
+                en_words: list[dict[str, Any]] = []
+                j0 = max(int(bisect_left(transcript_word_starts, orig_start)) - 1, 0) if transcript_word_starts else 0
+                for j in range(j0, len(transcript_words)):
+                    w = transcript_words[j]
+                    try:
+                        ws = float(w.get("start", 0.0) or 0.0)
+                        if ws >= orig_end:
+                            break
+                        we = float(w.get("end", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    if we > orig_start and ws < orig_end:
+                        en_words.append(w)
 
-            src_syll = 0
-            if src_audio_path:
-                src_y = _load_audio_slice(src_audio_path, sr=int(analysis_sr), start=float(orig_start), end=float(orig_end))
-                if src_y.size > 0:
-                    src_syll = _estimate_syllable_nuclei_count(
-                        src_y, int(analysis_sr), voiced_filter=bool(use_voiced_filter)
-                    )
+                if en_words:
+                    try:
+                        en_stats = compute_en_speech_rate(en_words)
+                    except Exception as exc:
+                        logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
+                        en_stats = None
 
-            tts_syll = (
-                _estimate_syllable_nuclei_count(tts_audio, int(sample_rate), voiced_filter=False) if tts_raw_samples > 0 else 0
-            )
-
-            ratio_method = "syllables"
-            if src_syll > 0 and tts_syll > 0:
-                ratio = float(tts_syll) / float(max(1, src_syll))
-                # Keep a running median for fallback on segments where syllable counting fails.
-                if 0.05 <= ratio <= 20.0:
-                    syllable_ratio_samples.append(float(ratio))
-                    if len(syllable_ratio_samples) >= 3:
-                        try:
-                            syllable_ratio_median = float(
-                                np.median(np.asarray(syllable_ratio_samples, dtype=np.float32))
+                if en_stats:
+                    try:
+                        zh_text = str(seg.get("translation") or "")
+                        zh_stats = compute_zh_speech_rate(tts_audio, sample_rate, zh_text, top_db=zh_vad_top_db)
+                        ratio_info = compute_scaling_ratio(
+                            en_stats,
+                            zh_stats,
+                            mode=align_mode,
+                            voice_min=voice_min,
+                            voice_max=voice_max,
+                            silence_min=silence_min,
+                            silence_max=silence_max,
+                            overall_min=overall_min,
+                            overall_max=overall_max,
+                        )
+                        if abs(float(ratio_info.get("voice_ratio", 1.0)) - 1.0) > float(align_threshold) or abs(
+                            float(ratio_info.get("silence_ratio", 1.0)) - 1.0
+                        ) > float(align_threshold):
+                            tts_audio, _scale_info = apply_scaling_ratio(
+                                tts_audio, sample_rate, ratio_info, mode=str(ratio_info.get("mode", align_mode))
                             )
-                        except Exception:
-                            pass
-            elif syllable_ratio_median is not None:
-                ratio_method = "median_syllables"
-                ratio = float(syllable_ratio_median)
-            else:
-                ratio_method = "duration"
-                ratio = float(tts_raw_dur) / float(max(0.001, src_dur)) if tts_raw_dur > 0 else 1.0
+                            if bool(ratio_info.get("clamped")):
+                                logger.warning(
+                                    f"段落 {i}: 语速比例已触发 clamp "
+                                    f"(voice={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{ratio_info.get('voice_ratio', 1.0):.3f}, "
+                                    f"silence={ratio_info.get('silence_ratio_raw', 1.0):.3f}->{ratio_info.get('silence_ratio', 1.0):.3f})"
+                                )
+                    except Exception as exc:
+                        logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
+                        ratio_info = None
+                        en_stats = None
+                        zh_stats = None
 
-            ratio = float(max(float(ratio_min), min(float(ratio), float(ratio_max))))
-            target_samples = int(round(float(src_dur) * float(ratio) * float(sample_rate)))
-            if target_samples <= 0:
-                target_samples = int(round(0.001 * float(sample_rate)))
-            target_duration = float(target_samples) / float(sample_rate)
+            # Output speech duration is exactly the (trimmed + optionally stretched) TTS segment duration.
+            target_samples = int(tts_audio.shape[0])
+            target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
 
-            tts_stretched = _stretch_audio_to_samples(
-                folder, tts_audio, sample_rate=int(sample_rate), target_samples=int(target_samples)
-            )
             if target_samples > 0:
-                audio_chunks.append(tts_stretched.astype(np.float32, copy=False))
+                audio_chunks.append(tts_audio.astype(np.float32, copy=False))
 
             # Record adaptive translation (speech segments only).
             start_s = float(t_cursor_samples) / float(sample_rate)
@@ -1731,13 +1579,14 @@ def _ensure_audio_combined(
                     "src_end": round(orig_end, 6),
                     "target_duration": round(target_duration, 6),
                     "target_samples": int(target_samples),
-                    "src_syllables": int(src_syll),
-                    "tts_syllables": int(tts_syll),
-                    "syllable_ratio": round(float(ratio), 6),
-                    "ratio_method": str(ratio_method),
-                    "tts_raw_duration": round(float(tts_raw_dur), 6),
-                    "tts_raw_samples": int(tts_raw_samples),
-                    "tts_stretch_ratio": round(float(target_samples) / float(max(1, tts_raw_samples)), 6),
+                    "speech_rate_mode": (ratio_info.get("mode") if ratio_info else None),
+                    "voice_ratio": (round(float(ratio_info.get("voice_ratio", 1.0)), 6) if ratio_info else None),
+                    "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
+                    "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
+                    "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
+                    "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
+                    "speech_rate_zh": (round(float(zh_stats.get("syllable_rate", 0.0)), 6) if zh_stats else None),
+                    "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
                 }
             )
 
