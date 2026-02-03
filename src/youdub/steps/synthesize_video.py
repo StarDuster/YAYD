@@ -899,7 +899,6 @@ def generate_monolingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
     *,
-    speed_up: float = 1.0,
     play_res_x: int = 1920,
     play_res_y: int = 1080,
     font_name: str = "Arial",
@@ -931,8 +930,8 @@ def generate_monolingual_ass(
         if not zh_raw:
             continue
 
-        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0) / float(speed_up))
-        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0) / float(speed_up))
+        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0))
+        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0))
 
         zh = _ass_escape_text(wrap_text(zh_raw, max_chars_zh=max_chars_zh, max_chars_en=max_chars_zh)).replace(
             "\n", r"\N"
@@ -950,7 +949,6 @@ def generate_bilingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
     *,
-    speed_up: float = 1.0,
     play_res_x: int = 1920,
     play_res_y: int = 1080,
     font_name: str = "Arial",
@@ -983,8 +981,8 @@ def generate_bilingual_ass(
         if not zh_raw and not en_raw:
             continue
 
-        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0) / float(speed_up))
-        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0) / float(speed_up))
+        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0))
+        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0))
 
         zh = _ass_escape_text(wrap_text(zh_raw, max_chars_zh=max_chars_zh, max_chars_en=max_chars_en)).replace(
             "\n", r"\N"
@@ -1007,7 +1005,6 @@ def generate_bilingual_ass(
 def generate_srt(
     translation: list[dict[str, Any]], 
     srt_path: str, 
-    speed_up: float = 1.0, 
     max_line_char: int = 55,
     bilingual_subtitle: bool = False,
     max_chars_zh: int | None = None,
@@ -1032,8 +1029,8 @@ def generate_srt(
     with open(srt_path, 'w', encoding='utf-8') as f:
         seq = 0
         for line in translation:
-            start = format_timestamp(line['start'] / speed_up)
-            end = format_timestamp(line['end'] / speed_up)
+            start = format_timestamp(line["start"])
+            end = format_timestamp(line["end"])
             tr_text = str(line.get('translation', '') or '').strip()
             src_text = (
                 _bilingual_source_text(str(line.get("text", "") or ""))
@@ -2234,12 +2231,9 @@ def synthesize_video(
 
     srt_path = os.path.join(folder, 'subtitles.srt')
     if subtitles:
-        # 自适应模式下，translation_adaptive.json 已经在输出时间轴，不应再做 speed_up 缩放。
-        subs_speed = 1.0 if adaptive_segment_stretch else speed_up
         generate_srt(
             translation,
             srt_path,
-            subs_speed,
             bilingual_subtitle=bilingual_subtitle,
             max_chars_zh=max_chars_zh,
             max_chars_en=max_chars_en,
@@ -2257,7 +2251,6 @@ def synthesize_video(
             generate_bilingual_ass(
                 translation,
                 ass_path,
-                speed_up=(1.0 if adaptive_segment_stretch else speed_up),
                 play_res_x=width,
                 play_res_y=height,
                 font_name="Arial",
@@ -2272,7 +2265,6 @@ def synthesize_video(
             generate_monolingual_ass(
                 translation,
                 ass_path,
-                speed_up=(1.0 if adaptive_segment_stretch else speed_up),
                 play_res_x=width,
                 play_res_y=height,
                 font_name="Arial",
