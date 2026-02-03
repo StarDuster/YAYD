@@ -2335,13 +2335,11 @@ def synthesize_video(
         with open(filter_script_path, "w", encoding="utf-8") as f:
             f.write(";\n".join(lines) + "\n")
     else:
-        # Legacy global speed-up path (video+audio).
-        video_speed_filter = f"setpts=PTS/{speed_up}"
-        audio_speed_filter = f"atempo={speed_up}"
-        v_filters: list[str] = [video_speed_filter, f"scale={width}:{height}"]
+        # Non-adaptive path: no global speed-up, only scale + optional subtitles.
+        v_filters: list[str] = [f"scale={width}:{height}"]
         if subtitles:
             v_filters.append(subtitle_filter)
-        filter_complex = f"[0:v]{','.join(v_filters)}[v];[1:a]{audio_speed_filter}[a]"
+        filter_complex = f"[0:v]{','.join(v_filters)}[v]"
         
     video_encoder = "h264_nvenc" if use_nvenc else "libx264"
     # 音频编码参数：上采样到 48kHz 并使用较高码率以保证音质
@@ -2393,7 +2391,7 @@ def synthesize_video(
             "-map",
             "[v]",
             "-map",
-            "[a]",
+            "1:a",
             "-r",
             str(fps),
             "-c:v",
