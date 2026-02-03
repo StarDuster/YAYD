@@ -11,8 +11,10 @@ from typing import Any
 
 import librosa
 import numpy as np
+import pronouncing
 from audiostretchy.stretch import stretch_audio
 from loguru import logger
+from pypinyin import Style, pinyin
 
 from .utils import save_wav
 
@@ -57,6 +59,74 @@ def _count_zh_units(text: str) -> int:
     if not s:
         return 0
     return int(sum(1 for ch in s if ch.isalnum()))
+
+
+def _fallback_syllable_count(word: str) -> int:
+    """
+    Rule-based syllable count fallback for English OOV words.
+
+    Heuristic:
+    - count vowel groups [aeiouy]+
+    - drop silent trailing 'e' (except *le endings)
+    - always return at least 1 for non-empty words
+    """
+    w = re.sub(r"[^a-z]+", "", str(word or "").lower())
+    if not w:
+        return 0
+    if len(w) > 2 and w.endswith("e") and not w.endswith("le"):
+        w = w[:-1]
+    groups = re.findall(r"[aeiouy]+", w)
+    return int(max(1, len(groups)))
+
+
+def count_en_syllables(text: str) -> int:
+    """
+    Count English syllables using CMUdict (via `pronouncing`) with a rule-based fallback.
+    """
+    tokens = re.findall(r"[A-Za-z]+", str(text or ""))
+    if not tokens:
+        return 0
+    total = 0
+    for tok in tokens:
+        w = tok.lower()
+        try:
+            phones = pronouncing.phones_for_word(w)
+        except Exception:
+            phones = []
+        if phones:
+            # CMUdict: vowels carry lexical stress markers (0/1/2).
+            try:
+                total += int(sum(1 for p in str(phones[0]).split() if p and p[-1].isdigit()))
+                continue
+            except Exception:
+                pass
+        total += _fallback_syllable_count(w)
+    return int(max(1, total))
+
+
+def count_zh_syllables(text: str) -> int:
+    """
+    Count Chinese syllables:
+    - Hanzi: use pypinyin and count produced pinyin tokens (errors='ignore' skips non-Hanzi).
+    - Latin words: count English syllables (CMUdict + fallback).
+    - Digits: count each digit as 1 syllable (very rough but stable).
+    """
+    s = str(text or "")
+    if not s.strip():
+        return 0
+
+    cjk_count = 0
+    try:
+        py = pinyin(s, style=Style.NORMAL, heteronym=False, errors="ignore")
+        cjk_count = int(sum(1 for item in py if item and item[0]))
+    except Exception:
+        # Fallback: count CJK Unified Ideographs.
+        cjk_count = int(sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff"))
+
+    latin_words = re.findall(r"[A-Za-z]+", s)
+    latin_count = int(sum(count_en_syllables(w) for w in latin_words)) if latin_words else 0
+    digit_count = int(sum(1 for ch in s if ch.isdigit()))
+    return int(cjk_count + latin_count + digit_count)
 
 
 def compute_en_speech_rate(
