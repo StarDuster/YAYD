@@ -35,7 +35,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v11: switch to subtitle syllable counting for speech rate alignment.
 # v12: normalize EN syllable counting for numbers/initialisms (affects alignment ratios).
 # v13: use VAD-based voiced duration + global bias for alignment (avoid overall pacing drift).
-_AUDIO_COMBINED_MIX_VERSION = 13
+# v14: blend speech-rate ratio with time-budget ratio (stabilize per-segment pacing).
+_AUDIO_COMBINED_MIX_VERSION = 14
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
