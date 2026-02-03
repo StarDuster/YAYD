@@ -31,8 +31,6 @@ settings = Settings()
 model_manager = ModelManager(settings)
 pipeline = VideoPipeline(settings=settings, model_manager=model_manager)
 
-DEFAULT_SPEED_UP = 1.2
-
 # --- Gradio UI（中文）---
 _RESOLUTION_CHOICES = ["4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"]
 _DEVICE_CHOICES = [("自动", "auto"), ("GPU", "cuda"), ("CPU", "cpu")]
@@ -116,73 +114,6 @@ _AUTO_SCROLL_JS = r"""
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
-
-  // 监听“按段自适应拉伸”checkbox，禁用/灰化同一页的“加速倍率”slider。
-  // TabbedInterface 会同时挂载多个页面，因此这里显式绑定两组（全自动 / 视频合成）。
-  const setupAdaptiveStretchToggles = () => {
-    const pairs = [
-      {
-        checkboxSelector: "#adaptive-stretch-checkbox input[type='checkbox']",
-        sliderId: "speed-up-slider",
-      },
-      {
-        checkboxSelector: "#adaptive-stretch-checkbox-synthesize input[type='checkbox']",
-        sliderId: "speed-up-slider-synthesize",
-      },
-    ];
-
-    let anyFound = false;
-    let allReady = true;
-
-    pairs.forEach(({ checkboxSelector, sliderId }) => {
-      const checkbox = document.querySelector(checkboxSelector);
-      const sliderContainer = document.getElementById(sliderId);
-      if (!checkbox || !sliderContainer) {
-        allReady = false;
-        return;
-      }
-      anyFound = true;
-
-      // Avoid duplicate binding across retries.
-      if (checkbox.dataset.youdubAdaptiveBound === sliderId) return;
-
-      const setDisabled = (disabled) => {
-        sliderContainer.classList.toggle("youdub-disabled", !!disabled);
-        sliderContainer.setAttribute("aria-disabled", disabled ? "true" : "false");
-
-        // Gradio slider 通常包含 range + number + reset button；统一禁用。
-        const controls = sliderContainer.querySelectorAll("input, button, select, textarea");
-        controls.forEach((el) => {
-          try {
-            el.disabled = !!disabled;
-          } catch (e) {}
-          try {
-            el.setAttribute("aria-disabled", disabled ? "true" : "false");
-          } catch (e) {}
-        });
-      };
-
-      const update = () => {
-        const isAdaptive = !!checkbox.checked;
-        setDisabled(isAdaptive);
-      };
-
-      checkbox.addEventListener("change", update);
-      update();
-      checkbox.dataset.youdubAdaptiveBound = sliderId;
-    });
-
-    // Wait until both pages are mounted so both bindings work reliably.
-    return anyFound && allReady;
-  };
-
-  // 重试直到元素就绪（Gradio 动态加载/切 tab 时会延迟挂载）
-  const trySetup = () => {
-    if (!setupAdaptiveStretchToggles()) {
-      setTimeout(trySetup, 500);
-    }
-  };
-  trySetup();
 })();
 """
 
@@ -197,16 +128,6 @@ _OUTPUT_CSS = r"""
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
   line-height: 1.4;
-}
-
-/* 通用禁用态：用于“启用自适应拉伸后，加速倍率无效”的灰化展示 */
-.youdub-disabled {
-  opacity: 0.5 !important;
-  filter: grayscale(1) !important;
-}
-.youdub-disabled * {
-  pointer-events: none !important;
-  cursor: not-allowed !important;
 }
 """
 
@@ -908,13 +829,6 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             label="按段自适应拉伸语音(减少无声)",
             value=False,
             elem_id="adaptive-stretch-checkbox",
-            info="启用后下方的加速倍率无效",
-        )
-        speed_up_input = gr.Slider(
-            minimum=0.5, maximum=1.8, step=0.05,
-            label="加速倍率",
-            value=DEFAULT_SPEED_UP,
-            elem_id="speed-up-slider",
         )
         fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
         use_nvenc_input = gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU")
@@ -1361,15 +1275,6 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             label="按段自适应拉伸语音(减少无声)",
             value=False,
             elem_id="adaptive-stretch-checkbox-synthesize",
-            info="启用后下方的加速倍率无效",
-        )
-        synth_speed_input = gr.Slider(
-            minimum=0.5,
-            maximum=1.8,
-            step=0.05,
-            label="加速倍率",
-            value=DEFAULT_SPEED_UP,
-            elem_id="speed-up-slider-synthesize",
         )
         synth_fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
         synth_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="输出分辨率", value="1080p")
