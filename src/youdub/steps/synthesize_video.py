@@ -1411,7 +1411,10 @@ def _ensure_audio_combined(
         overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
         overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
         align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
+        en_syllables_per_word = _read_env_float("SPEECH_RATE_EN_SYLLABLES_PER_WORD", 1.5)
+        en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
         zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
+        en_vad_audio_path = os.path.join(folder, "audio_vocals.wav")
 
         # Build an index of ASR word-level timestamps from transcript.json (if available).
         transcript_words: list[dict[str, Any]] = []
@@ -1518,7 +1521,31 @@ def _ensure_audio_combined(
 
                 if en_words:
                     try:
-                        en_stats = compute_en_speech_rate(en_words, segment_start=orig_start, segment_end=orig_end)
+                        en_audio = None
+                        if os.path.exists(en_vad_audio_path):
+                            try:
+                                dur = float(max(0.0, orig_end - orig_start))
+                                if dur > 0:
+                                    en_audio, _ = librosa.load(
+                                        en_vad_audio_path,
+                                        sr=sample_rate,
+                                        mono=True,
+                                        offset=max(0.0, float(orig_start)),
+                                        duration=dur,
+                                    )
+                                    en_audio = en_audio.astype(np.float32, copy=False)
+                            except Exception:
+                                en_audio = None
+
+                        en_stats = compute_en_speech_rate(
+                            en_words,
+                            segment_start=orig_start,
+                            segment_end=orig_end,
+                            syllables_per_word=float(en_syllables_per_word),
+                            audio=en_audio,
+                            sr=int(sample_rate),
+                            vad_top_db=float(en_vad_top_db),
+                        )
                     except Exception as exc:
                         logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
                         en_stats = None

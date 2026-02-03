@@ -65,6 +65,9 @@ def compute_en_speech_rate(
     segment_start: float | None = None,
     segment_end: float | None = None,
     syllables_per_word: float = 1.5,
+    audio: np.ndarray | None = None,
+    sr: int | None = None,
+    vad_top_db: float = 30.0,
 ) -> dict[str, Any]:
     """
     Compute English speech stats from faster-whisper word timestamps.
@@ -72,6 +75,8 @@ def compute_en_speech_rate(
     Notes:
     - `words` entries are expected to have absolute timestamps (seconds): {start, end, word, probability}.
     - When `segment_start/segment_end` are provided, only words whose midpoint falls within the window are counted.
+    - If `audio`+`sr` are provided, voiced/silence durations are measured by VAD on the audio slice
+      (more reliable than summing word durations, which can be overly coarse).
     """
     seg_s = _safe_float(segment_start, default=float("nan")) if segment_start is not None else float("nan")
     seg_e = _safe_float(segment_end, default=float("nan")) if segment_end is not None else float("nan")
@@ -98,7 +103,7 @@ def compute_en_speech_rate(
         kept.append((ws, we))
         word_count += 1
 
-    # Voiced duration: sum of word durations (simple; words should not overlap).
+    # Default voiced duration: sum of word durations (best-effort fallback).
     voiced_duration = float(sum((we - ws) for ws, we in kept))
     voiced_duration = float(max(0.0, voiced_duration))
 
@@ -108,6 +113,29 @@ def compute_en_speech_rate(
         total_duration = float(max(0.0, max(we for _ws, we in kept) - min(ws for ws, _we in kept)))
     else:
         total_duration = 0.0
+
+    # If audio is provided, prefer VAD-derived voiced/silence durations.
+    sample_rate = int(sr or 0) if sr is not None else 0
+    if audio is not None and sample_rate > 0:
+        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if y.size > 0:
+            total_duration = float(y.size) / float(sample_rate)
+            try:
+                intervals = librosa.effects.split(y, top_db=float(vad_top_db))
+            except Exception:
+                intervals = np.zeros((0, 2), dtype=np.int64)
+
+            voiced_samples = 0
+            try:
+                for st, ed in intervals:
+                    st_i = int(st)
+                    ed_i = int(ed)
+                    if ed_i > st_i:
+                        voiced_samples += (ed_i - st_i)
+            except Exception:
+                voiced_samples = 0
+
+            voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
 
     silence_duration = float(max(0.0, total_duration - voiced_duration))
     pause_ratio = float(silence_duration / total_duration) if total_duration > 0 else 0.0
