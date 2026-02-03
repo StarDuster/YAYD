@@ -34,7 +34,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v10: refine EN stats by using segment start/end bounds (affects speech-rate alignment output).
 # v11: switch to subtitle syllable counting for speech rate alignment.
 # v12: normalize EN syllable counting for numbers/initialisms (affects alignment ratios).
-_AUDIO_COMBINED_MIX_VERSION = 12
+# v13: use VAD-based voiced duration + global bias for alignment (avoid overall pacing drift).
+_AUDIO_COMBINED_MIX_VERSION = 13
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -1412,6 +1413,58 @@ def _ensure_audio_combined(
         overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
         overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
         align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
+        en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
+        zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
+        audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
+
+        # Global bias to avoid overall pacing drift.
+        #
+        # Problem: even with comparable speech-rate metrics, ZH translation often has more syllables
+        # and TTS tends to speak slower, so the whole output can become noticeably longer (\"慢\").
+        # We compute a per-video bias using the original EN segment time budget vs the raw (trimmed)
+        # ZH TTS durations, then apply it by effectively increasing the EN reference rate.
+        align_global_bias = 1.0
+        if align_enabled:
+            try:
+                total_en = 0.0
+                for _seg in translation:
+                    try:
+                        s0 = float(_seg.get("start", 0.0) or 0.0)
+                        s1 = float(_seg.get("end", 0.0) or 0.0)
+                        if s1 < s0:
+                            s0, s1 = s1, s0
+                        total_en += float(max(0.0, s1 - s0))
+                    except Exception:
+                        continue
+
+                total_zh = 0.0
+                for _i in range(expected_count):
+                    check_cancelled()
+                    wav_path = os.path.join(wavs_folder, wav_files[_i])
+                    if not os.path.exists(wav_path):
+                        continue
+                    try:
+                        y, _sr = librosa.load(wav_path, sr=sample_rate, mono=True)
+                        y = y.astype(np.float32, copy=False)
+                        if y.size > 0:
+                            try:
+                                trimmed, _idx = librosa.effects.trim(y, top_db=float(trim_top_db))
+                                if trimmed is not None and trimmed.size > 0:
+                                    y = trimmed.astype(np.float32, copy=False)
+                            except Exception:
+                                pass
+                        total_zh += float(y.shape[0]) / float(sample_rate) if y.size > 0 else 0.0
+                    except Exception:
+                        continue
+
+                if total_en > 0.0 and total_zh > 0.0:
+                    align_global_bias = float(total_en / total_zh)
+                    # We only use this to speed up overall pacing (cap at 1.0).
+                    align_global_bias = float(max(0.3, min(align_global_bias, 1.0)))
+                    logger.info(f"语速对齐: 全局bias={align_global_bias:.3f} (en={total_en:.1f}s, zh={total_zh:.1f}s)")
+            except Exception as exc:
+                logger.warning(f"语速对齐: 计算全局bias失败，将回退为 1.0: {exc}")
+                align_global_bias = 1.0
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1474,8 +1527,48 @@ def _ensure_audio_combined(
             if align_enabled and tts_audio.size > 0:
                 try:
                     en_text = str(seg.get("text") or "")
-                    en_duration = float(max(0.0, orig_end - orig_start))
-                    en_stats = compute_en_speech_rate(en_text, en_duration)
+                    en_total_duration = float(max(0.0, orig_end - orig_start))
+
+                    # Estimate EN voiced duration from the original vocal stem (VAD).
+                    en_voiced_duration = float(en_total_duration)
+                    if en_total_duration > 0 and os.path.exists(audio_vocals_path):
+                        try:
+                            en_audio, en_sr = librosa.load(
+                                audio_vocals_path,
+                                sr=None,
+                                mono=True,
+                                offset=max(0.0, float(orig_start)),
+                                duration=float(en_total_duration),
+                            )
+                            en_audio = np.asarray(en_audio, dtype=np.float32).reshape(-1)
+                            if en_audio.size > 0 and int(en_sr or 0) > 0:
+                                try:
+                                    intervals = librosa.effects.split(en_audio, top_db=float(en_vad_top_db))
+                                except Exception:
+                                    intervals = np.zeros((0, 2), dtype=np.int64)
+                                voiced_samples = 0
+                                for st, ed in intervals:
+                                    st_i = int(st)
+                                    ed_i = int(ed)
+                                    if ed_i > st_i:
+                                        voiced_samples += (ed_i - st_i)
+                                en_voiced_duration = float(voiced_samples) / float(en_sr) if voiced_samples > 0 else 0.0
+                        except Exception:
+                            en_voiced_duration = float(en_total_duration)
+
+                    en_voiced_duration = float(max(0.0, min(en_voiced_duration, en_total_duration)))
+                    en_silence_duration = float(max(0.0, en_total_duration - en_voiced_duration))
+                    en_pause_ratio = float(en_silence_duration / en_total_duration) if en_total_duration > 0 else 0.0
+
+                    en_stats = dict(compute_en_speech_rate(en_text, en_voiced_duration))
+                    en_stats.update(
+                        {
+                            "total_duration": float(en_total_duration),
+                            "voiced_duration": float(en_voiced_duration),
+                            "silence_duration": float(en_silence_duration),
+                            "pause_ratio": float(en_pause_ratio),
+                        }
+                    )
                 except Exception as exc:
                     logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
                     en_stats = None
@@ -1483,10 +1576,46 @@ def _ensure_audio_combined(
                 if en_stats:
                     try:
                         zh_text = str(seg.get("translation") or "")
-                        zh_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
-                        zh_stats = compute_zh_speech_rate(zh_text, zh_duration)
+                        zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
+
+                        # ZH voiced duration from TTS itself (VAD).
+                        zh_voiced_duration = float(zh_total_duration)
+                        if tts_audio.size > 0 and sample_rate > 0:
+                            try:
+                                intervals = librosa.effects.split(tts_audio.astype(np.float32, copy=False), top_db=float(zh_vad_top_db))
+                            except Exception:
+                                intervals = np.zeros((0, 2), dtype=np.int64)
+                            voiced_samples = 0
+                            for st, ed in intervals:
+                                st_i = int(st)
+                                ed_i = int(ed)
+                                if ed_i > st_i:
+                                    voiced_samples += (ed_i - st_i)
+                            zh_voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
+
+                        zh_voiced_duration = float(max(0.0, min(zh_voiced_duration, zh_total_duration)))
+                        zh_silence_duration = float(max(0.0, zh_total_duration - zh_voiced_duration))
+                        zh_pause_ratio = float(zh_silence_duration / zh_total_duration) if zh_total_duration > 0 else 0.0
+
+                        zh_stats = dict(compute_zh_speech_rate(zh_text, zh_voiced_duration))
+                        zh_stats.update(
+                            {
+                                "total_duration": float(zh_total_duration),
+                                "voiced_duration": float(zh_voiced_duration),
+                                "silence_duration": float(zh_silence_duration),
+                                "pause_ratio": float(zh_pause_ratio),
+                            }
+                        )
+
+                        # Apply global bias by effectively increasing EN reference rate.
+                        en_stats_used = dict(en_stats)
+                        if float(align_global_bias) > 1e-6 and abs(float(align_global_bias) - 1.0) > 1e-6:
+                            en_stats_used["syllable_rate"] = float(en_stats_used.get("syllable_rate", 0.0)) / float(
+                                align_global_bias
+                            )
+
                         ratio_info = compute_scaling_ratio(
-                            en_stats,
+                            en_stats_used,
                             zh_stats,
                             mode=align_mode,
                             voice_min=voice_min,
@@ -1543,6 +1672,7 @@ def _ensure_audio_combined(
                     "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
                     "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
                     "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
+                    "speech_rate_global_bias": (round(float(align_global_bias), 6) if ratio_info else None),
                     "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
                     "speech_rate_zh": (round(float(zh_stats.get("syllable_rate", 0.0)), 6) if zh_stats else None),
                     "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
