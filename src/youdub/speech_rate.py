@@ -59,23 +59,75 @@ def count_en_syllables(text: str) -> int:
     """
     Count English syllables using CMUdict (via `pronouncing`) with a rule-based fallback.
     """
-    tokens = re.findall(r"[A-Za-z]+", str(text or ""))
+    # Keep a small amount of normalization for numeric/currency/initialisms.
+    # Examples:
+    # - 2024 -> "2 0 2 4" (approx)
+    # - $1.13 -> "1 point 1 3 dollars" (approx)
+    # - QTS -> "Q T S" (initialism)
+    s = str(text or "")
+    token_re = re.compile(r"\$?\d+(?:,\d{3})*(?:\.\d+)?%?|[A-Za-z]+(?:'[A-Za-z]+)?")
+    tokens = token_re.findall(s)
     if not tokens:
         return 0
+
+    # Letter-name syllables for initialisms (approx).
+    # Most letter names are 1 syllable; W is the main exception.
+    letter_syllables = {ch: 1 for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+    letter_syllables["W"] = 3
     total = 0
     for tok in tokens:
-        w = tok.lower()
+        t = str(tok or "")
+        if not t:
+            continue
+
+        # Numeric / currency / percent tokens.
+        if any(ch.isdigit() for ch in t):
+            raw = t.strip()
+            is_money = raw.startswith("$")
+            is_percent = raw.endswith("%")
+            raw = raw[1:] if is_money else raw
+            raw = raw[:-1] if is_percent else raw
+            raw = raw.replace(",", "")
+
+            # Number syllables (very rough but better than dropping numbers).
+            num_syl = 0
+            if raw:
+                if "." in raw:
+                    a, b = raw.split(".", 1)
+                    num_syl += len([ch for ch in a if ch.isdigit()])
+                    if b:
+                        num_syl += 1  # "point"
+                        num_syl += len([ch for ch in b if ch.isdigit()])
+                else:
+                    num_syl += len([ch for ch in raw if ch.isdigit()])
+
+            # Add spoken suffix approximation.
+            if is_money:
+                num_syl += 2  # "dollars" (2 syllables)
+            if is_percent:
+                num_syl += 2  # "percent" (2 syllables)
+
+            total += int(max(1, num_syl)) if raw else 0
+            continue
+
+        # Alphabetic tokens: try CMUdict first.
+        w = t.lower()
         try:
             phones = pronouncing.phones_for_word(w)
         except Exception:
             phones = []
         if phones:
-            # CMUdict: vowels carry lexical stress markers (0/1/2).
             try:
                 total += int(sum(1 for p in str(phones[0]).split() if p and p[-1].isdigit()))
                 continue
             except Exception:
                 pass
+
+        # Initialism: all-caps, not in CMUdict => count letter names.
+        if t.isalpha() and t.isupper() and len(t) >= 2:
+            total += int(sum(int(letter_syllables.get(ch, 1)) for ch in t))
+            continue
+
         total += _fallback_syllable_count(w)
     return int(max(1, total))
 

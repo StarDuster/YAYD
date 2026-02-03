@@ -20,6 +20,18 @@ def test_count_en_syllables_fallback_for_oov_words():
     assert count_en_syllables("blorb") >= 1
 
 
+def test_count_en_syllables_counts_initialisms_by_letters():
+    # Q-T-S
+    assert count_en_syllables("QTS") == 3
+
+
+def test_count_en_syllables_counts_numbers_and_currency_tokens():
+    # 2024 -> 4 digits (approx)
+    assert count_en_syllables("2024") == 4
+    # $1.13 -> 1 + point + 1 3 + dollars(2) => 6 (approx)
+    assert count_en_syllables("$1.13") == 6
+
+
 def test_count_zh_syllables_counts_hanzi_digits_and_latin_words():
     # 你好世界 (4) + 123 (3)
     assert count_zh_syllables("你好，世界！ 123") == 7

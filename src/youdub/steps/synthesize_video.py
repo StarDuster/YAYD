@@ -33,7 +33,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v9: refine speech-rate alignment metadata and clamp behavior.
 # v10: refine EN stats by using segment start/end bounds (affects speech-rate alignment output).
 # v11: switch to subtitle syllable counting for speech rate alignment.
-_AUDIO_COMBINED_MIX_VERSION = 11
+# v12: normalize EN syllable counting for numbers/initialisms (affects alignment ratios).
+_AUDIO_COMBINED_MIX_VERSION = 12
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
