@@ -33,6 +33,8 @@ dependencies = [
     "audiostretchy>=1.3.5",
     "soundfile",
     "numpy>=2.0.0,<3.0.0",
+    "pronouncing",
+    "pypinyin",
 
     # Vocal separation (offline / GPU-friendly)
     # Use demucs-infer (actively maintained inference-only Demucs fork).
