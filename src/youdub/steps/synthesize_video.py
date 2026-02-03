@@ -5,7 +5,6 @@ import re
 import subprocess
 import threading
 import time
-from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any
@@ -1411,39 +1410,6 @@ def _ensure_audio_combined(
         overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
         overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
         align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
-        en_syllables_per_word = _read_env_float("SPEECH_RATE_EN_SYLLABLES_PER_WORD", 1.5)
-        en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
-        zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
-        en_vad_audio_path = os.path.join(folder, "audio_vocals.wav")
-
-        # Build an index of ASR word-level timestamps from transcript.json (if available).
-        transcript_words: list[dict[str, Any]] = []
-        transcript_word_starts: list[float] = []
-        if align_enabled:
-            transcript_path = os.path.join(folder, "transcript.json")
-            if os.path.exists(transcript_path):
-                try:
-                    with open(transcript_path, "r", encoding="utf-8") as f:
-                        transcript_src = json.load(f)
-                    if isinstance(transcript_src, list):
-                        for item in transcript_src:
-                            if not isinstance(item, dict):
-                                continue
-                            words = item.get("words")
-                            if not isinstance(words, list):
-                                continue
-                            for w in words:
-                                if not isinstance(w, dict):
-                                    continue
-                                if "start" not in w or "end" not in w:
-                                    continue
-                                transcript_words.append(w)
-                    transcript_words.sort(key=lambda w: float(w.get("start", 0.0) or 0.0))
-                    transcript_word_starts = [float(w.get("start", 0.0) or 0.0) for w in transcript_words]
-                except Exception as exc:
-                    logger.warning(f"读取 transcript.json 的词级时间戳失败，将跳过语速对齐: {exc}")
-                    transcript_words = []
-                    transcript_word_starts = []
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1503,57 +1469,20 @@ def _ensure_audio_combined(
             zh_stats: dict[str, Any] | None = None
 
             # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
-            if align_enabled and transcript_words and tts_audio.size > 0:
-                # Collect words that overlap this segment's [orig_start, orig_end).
-                en_words: list[dict[str, Any]] = []
-                j0 = max(int(bisect_left(transcript_word_starts, orig_start)) - 1, 0) if transcript_word_starts else 0
-                for j in range(j0, len(transcript_words)):
-                    w = transcript_words[j]
-                    try:
-                        ws = float(w.get("start", 0.0) or 0.0)
-                        if ws >= orig_end:
-                            break
-                        we = float(w.get("end", 0.0) or 0.0)
-                    except Exception:
-                        continue
-                    if we > orig_start and ws < orig_end:
-                        en_words.append(w)
-
-                if en_words:
-                    try:
-                        en_audio = None
-                        if os.path.exists(en_vad_audio_path):
-                            try:
-                                dur = float(max(0.0, orig_end - orig_start))
-                                if dur > 0:
-                                    en_audio, _ = librosa.load(
-                                        en_vad_audio_path,
-                                        sr=sample_rate,
-                                        mono=True,
-                                        offset=max(0.0, float(orig_start)),
-                                        duration=dur,
-                                    )
-                                    en_audio = en_audio.astype(np.float32, copy=False)
-                            except Exception:
-                                en_audio = None
-
-                        en_stats = compute_en_speech_rate(
-                            en_words,
-                            segment_start=orig_start,
-                            segment_end=orig_end,
-                            syllables_per_word=float(en_syllables_per_word),
-                            audio=en_audio,
-                            sr=int(sample_rate),
-                            vad_top_db=float(en_vad_top_db),
-                        )
-                    except Exception as exc:
-                        logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
-                        en_stats = None
+            if align_enabled and tts_audio.size > 0:
+                try:
+                    en_text = str(seg.get("text") or "")
+                    en_duration = float(max(0.0, orig_end - orig_start))
+                    en_stats = compute_en_speech_rate(en_text, en_duration)
+                except Exception as exc:
+                    logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
+                    en_stats = None
 
                 if en_stats:
                     try:
                         zh_text = str(seg.get("translation") or "")
-                        zh_stats = compute_zh_speech_rate(tts_audio, sample_rate, zh_text, top_db=zh_vad_top_db)
+                        zh_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
+                        zh_stats = compute_zh_speech_rate(zh_text, zh_duration)
                         ratio_info = compute_scaling_ratio(
                             en_stats,
                             zh_stats,

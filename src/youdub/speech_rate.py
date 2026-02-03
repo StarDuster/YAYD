@@ -37,30 +37,6 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
     return float(x)
 
-
-def _is_word_like(token: str) -> bool:
-    s = (token or "").strip()
-    if not s:
-        return False
-    # Keep anything that contains at least one alphanumeric char.
-    return any(ch.isalnum() for ch in s)
-
-
-def _count_zh_units(text: str) -> int:
-    """
-    Count "syllable-like" units for Chinese TTS.
-
-    Practical heuristic:
-    - remove whitespace
-    - count alphanumeric unicode characters
-    This counts CJK chars, latin letters, and digits; skips punctuation.
-    """
-    s = re.sub(r"\s+", "", str(text or ""))
-    if not s:
-        return 0
-    return int(sum(1 for ch in s if ch.isalnum()))
-
-
 def _fallback_syllable_count(word: str) -> int:
     """
     Rule-based syllable count fallback for English OOV words.
@@ -130,175 +106,31 @@ def count_zh_syllables(text: str) -> int:
 
 
 def compute_en_speech_rate(
-    words: list[dict[str, Any]],
-    *,
-    segment_start: float | None = None,
-    segment_end: float | None = None,
-    syllables_per_word: float = 1.5,
-    audio: np.ndarray | None = None,
-    sr: int | None = None,
-    vad_top_db: float = 30.0,
+    text: str,
+    duration: float,
 ) -> dict[str, Any]:
     """
-    Compute English speech stats from faster-whisper word timestamps.
-
-    Notes:
-    - `words` entries are expected to have absolute timestamps (seconds): {start, end, word, probability}.
-    - When `segment_start/segment_end` are provided, only words whose midpoint falls within the window are counted.
-    - If `audio`+`sr` are provided, voiced/silence durations are measured by VAD on the audio slice
-      (more reliable than summing word durations, which can be overly coarse).
+    Compute English speech stats from subtitle text + segment duration.
     """
-    seg_s = _safe_float(segment_start, default=float("nan")) if segment_start is not None else float("nan")
-    seg_e = _safe_float(segment_end, default=float("nan")) if segment_end is not None else float("nan")
-    if math.isfinite(seg_s) and math.isfinite(seg_e) and seg_e < seg_s:
-        seg_s, seg_e = seg_e, seg_s
-
-    kept: list[tuple[float, float]] = []
-    word_count = 0
-
-    for w in (words or []):
-        if not isinstance(w, dict):
-            continue
-        ws = _safe_float(w.get("start", 0.0), default=0.0)
-        we = _safe_float(w.get("end", 0.0), default=0.0)
-        if we <= ws:
-            continue
-        token = str(w.get("word", "") or "")
-        if not _is_word_like(token):
-            continue
-        if math.isfinite(seg_s) and math.isfinite(seg_e):
-            mid = 0.5 * (ws + we)
-            if mid < seg_s or mid > seg_e:
-                continue
-        kept.append((ws, we))
-        word_count += 1
-
-    # Default voiced duration: sum of word durations (best-effort fallback).
-    voiced_duration = float(sum((we - ws) for ws, we in kept))
-    voiced_duration = float(max(0.0, voiced_duration))
-
-    if math.isfinite(seg_s) and math.isfinite(seg_e):
-        total_duration = float(max(0.0, seg_e - seg_s))
-    elif kept:
-        total_duration = float(max(0.0, max(we for _ws, we in kept) - min(ws for ws, _we in kept)))
-    else:
-        total_duration = 0.0
-
-    # If audio is provided, prefer VAD-derived voiced/silence durations.
-    sample_rate = int(sr or 0) if sr is not None else 0
-    if audio is not None and sample_rate > 0:
-        y = np.asarray(audio, dtype=np.float32).reshape(-1)
-        if y.size > 0:
-            total_duration = float(y.size) / float(sample_rate)
-            try:
-                intervals = librosa.effects.split(y, top_db=float(vad_top_db))
-            except Exception:
-                intervals = np.zeros((0, 2), dtype=np.int64)
-
-            voiced_samples = 0
-            try:
-                for st, ed in intervals:
-                    st_i = int(st)
-                    ed_i = int(ed)
-                    if ed_i > st_i:
-                        voiced_samples += (ed_i - st_i)
-            except Exception:
-                voiced_samples = 0
-
-            voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
-
-    silence_duration = float(max(0.0, total_duration - voiced_duration))
-    pause_ratio = float(silence_duration / total_duration) if total_duration > 0 else 0.0
-    speech_rate = float(word_count / voiced_duration) if voiced_duration > 0 else 0.0
-
-    spw = _safe_float(syllables_per_word, default=1.5)
-    spw = float(max(0.1, min(spw, 10.0)))
-    syllable_rate = float(speech_rate * spw) if speech_rate > 0 else 0.0
-
-    return {
-        "word_count": int(word_count),
-        "voiced_duration": float(voiced_duration),
-        "total_duration": float(total_duration),
-        "silence_duration": float(silence_duration),
-        "speech_rate": float(speech_rate),  # words/s over voiced duration
-        "syllable_rate": float(syllable_rate),  # approx syllables/s over voiced duration
-        "pause_ratio": float(_clamp(pause_ratio, 0.0, 1.0)),
-    }
+    dur = _safe_float(duration, default=0.0)
+    dur = float(max(0.0, dur))
+    syllables = int(count_en_syllables(text))
+    syllable_rate = float(syllables / dur) if dur > 0 else 0.0
+    return {"syllable_count": int(syllables), "duration": float(dur), "syllable_rate": float(syllable_rate)}
 
 
 def compute_zh_speech_rate(
-    audio: np.ndarray,
-    sr: int,
     text: str,
-    *,
-    top_db: float = 30.0,
-    vad_top_db: float | None = None,
+    duration: float,
 ) -> dict[str, Any]:
     """
-    Compute Chinese TTS speech stats from audio + text.
+    Compute Chinese speech stats from translated subtitle text + TTS segment duration.
     """
-    sample_rate = int(sr or 0)
-    if sample_rate <= 0:
-        return {
-            "char_count": int(_count_zh_units(text)),
-            "voiced_duration": 0.0,
-            "total_duration": 0.0,
-            "silence_duration": 0.0,
-            "speech_rate": 0.0,
-            "syllable_rate": 0.0,
-            "pause_ratio": 0.0,
-        }
-
-    y = np.asarray(audio, dtype=np.float32)
-    total_samples = int(y.shape[0] if y.ndim == 1 else (y.reshape(-1).shape[0]))
-    if total_samples <= 0:
-        return {
-            "char_count": int(_count_zh_units(text)),
-            "voiced_duration": 0.0,
-            "total_duration": 0.0,
-            "silence_duration": 0.0,
-            "speech_rate": 0.0,
-            "syllable_rate": 0.0,
-            "pause_ratio": 0.0,
-        }
-
-    y = y.reshape(-1)
-    total_duration = float(total_samples) / float(sample_rate)
-
-    if vad_top_db is not None:
-        top_db = float(vad_top_db)
-    try:
-        intervals = librosa.effects.split(y, top_db=float(top_db))
-    except Exception:
-        intervals = np.zeros((0, 2), dtype=np.int64)
-
-    voiced_samples = 0
-    try:
-        for st, ed in intervals:
-            st_i = int(st)
-            ed_i = int(ed)
-            if ed_i > st_i:
-                voiced_samples += (ed_i - st_i)
-    except Exception:
-        voiced_samples = 0
-
-    voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
-    silence_duration = float(max(0.0, total_duration - voiced_duration))
-    pause_ratio = float(silence_duration / total_duration) if total_duration > 0 else 0.0
-
-    char_count = int(_count_zh_units(text))
-    speech_rate = float(char_count / voiced_duration) if voiced_duration > 0 else 0.0
-    syllable_rate = float(speech_rate)
-
-    return {
-        "char_count": int(char_count),
-        "voiced_duration": float(voiced_duration),
-        "total_duration": float(total_duration),
-        "silence_duration": float(silence_duration),
-        "speech_rate": float(speech_rate),  # chars/s over voiced duration
-        "syllable_rate": float(syllable_rate),  # approx syllables/s over voiced duration
-        "pause_ratio": float(_clamp(pause_ratio, 0.0, 1.0)),
-    }
+    dur = _safe_float(duration, default=0.0)
+    dur = float(max(0.0, dur))
+    syllables = int(count_zh_syllables(text))
+    syllable_rate = float(syllables / dur) if dur > 0 else 0.0
+    return {"syllable_count": int(syllables), "duration": float(dur), "syllable_rate": float(syllable_rate)}
 
 
 def compute_scaling_ratio(
