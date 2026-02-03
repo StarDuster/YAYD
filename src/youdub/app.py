@@ -540,7 +540,6 @@ def run_pipeline(
     subtitles,
     bilingual_subtitle,
     tts_adaptive_segment_stretch,
-    speed_up,
     fps,
     use_nvenc,
     target_resolution,
@@ -549,8 +548,6 @@ def run_pipeline(
     auto_upload_video,
 ):
     try:
-        # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
-        effective_speed_up = 1.0 if tts_adaptive_segment_stretch else speed_up
         with _temp_env(
             {
                 "TRANSLATION_STRATEGY": translation_strategy,
@@ -584,7 +581,6 @@ def run_pipeline(
                 tts_adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
                 subtitles=subtitles,
                 bilingual_subtitle=bool(bilingual_subtitle),
-                speed_up=effective_speed_up,
                 fps=fps,
                 target_resolution=target_resolution,
                 use_nvenc=use_nvenc,
@@ -994,7 +990,6 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             subtitles_input,
             bilingual_subtitle_input,
             adaptive_stretch_input,
-            speed_up_input,
             fps_input,
             use_nvenc_input,
             target_resolution_input,
@@ -1337,21 +1332,17 @@ def _synthesize_video_wrapper(
     subtitles,
     bilingual_subtitle,
     adaptive_stretch,
-    speed_up,
     fps,
     resolution,
     use_nvenc,
     max_workers,
     auto_upload_video,
 ):
-    # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
-    effective_speed_up = 1.0 if adaptive_stretch else speed_up
     return synthesize_all_video_under_folder(
         folder,
         subtitles=subtitles,
         bilingual_subtitle=bilingual_subtitle,
         adaptive_segment_stretch=bool(adaptive_stretch),
-        speed_up=effective_speed_up,
         fps=fps,
         resolution=resolution,
         use_nvenc=use_nvenc,
@@ -1407,7 +1398,6 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             synth_subtitles_input,
             synth_bilingual_input,
             synth_adaptive_input,
-            synth_speed_input,
             synth_fps_input,
             synth_resolution_input,
             synth_nvenc_input,

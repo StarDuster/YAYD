@@ -50,7 +50,8 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v10: keep 1080p landscape at ~36; portrait slightly smaller
 # v11: increase 1080p landscape subtitle size (~49) to match expected readability
 # v12: bilingual subtitles no longer truncate source text to first sentence
-_VIDEO_META_VERSION = 12
+# v13: remove legacy global speed-up (drop speed_up from metadata)
+_VIDEO_META_VERSION = 13
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -150,7 +151,6 @@ def _write_video_meta(
     subtitles: bool,
     bilingual_subtitle: bool,
     adaptive_segment_stretch: bool,
-    speed_up: float,
     fps: int,
     resolution: str,
     use_nvenc: bool,
@@ -161,7 +161,6 @@ def _write_video_meta(
         "subtitles": bool(subtitles),
         "bilingual_subtitle": bool(bilingual_subtitle),
         "adaptive_segment_stretch": bool(adaptive_segment_stretch),
-        "speed_up": float(speed_up),
         "fps": int(fps),
         "resolution": str(resolution),
         "use_nvenc": bool(use_nvenc),
@@ -221,7 +220,6 @@ def _video_up_to_date(
     subtitles: bool,
     bilingual_subtitle: bool,
     adaptive_segment_stretch: bool,
-    speed_up: float,
     fps: int,
     resolution: str,
     use_nvenc: bool,
@@ -254,13 +252,6 @@ def _video_up_to_date(
         return False
     if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
         logger.debug(f"video 过期原因: adaptive_segment_stretch 参数不匹配")
-        return False
-    try:
-        if abs(float(meta.get("speed_up")) - float(speed_up)) > 1e-6:
-            logger.debug(f"video 过期原因: speed_up 参数不匹配 ({meta.get('speed_up')} != {speed_up})")
-            return False
-    except Exception:
-        logger.debug(f"video 过期原因: speed_up 参数解析失败")
         return False
     if int(meta.get("fps") or 0) != int(fps):
         logger.debug(f"video 过期原因: fps 参数不匹配 ({meta.get('fps')} != {fps})")
@@ -2088,7 +2079,6 @@ def _ensure_audio_combined(
 def synthesize_video(
     folder: str, 
     subtitles: bool = True, 
-    speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
     use_nvenc: bool = False,
@@ -2098,8 +2088,7 @@ def synthesize_video(
     check_cancelled()
     output_video = os.path.join(folder, "video.mp4")
 
-    # 缓存元数据中的“有效参数”（自适应模式下 speed_up/fps 不参与输出）
-    meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
+    # 缓存元数据中的“有效参数”（自适应模式下 fps 不参与输出）
     meta_fps = 0 if adaptive_segment_stretch else int(fps)
 
     # NOTE:
@@ -2112,7 +2101,6 @@ def synthesize_video(
         subtitles=subtitles,
         bilingual_subtitle=bilingual_subtitle,
         adaptive_segment_stretch=adaptive_segment_stretch,
-        speed_up=meta_speed_up,
         fps=meta_fps,
         resolution=resolution,
         use_nvenc=use_nvenc,
@@ -2511,7 +2499,6 @@ def synthesize_video(
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
             adaptive_segment_stretch=adaptive_segment_stretch,
-            speed_up=meta_speed_up,
             fps=meta_fps,
             resolution=resolution,
             use_nvenc=use_nvenc,
@@ -2534,7 +2521,6 @@ def synthesize_video(
                 subtitles=subtitles,
                 bilingual_subtitle=bilingual_subtitle,
                 adaptive_segment_stretch=adaptive_segment_stretch,
-                speed_up=meta_speed_up,
                 fps=meta_fps,
                 resolution=resolution,
                 use_nvenc=False,
@@ -2549,7 +2535,6 @@ def synthesize_video(
 def synthesize_all_video_under_folder(
     folder: str, 
     subtitles: bool = True, 
-    speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
     use_nvenc: bool = False,
@@ -2565,14 +2550,12 @@ def synthesize_all_video_under_folder(
         if "download.mp4" not in files:
             continue
         # Use the same freshness logic as synthesize_video() to avoid stale reuse.
-        meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
         meta_fps = 0 if adaptive_segment_stretch else int(fps)
         up_to_date = _video_up_to_date(
             root,
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
             adaptive_segment_stretch=adaptive_segment_stretch,
-            speed_up=meta_speed_up,
             fps=meta_fps,
             resolution=resolution,
             use_nvenc=use_nvenc,
@@ -2619,7 +2602,6 @@ def synthesize_all_video_under_folder(
             root,
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
-            speed_up=speed_up,
             fps=fps,
             resolution=resolution,
             use_nvenc=use_nvenc,
