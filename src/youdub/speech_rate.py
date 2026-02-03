@@ -190,6 +190,7 @@ def compute_scaling_ratio(
     zh_stats: dict[str, Any],
     *,
     mode: str = "single",
+    budget_weight: float = 0.0,
     voice_min: float = 0.7,
     voice_max: float = 1.3,
     silence_min: float = 0.3,
@@ -198,10 +199,20 @@ def compute_scaling_ratio(
     overall_max: float = 2.0,
 ) -> dict[str, Any]:
     """
-    Compute scaling ratios to match ZH speech rate to EN speech rate.
+    Compute scaling ratios for time-scale modification (TSM).
 
     ratio definition:
         ratio = new_duration / old_duration
+
+    By default, the *voice* ratio is derived from the speech-rate ratio:
+        voice_ratio_rate_raw = zh_rate / en_rate
+
+    When both sides provide segment total durations (en_stats["total_duration"], zh_stats["total_duration"]),
+    you can optionally blend in the time-budget ratio:
+        voice_ratio_budget_raw = en_total / zh_total
+
+    This helps avoid cases where speech-rate estimates look similar but the ZH TTS segment is much longer/shorter
+    than the original time budget (common when translations have more/less syllables).
     """
     mode_norm = str(mode or "single").strip().lower()
     if mode_norm in {"two_stage", "two-stage"}:
@@ -218,11 +229,36 @@ def compute_scaling_ratio(
             "silence_ratio": 1.0,
             "overall_ratio": 1.0,
             "voice_ratio_raw": 1.0,
+            "voice_ratio_rate_raw": 1.0,
+            "voice_ratio_budget_raw": 1.0,
+            "speech_rate_budget_weight": 0.0,
             "silence_ratio_raw": 1.0,
             "clamped": False,
         }
 
-    voice_ratio_raw = float(zh_rate / en_rate)
+    voice_ratio_rate_raw = float(zh_rate / en_rate)
+
+    # Optional: blend in time-budget ratio (en_total / zh_total) when available.
+    bw = _safe_float(budget_weight, default=0.0)
+    bw = float(_clamp(bw, 0.0, 1.0))
+    en_total = _safe_float(en_stats.get("total_duration", 0.0), default=0.0)
+    zh_total = _safe_float(zh_stats.get("total_duration", 0.0), default=0.0)
+    voice_ratio_budget_raw = float(en_total / zh_total) if (en_total > 0.0 and zh_total > 0.0) else float(
+        voice_ratio_rate_raw
+    )
+
+    voice_ratio_raw = float(voice_ratio_rate_raw)
+    if bw > 1e-9 and voice_ratio_rate_raw > 0.0 and voice_ratio_budget_raw > 0.0:
+        # Geometric blend (more stable for ratios than linear interpolation).
+        try:
+            voice_ratio_raw = float(
+                math.exp(
+                    (1.0 - bw) * math.log(float(voice_ratio_rate_raw)) + bw * math.log(float(voice_ratio_budget_raw))
+                )
+            )
+        except Exception:
+            voice_ratio_raw = float(voice_ratio_rate_raw)
+
     voice_ratio = _clamp(voice_ratio_raw, float(voice_min), float(voice_max))
 
     V_zh = _safe_float(zh_stats.get("voiced_duration", 0.0), default=0.0)
@@ -292,6 +328,9 @@ def compute_scaling_ratio(
         "silence_ratio": float(silence_ratio),
         "overall_ratio": float(overall_ratio),
         "voice_ratio_raw": float(voice_ratio_raw),
+        "voice_ratio_rate_raw": float(voice_ratio_rate_raw),
+        "voice_ratio_budget_raw": float(voice_ratio_budget_raw),
+        "speech_rate_budget_weight": float(bw) if (en_total > 0.0 and zh_total > 0.0) else 0.0,
         "silence_ratio_raw": float(silence_ratio_raw),
         "clamped": bool(clamped),
     }

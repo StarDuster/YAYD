@@ -1415,6 +1415,10 @@ def _ensure_audio_combined(
         align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
         en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
         zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
+        # Blend weight between speech-rate ratio and time-budget ratio (en_total / zh_total).
+        # - 0.0: pure speech-rate (more natural articulation)
+        # - 1.0: pure time-budget (more aggressive, keeps pacing closer to original timestamps)
+        budget_weight = _read_env_float("SPEECH_RATE_BUDGET_WEIGHT", 0.7)
         audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
 
         # Global bias to avoid overall pacing drift.
@@ -1618,6 +1622,7 @@ def _ensure_audio_combined(
                             en_stats_used,
                             zh_stats,
                             mode=align_mode,
+                            budget_weight=float(budget_weight),
                             voice_min=voice_min,
                             voice_max=voice_max,
                             silence_min=silence_min,
@@ -1671,10 +1676,29 @@ def _ensure_audio_combined(
                     "voice_ratio": (round(float(ratio_info.get("voice_ratio", 1.0)), 6) if ratio_info else None),
                     "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
                     "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
+                    "voice_ratio_rate_raw": (
+                        round(float(ratio_info.get("voice_ratio_rate_raw", 1.0)), 6) if ratio_info else None
+                    ),
+                    "voice_ratio_budget_raw": (
+                        round(float(ratio_info.get("voice_ratio_budget_raw", 1.0)), 6) if ratio_info else None
+                    ),
+                    "speech_rate_budget_weight": (
+                        round(float(ratio_info.get("speech_rate_budget_weight", 0.0)), 6) if ratio_info else None
+                    ),
                     "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
                     "speech_rate_global_bias": (round(float(align_global_bias), 6) if ratio_info else None),
                     "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
                     "speech_rate_zh": (round(float(zh_stats.get("syllable_rate", 0.0)), 6) if zh_stats else None),
+                    "speech_syllables_en": (int(en_stats.get("syllable_count", 0)) if en_stats else None),
+                    "speech_syllables_zh": (int(zh_stats.get("syllable_count", 0)) if zh_stats else None),
+                    "en_total_duration": (round(float(en_stats.get("total_duration", 0.0)), 6) if en_stats else None),
+                    "en_voiced_duration": (round(float(en_stats.get("voiced_duration", 0.0)), 6) if en_stats else None),
+                    "en_silence_duration": (round(float(en_stats.get("silence_duration", 0.0)), 6) if en_stats else None),
+                    "en_pause_ratio": (round(float(en_stats.get("pause_ratio", 0.0)), 6) if en_stats else None),
+                    "zh_total_duration": (round(float(zh_stats.get("total_duration", 0.0)), 6) if zh_stats else None),
+                    "zh_voiced_duration": (round(float(zh_stats.get("voiced_duration", 0.0)), 6) if zh_stats else None),
+                    "zh_silence_duration": (round(float(zh_stats.get("silence_duration", 0.0)), 6) if zh_stats else None),
+                    "zh_pause_ratio": (round(float(zh_stats.get("pause_ratio", 0.0)), 6) if zh_stats else None),
                     "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
                 }
             )
