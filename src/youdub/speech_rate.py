@@ -9,14 +9,16 @@ import time
 import uuid
 from typing import Any
 
+from cmudict import dict as cmudict_dict
 import librosa
 import numpy as np
-import pronouncing
 from audiostretchy.stretch import stretch_audio
 from loguru import logger
 from pypinyin import Style, pinyin
 
 from .utils import save_wav
+
+_CMU_DICT = cmudict_dict()
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -144,7 +146,7 @@ def _fallback_syllable_count(word: str) -> int:
 
 def count_en_syllables(text: str) -> int:
     """
-    Count English syllables using CMUdict (via `pronouncing`) with a rule-based fallback.
+    Count English syllables using CMUdict (via `cmudict`) with a rule-based fallback.
     """
     # Keep a small amount of normalization for numeric/currency/initialisms.
     # Examples:
@@ -199,13 +201,10 @@ def count_en_syllables(text: str) -> int:
 
         # Alphabetic tokens: try CMUdict first.
         w = t.lower()
-        try:
-            phones = pronouncing.phones_for_word(w)
-        except Exception:
-            phones = []
-        if phones:
+        prons = _CMU_DICT.get(w, [])
+        if prons:
             try:
-                total += int(sum(1 for p in str(phones[0]).split() if p and p[-1].isdigit()))
+                total += int(sum(1 for p in prons[0] if p and p[-1].isdigit()))
                 continue
             except Exception:
                 pass
