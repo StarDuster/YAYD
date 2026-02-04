@@ -332,11 +332,8 @@ def _ensure_audio_combined(
     audio_tts_path = os.path.join(folder, "audio_tts.wav")
     wavs_folder = os.path.join(folder, "wavs")
     translation_path = os.path.join(folder, "translation.json")
-    translation_adaptive_path = os.path.join(folder, "translation_adaptive.json")
     adaptive_plan_path = os.path.join(folder, "adaptive_plan.json")
     audio_instruments_path = os.path.join(folder, "audio_instruments.wav")
-
-    _ = translation_adaptive_path
 
     # 检查必要文件
     if not os.path.exists(wavs_folder):
