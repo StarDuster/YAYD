@@ -95,6 +95,9 @@ def _subtitles_exist(folder: str) -> bool:
             if not name.startswith("download."):
                 continue
             low = name.lower()
+            # Ignore auto captions artifacts (yt-dlp typically uses *.auto.vtt).
+            if ".auto." in low or low.endswith(".auto.vtt") or low.endswith(".auto.srt"):
+                continue
             if low.endswith(".vtt") or low.endswith(".srt"):
                 return True
     except Exception:

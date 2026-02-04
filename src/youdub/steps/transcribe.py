@@ -902,7 +902,16 @@ def _find_subtitle_file(folder: str, preferred_lang: str | None) -> tuple[str | 
 
     # Fallback: scan folder for any download.*.vtt/srt
     try:
-        names = [n for n in os.listdir(folder) if n.startswith("download.") and n.lower().endswith(exts)]
+        names = [
+            n
+            for n in os.listdir(folder)
+            if n.startswith("download.")
+            and n.lower().endswith(exts)
+            # Ignore auto captions artifacts (yt-dlp typically uses *.auto.vtt).
+            and (".auto." not in n.lower())
+            and (not n.lower().endswith(".auto.vtt"))
+            and (not n.lower().endswith(".auto.srt"))
+        ]
     except Exception:
         names = []
 
@@ -931,12 +940,15 @@ def _find_subtitle_file(folder: str, preferred_lang: str | None) -> tuple[str | 
             if lang.lower() == preferred_lang.lower():
                 return p, lang
         for p, lang in candidates:
-            if lang.lower().startswith(preferred_lang.lower()):
+            ll = lang.lower()
+            pl = preferred_lang.lower()
+            if ll.startswith(pl) and (len(ll) == len(pl) or ll[len(pl)] in {"-", "_"}):
                 return p, lang
 
     # Prefer English if present.
     for p, lang in candidates:
-        if lang.lower() == "en" or lang.lower().startswith("en"):
+        ll = lang.lower()
+        if ll == "en" or (ll.startswith("en") and (len(ll) == 2 or ll[2] in {"-", "_"})):
             return p, lang
 
     return candidates[0]
