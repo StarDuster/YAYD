@@ -3,6 +3,18 @@
 本文档记录了本项目中“带计算/规则”的核心算法与工程策略（字幕字号/换行、时间轴、对齐、兜底等）。
 注意：为了避免文档与实现漂移，优先写 **关键规则/公式 + 对应函数名**，不要长期依赖拷贝出来的旧代码片段。
 
+## 专题文档
+
+| 文档 | 说明 |
+|------|------|
+| [ADAPTIVE_ALIGNMENT.md](./ADAPTIVE_ALIGNMENT.md) | 自适应对轴算法详解 |
+| [bgm_align.md](./bgm_align.md) | BGM 对齐策略 |
+| [DIARIZATION_TUNING.md](./DIARIZATION_TUNING.md) | 说话人分离调参指南 |
+| [qwentts.md](./qwentts.md) | Qwen TTS 防劣化与优化机制 |
+| [srt-render.md](./srt-render.md) | 字幕渲染策略 |
+| [translate.md](./translate.md) | 翻译策略文档 |
+| [youtube-srt-align.md](./youtube-srt-align.md) | YouTube SRT 说话人对齐 |
+
 ---
 
 ## 一、双语字幕对轴
@@ -56,18 +68,15 @@ def _calc_subtitle_style_params(width, height, *, en_font_scale=0.75):
     max_chars_en = max(1, int(safe_w / (en_fs * 0.65)))
 ```
 
-### 3. 双语字幕英文仅保留一句（避免铺屏）
+### 3. 双语字幕原文智能排版
 
 **问题**: 直接显示整段英文原文会铺满屏幕，影响可读性。
 
-**解决方案**: `_first_sentence()` 只提取原文第一句作为双语字幕的英文部分。
+**解决方案**: `_bilingual_source_text()` 完整保留原文，智能换行（详见 [srt-render.md](./srt-render.md)）。
 
-```python
-def _first_sentence(text, *, max_chars=220):
-    # 只保留第一行非空内容
-    # 按句号/问号/感叹号截断
-    # 避免把长段落全部显示
-```
+- 短句：单行显示
+- 多句：按句号换行
+- 长句：在逗号/分号处智能换行，保持多行平衡
 
 ### 4. 双语字幕原文补齐（旧文件兼容）
 
