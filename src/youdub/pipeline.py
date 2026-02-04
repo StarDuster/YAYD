@@ -63,7 +63,6 @@ class VideoPipeline:
         qwen_tts_batch_size: int,
         tts_adaptive_segment_stretch: bool,
         subtitles: bool,
-        speed_up: float,
         fps: int,
         target_resolution: str,
         max_retries: int,
@@ -157,14 +156,11 @@ class VideoPipeline:
                 require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
 
                 check_cancelled()
-                # 当启用“按段自适应拉伸语音”时，忽略全局加速倍率（避免双重变速）。
-                effective_speed_up = 1.0 if tts_adaptive_segment_stretch else speed_up
                 synthesize_all_video_under_folder(
                     folder,
                     subtitles=subtitles,
                     bilingual_subtitle=bilingual_subtitle,
                     adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
-                    speed_up=effective_speed_up,
                     fps=fps,
                     resolution=target_resolution,
                     use_nvenc=use_nvenc,
@@ -211,7 +207,6 @@ class VideoPipeline:
         tts_adaptive_segment_stretch: bool = False,
         subtitles: bool = True,
         bilingual_subtitle: bool = False,
-        speed_up: float = 1.2,
         fps: int = 30,
         target_resolution: str = "1080p",
         use_nvenc: bool = False,
@@ -555,16 +550,12 @@ class VideoPipeline:
                         fail_list.append(info)
                         continue
 
-                    # 当启用“按段自适应拉伸语音”时，忽略全局加速倍率（避免双重变速）。
-                    effective_speed_up = 1.0 if bool(tts_adaptive_segment_stretch) else float(speed_up)
-
                     fut = encode_executor.submit(
                         synthesize_all_video_under_folder,
                         folder,
                         subtitles=subtitles,
                         bilingual_subtitle=bool(bilingual_subtitle),
                         adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
-                        speed_up=effective_speed_up,
                         fps=fps,
                         resolution=target_resolution,
                         use_nvenc=use_nvenc,
@@ -604,7 +595,6 @@ class VideoPipeline:
                     int(qwen_tts_batch_size),
                     bool(tts_adaptive_segment_stretch),
                     subtitles,
-                    speed_up,
                     fps,
                     target_resolution,
                     max_retries,

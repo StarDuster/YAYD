@@ -22,11 +22,11 @@ from ..models import ModelCheckError, ModelManager
 from ..interrupts import CancelledByUser, check_cancelled, sleep_with_cancel
 from ..cn_tx import TextNorm
 from ..utils import (
-    ensure_torchaudio_backend_compat,
     prepare_speaker_ref_audio,
     read_speaker_ref_seconds,
     save_wav,
     save_wav_norm,
+    torch_load_weights_only_compat,
     wav_duration_seconds,
 )
 
@@ -772,7 +772,6 @@ def load_embedding_model() -> None:
 
     try:
         try:
-            ensure_torchaudio_backend_compat()
             from pyannote.audio import Inference, Model  # type: ignore
         except Exception as exc:  # pylint: disable=broad-except
             raise RuntimeError(
@@ -782,11 +781,23 @@ def load_embedding_model() -> None:
 
         logger.info("加载pyannote/embedding模型...")
         token = _DEFAULT_SETTINGS.hf_token
-        # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
-        try:
-            _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token)
-        except TypeError:
-            _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
+        diar_dir = _DEFAULT_SETTINGS.resolve_path(_DEFAULT_SETTINGS.whisper_diarization_model_dir)
+        cache_dir = str(diar_dir) if diar_dir else None
+
+        # PyTorch 2.6+ 默认 weights_only=True，会导致 pyannote 模型加载失败。
+        with torch_load_weights_only_compat():
+            # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
+            try:
+                _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token, cache_dir=cache_dir)
+            except TypeError:
+                try:
+                    _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token, cache_dir=cache_dir)
+                except TypeError:
+                    # Older pyannote versions may not accept auth/cache kwargs.
+                    try:
+                        _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", token=token)
+                    except TypeError:
+                        _EMBEDDING_MODEL = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
         
         if _EMBEDDING_MODEL is None:
             logger.error("加载pyannote/embedding失败。请检查HF_TOKEN。")
@@ -1879,6 +1890,33 @@ def _tts_segment_wavs_complete(folder: str, expected_segments: int) -> bool:
     return True
 
 
+def _clear_tts_wavs_cache(folder: str) -> None:
+    """Remove cached per-segment TTS outputs under `folder/wavs/`.
+
+    `generate_wavs` uses file existence as cache key and does not validate against
+    translation text or speaker reference changes. When upstream inputs change, we
+    must clear cached wavs (and marker json) to force regeneration.
+    """
+
+    wavs_dir = os.path.join(folder, "wavs")
+    if not os.path.isdir(wavs_dir):
+        return
+
+    removed = 0
+    for ent in os.scandir(wavs_dir):
+        if not ent.is_file():
+            continue
+        if ent.name.endswith(".wav") or ent.name.endswith(".json"):
+            try:
+                os.remove(ent.path)
+                removed += 1
+            except Exception:
+                continue
+
+    if removed:
+        logger.info(f"已清理TTS片段缓存: {folder}（{removed} 个文件）")
+
+
 def generate_wavs(
     folder: str,
     tts_method: str = "bytedance",
@@ -2460,36 +2498,109 @@ def generate_all_wavs_under_folder(
         check_cancelled()
         if 'translation.json' not in files:
             continue
+        tr_path = os.path.join(root, "translation.json")
+        wavs_dir = os.path.join(root, "wavs")
         done_path = os.path.join(root, "wavs", ".tts_done.json")
+        should_run = True
+        force_clear_cache = False
         if os.path.exists(done_path):
             try:
                 with open(done_path, "r", encoding="utf-8") as f:
                     st = json.load(f)
-                if st.get("tts_method") == tts_method:
-                    # If translation.json is newer than marker, re-run to reflect changes.
-                    tr_path = os.path.join(root, "translation.json")
-                    tr_mtime = os.path.getmtime(tr_path)
-                    done_mtime = os.path.getmtime(done_path)
-                    if done_mtime >= tr_mtime:
-                        expected_segments: int | None = None
-                        try:
-                            with open(tr_path, "r", encoding="utf-8") as f:
-                                tr = json.load(f)
-                            if isinstance(tr, list):
-                                expected_segments = int(len(tr))
-                        except Exception:
-                            expected_segments = None
+                prev_method = st.get("tts_method")
+                done_mtime = os.path.getmtime(done_path)
+                tr_mtime = os.path.getmtime(tr_path)
 
-                        if expected_segments is not None and _tts_segment_wavs_complete(root, expected_segments):
-                            continue
+                expected_segments: int | None = None
+                try:
+                    with open(tr_path, "r", encoding="utf-8") as f:
+                        tr = json.load(f)
+                    if isinstance(tr, list):
+                        expected_segments = int(len(tr))
+                except Exception:
+                    expected_segments = None
 
-                        # Marker exists but wavs are incomplete/corrupted -> resume generation.
-                        logger.info(
-                            f"TTS产物不完整，将继续生成: {root} "
-                            f"(expected_segments={expected_segments if expected_segments is not None else 'unknown'})"
-                        )
+                wavs_complete = bool(
+                    expected_segments is not None and _tts_segment_wavs_complete(root, expected_segments)
+                )
+
+                # Speaker refs (SPEAKER/*.wav) may be regenerated after re-diarization.
+                speaker_ref_newer = False
+                speaker_ref_mtime_max = 0.0
+                speaker_dir = os.path.join(root, "SPEAKER")
+                try:
+                    if os.path.isdir(speaker_dir):
+                        for ent in os.scandir(speaker_dir):
+                            if not ent.is_file():
+                                continue
+                            if not (ent.name.endswith(".wav") or ent.name.endswith(".json")):
+                                continue
+                            try:
+                                mtime = float(ent.stat().st_mtime)
+                                if mtime > speaker_ref_mtime_max:
+                                    speaker_ref_mtime_max = mtime
+                                if mtime > float(done_mtime):
+                                    speaker_ref_newer = True
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    speaker_ref_newer = False
+
+                # NOTE: `generate_wavs` uses wav existence as cache key, so when inputs change
+                # we must clear `wavs/*.wav` to force regeneration.
+                if prev_method != tts_method:
+                    force_clear_cache = True
+                    logger.info(f"TTS方法已变更，将重新生成TTS: {root} ({prev_method} -> {tts_method})")
+                elif tr_mtime > done_mtime:
+                    force_clear_cache = True
+                    logger.info(f"检测到翻译已更新，将重新生成TTS: {root}")
+                elif speaker_ref_newer:
+                    force_clear_cache = True
+                    logger.info(f"检测到说话人参考已更新，将重新生成TTS: {root}")
+                elif wavs_complete:
+                    # Transitional robustness: marker can be newer than inputs even when wavs were fully cached
+                    # (and therefore not regenerated). Ensure all segment wavs are at least as new as inputs.
+                    inputs_mtime = float(max(float(tr_mtime), float(speaker_ref_mtime_max)))
+                    stale_outputs = False
+                    try:
+                        if os.path.isdir(wavs_dir):
+                            for ent in os.scandir(wavs_dir):
+                                if not ent.is_file():
+                                    continue
+                                if not ent.name.endswith(".wav"):
+                                    continue
+                                try:
+                                    if float(ent.stat().st_mtime) < inputs_mtime:
+                                        stale_outputs = True
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        stale_outputs = False
+
+                    if stale_outputs:
+                        force_clear_cache = True
+                        logger.info(f"检测到TTS片段缓存早于上游输入，将重新生成TTS: {root}")
+                    else:
+                        should_run = False
+                else:
+                    logger.info(
+                        f"TTS产物不完整，将继续生成: {root} "
+                        f"(expected_segments={expected_segments if expected_segments is not None else 'unknown'})"
+                    )
             except Exception:
                 # Treat as not done and re-generate.
+                pass
+        if not should_run:
+            continue
+        if force_clear_cache:
+            _clear_tts_wavs_cache(root)
+            # Also remove the marker explicitly if it still exists.
+            try:
+                if os.path.exists(done_path):
+                    os.remove(done_path)
+            except Exception:
                 pass
         generate_wavs(
             root,

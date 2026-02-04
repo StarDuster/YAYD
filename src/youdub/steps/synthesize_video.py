@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
+from ..speech_rate import apply_scaling_ratio, compute_en_speech_rate, compute_scaling_ratio, compute_zh_speech_rate
 from ..utils import save_wav, save_wav_norm, valid_file
 
 
@@ -27,7 +29,14 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 #     log original voice/BGM loudness + ratio to make debugging easy.
 # v6: improve window search by probing stems first (avoid missing music-heavy moments).
 # v7: adaptive mode aligns instruments per adaptive_plan (fix BGM drift vs stretched video).
-_AUDIO_COMBINED_MIX_VERSION = 7
+# v8: adaptive mode optionally applies speech-rate based TTS time-scale modification (TSM) per segment.
+# v9: refine speech-rate alignment metadata and clamp behavior.
+# v10: refine EN stats by using segment start/end bounds (affects speech-rate alignment output).
+# v11: switch to subtitle syllable counting for speech rate alignment.
+# v12: normalize EN syllable counting for numbers/initialisms (affects alignment ratios).
+# v13: use VAD-based voiced duration + global bias for alignment (avoid overall pacing drift).
+# v14: blend speech-rate ratio with time-budget ratio (stabilize per-segment pacing).
+_AUDIO_COMBINED_MIX_VERSION = 14
 
 _VIDEO_META_NAME = ".video_synth.json"
 # Bump when the video output semantics/config keys change.
@@ -40,7 +49,9 @@ _VIDEO_META_NAME = ".video_synth.json"
 # v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
 # v10: keep 1080p landscape at ~36; portrait slightly smaller
 # v11: increase 1080p landscape subtitle size (~49) to match expected readability
-_VIDEO_META_VERSION = 11
+# v12: bilingual subtitles no longer truncate source text to first sentence
+# v13: remove legacy global speed-up (drop speed_up from metadata)
+_VIDEO_META_VERSION = 13
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -140,7 +151,6 @@ def _write_video_meta(
     subtitles: bool,
     bilingual_subtitle: bool,
     adaptive_segment_stretch: bool,
-    speed_up: float,
     fps: int,
     resolution: str,
     use_nvenc: bool,
@@ -151,7 +161,6 @@ def _write_video_meta(
         "subtitles": bool(subtitles),
         "bilingual_subtitle": bool(bilingual_subtitle),
         "adaptive_segment_stretch": bool(adaptive_segment_stretch),
-        "speed_up": float(speed_up),
         "fps": int(fps),
         "resolution": str(resolution),
         "use_nvenc": bool(use_nvenc),
@@ -211,7 +220,6 @@ def _video_up_to_date(
     subtitles: bool,
     bilingual_subtitle: bool,
     adaptive_segment_stretch: bool,
-    speed_up: float,
     fps: int,
     resolution: str,
     use_nvenc: bool,
@@ -244,13 +252,6 @@ def _video_up_to_date(
         return False
     if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
         logger.debug(f"video 过期原因: adaptive_segment_stretch 参数不匹配")
-        return False
-    try:
-        if abs(float(meta.get("speed_up")) - float(speed_up)) > 1e-6:
-            logger.debug(f"video 过期原因: speed_up 参数不匹配 ({meta.get('speed_up')} != {speed_up})")
-            return False
-    except Exception:
-        logger.debug(f"video 过期原因: speed_up 参数解析失败")
         return False
     if int(meta.get("fps") or 0) != int(fps):
         logger.debug(f"video 过期原因: fps 参数不匹配 ({meta.get('fps')} != {fps})")
@@ -663,36 +664,197 @@ def _calc_subtitle_style_params(
     return int(font_size), int(outline), int(margin_v), int(max_chars_zh), int(max_chars_en)
 
 
-def _first_sentence(text: str, *, max_chars: int = 220) -> str:
+_TOKEN_RE = re.compile(r"[0-9A-Za-z_]+(?:['’][0-9A-Za-z_]+)?")
+
+
+def _normalize_ws(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _tokenize_for_count(text: str) -> list[str]:
+    # Normalize apostrophes so tokenization is stable.
+    s = _normalize_ws(text).replace("’", "'")
+    return [m.group(0).lower() for m in _TOKEN_RE.finditer(s)]
+
+
+def _unit_weight(text: str) -> int:
     """
-    Return a short preview of source text for bilingual subtitles.
-    We intentionally keep ONLY one sentence to avoid dumping long paragraphs on screen.
+    Weight for balancing clause grouping.
+
+    Prefer ASCII token count (English-like); fallback to character length for CJK/others.
+    """
+    toks = _tokenize_for_count(text)
+    if toks:
+        return int(len(toks))
+    s = _normalize_ws(text)
+    return int(max(1, len(s)))
+
+
+def _split_words_to_count(text: str, target_count: int) -> list[str]:
+    """Fallback: split by words as evenly as possible."""
+    if target_count <= 0:
+        return []
+    s = _normalize_ws(text)
+    if not s:
+        return [""] * target_count
+    if target_count == 1:
+        return [s]
+
+    words = s.split(" ")
+    if not words:
+        return [""] * target_count
+
+    base = len(words) // target_count
+    rem = len(words) % target_count
+    out: list[str] = []
+    idx = 0
+    for i in range(target_count):
+        size = base + (1 if i < rem else 0)
+        if size <= 0:
+            out.append("")
+            continue
+        out.append(" ".join(words[idx : idx + size]).strip())
+        idx += size
+    return out
+
+
+def _group_clauses_evenly(clauses: list[str], target_count: int) -> list[str]:
+    """Group clauses in order so each group has similar weight."""
+    cleaned = [c.strip() for c in clauses if c and c.strip()]
+    if target_count <= 1:
+        return [" ".join(cleaned).strip()] if cleaned else []
+    if not cleaned:
+        return [""] * target_count
+    if len(cleaned) < target_count:
+        # Not enough clauses to make target_count groups.
+        return []
+
+    weights = [_unit_weight(c) for c in cleaned]
+    total = sum(weights) or 1
+    target = float(total) / float(target_count)
+
+    out: list[str] = []
+    buf: list[str] = []
+    buf_cnt = 0
+    remaining_groups = int(target_count)
+
+    for i, clause in enumerate(cleaned):
+        w = int(weights[i])
+        remaining_clauses = len(cleaned) - i
+
+        # If remaining clauses == remaining groups, we must allocate 1 clause per group.
+        if buf and remaining_clauses == remaining_groups:
+            out.append(" ".join(buf).strip())
+            buf = [clause]
+            buf_cnt = w
+            remaining_groups -= 1
+            continue
+
+        if not buf:
+            buf = [clause]
+            buf_cnt = w
+            continue
+
+        # Last group: take everything remaining.
+        if remaining_groups <= 1:
+            buf.append(clause)
+            buf_cnt += w
+            continue
+
+        # Close group when reaching target.
+        if float(buf_cnt) >= target:
+            out.append(" ".join(buf).strip())
+            buf = [clause]
+            buf_cnt = w
+            remaining_groups -= 1
+            continue
+
+        # If adding this clause overshoots target a lot, close early if current buf isn't too small.
+        if (float(buf_cnt + w) > target) and (buf_cnt >= max(3, int(target * 0.6))):
+            out.append(" ".join(buf).strip())
+            buf = [clause]
+            buf_cnt = w
+            remaining_groups -= 1
+            continue
+
+        buf.append(clause)
+        buf_cnt += w
+
+    if buf:
+        out.append(" ".join(buf).strip())
+
+    # Defensive: if grouping drifted, signal failure so caller can fallback.
+    if len(out) != int(target_count):
+        return []
+    return out
+
+
+def _bilingual_source_text(
+    text: str,
+    *,
+    max_words: int = 18,
+    max_chars: int = 110,
+) -> str:
+    """
+    Source text rendering for bilingual subtitles.
+
+    Strategy (mirrors `scripts/resplit_by_diarization.py` step 6):
+    - Split by sentence terminators (.?! and Chinese equivalents).
+    - If a single sentence is too long, split into clause groups as evenly as possible.
+    - Unlike the legacy logic, we do NOT truncate to the first sentence.
     """
     raw = str(text or "").replace("\r", "").strip()
     if not raw:
         return ""
 
-    # Keep first non-empty line only.
-    first_line = ""
-    for ln in raw.splitlines():
-        ln = ln.strip()
-        if ln:
-            first_line = ln
-            break
-    if not first_line:
-        return ""
-
-    s = " ".join(first_line.split()).strip()
+    s = _normalize_ws(raw)
     if not s:
         return ""
 
-    # Sentence terminators. For '.' we require a following whitespace/end/quote/bracket to avoid decimals.
-    m = re.search(r'(?:[。！？!?]|\.)(?=(?:\s|$|["\')\]]))', s)
-    if m:
-        return s[: m.end()].strip()
-    if len(s) > int(max_chars):
-        return s[: int(max_chars)].rstrip()
-    return s
+    # Lazy import to avoid pulling translation stack unless needed.
+    try:
+        from .translate import _split_source_text_into_sentences, _split_source_text_relaxed
+    except Exception:
+        return s
+
+    sentences = [x.strip() for x in _split_source_text_into_sentences(s) if str(x).strip()]
+    if not sentences:
+        sentences = [s]
+
+    rendered: list[str] = []
+    for sent in sentences:
+        sent = _normalize_ws(sent)
+        if not sent:
+            continue
+
+        # Prefer token-based counting for English. If no tokens (e.g. CJK), fall back to chars.
+        token_count = len(_tokenize_for_count(sent))
+        wc = int(token_count) if token_count > 0 else int(len(sent.split()))
+        if wc <= 0:
+            wc = 1
+
+        too_long = (max_words > 0 and wc > int(max_words)) or (max_chars > 0 and len(sent) > int(max_chars))
+        if not too_long:
+            rendered.append(sent)
+            continue
+
+        # Decide how many chunks we need.
+        target_count = 2
+        if max_words > 0:
+            target_count = max(target_count, int(math.ceil(float(wc) / float(max_words))))
+        if max_chars > 0:
+            target_count = max(target_count, int(math.ceil(float(len(sent)) / float(max_chars))))
+
+        clauses = [c.strip() for c in _split_source_text_relaxed(sent) if str(c).strip()]
+        grouped = _group_clauses_evenly(clauses, target_count)
+        if grouped:
+            rendered.append("\n".join(grouped).strip())
+            continue
+
+        # Fallback: word-based even split (guarantees count).
+        rendered.append("\n".join([p for p in _split_words_to_count(sent, target_count) if p.strip()]).strip())
+
+    return " ".join([x for x in rendered if x]).strip()
 
 
 def _generate_ass_header(
@@ -728,7 +890,6 @@ def generate_monolingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
     *,
-    speed_up: float = 1.0,
     play_res_x: int = 1920,
     play_res_y: int = 1080,
     font_name: str = "Arial",
@@ -760,8 +921,8 @@ def generate_monolingual_ass(
         if not zh_raw:
             continue
 
-        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0) / float(speed_up))
-        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0) / float(speed_up))
+        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0))
+        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0))
 
         zh = _ass_escape_text(wrap_text(zh_raw, max_chars_zh=max_chars_zh, max_chars_en=max_chars_zh)).replace(
             "\n", r"\N"
@@ -779,7 +940,6 @@ def generate_bilingual_ass(
     translation: list[dict[str, Any]],
     ass_path: str,
     *,
-    speed_up: float = 1.0,
     play_res_x: int = 1920,
     play_res_y: int = 1080,
     font_name: str = "Arial",
@@ -808,12 +968,12 @@ def generate_bilingual_ass(
     for seg in translation:
         check_cancelled()
         zh_raw = str(seg.get("translation") or "").strip()
-        en_raw = _first_sentence(str(seg.get("text") or ""))
+        en_raw = _bilingual_source_text(str(seg.get("text") or ""))
         if not zh_raw and not en_raw:
             continue
 
-        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0) / float(speed_up))
-        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0) / float(speed_up))
+        start = format_timestamp_ass(float(seg.get("start", 0.0) or 0.0))
+        end = format_timestamp_ass(float(seg.get("end", 0.0) or 0.0))
 
         zh = _ass_escape_text(wrap_text(zh_raw, max_chars_zh=max_chars_zh, max_chars_en=max_chars_en)).replace(
             "\n", r"\N"
@@ -836,7 +996,6 @@ def generate_bilingual_ass(
 def generate_srt(
     translation: list[dict[str, Any]], 
     srt_path: str, 
-    speed_up: float = 1.0, 
     max_line_char: int = 55,
     bilingual_subtitle: bool = False,
     max_chars_zh: int | None = None,
@@ -861,10 +1020,14 @@ def generate_srt(
     with open(srt_path, 'w', encoding='utf-8') as f:
         seq = 0
         for line in translation:
-            start = format_timestamp(line['start'] / speed_up)
-            end = format_timestamp(line['end'] / speed_up)
+            start = format_timestamp(line["start"])
+            end = format_timestamp(line["end"])
             tr_text = str(line.get('translation', '') or '').strip()
-            src_text = _first_sentence(str(line.get("text", "") or "")) if bilingual_subtitle else str(line.get('text', '') or '').strip()
+            src_text = (
+                _bilingual_source_text(str(line.get("text", "") or ""))
+                if bilingual_subtitle
+                else str(line.get("text", "") or "").strip()
+            )
 
             if not tr_text and not (bilingual_subtitle and src_text):
                 continue
@@ -1155,7 +1318,7 @@ def _ensure_audio_combined(
     生成 audio_combined.wav 和 audio_tts.wav
     
     如果 adaptive_segment_stretch=True:
-        - 不对 TTS 做相位声码器 time_stretch（避免“回音/空洞”感）
+        - 不使用相位声码器 time_stretch（避免“回音/空洞”感）；可选使用 audiostretchy 做 TSM 语速对齐
         - 逐段拼接（可裁剪首尾静音）并插入短停顿，生成 translation_adaptive.json
         - 同时生成 adaptive_plan.json，用于逐段拉伸/裁剪原视频并 concat
     否则:
@@ -1207,6 +1370,94 @@ def _ensure_audio_combined(
         gap_default_s = 0.12
         gap_clause_s = 0.18
         gap_sentence_s = 0.25
+
+        def _read_env_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None:
+                return bool(default)
+            s = str(raw).strip().lower()
+            if not s:
+                return bool(default)
+            return s not in {"0", "false", "no", "off"}
+
+        def _read_env_float(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return float(default)
+            s = str(raw).strip()
+            if not s:
+                return float(default)
+            try:
+                return float(s)
+            except Exception:
+                return float(default)
+
+        # Optional: speech-rate based TTS time-scale modification (TSM) to match EN pacing.
+        align_enabled = _read_env_bool("SPEECH_RATE_ALIGN_ENABLED", True)
+        align_mode = str(os.getenv("SPEECH_RATE_ALIGN_MODE", "single") or "single").strip().lower()
+        voice_min = _read_env_float("SPEECH_RATE_VOICE_MIN_RATIO", 0.7)
+        voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.3)
+        silence_min = _read_env_float("SPEECH_RATE_SILENCE_MIN_RATIO", 0.3)
+        silence_max = _read_env_float("SPEECH_RATE_SILENCE_MAX_RATIO", 3.0)
+        overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
+        overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
+        align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
+        en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
+        zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
+        # Blend weight between speech-rate ratio and time-budget ratio (en_total / zh_total).
+        # - 0.0: pure speech-rate (more natural articulation)
+        # - 1.0: pure time-budget (more aggressive, keeps pacing closer to original timestamps)
+        budget_weight = _read_env_float("SPEECH_RATE_BUDGET_WEIGHT", 0.7)
+        audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
+
+        # Global bias to avoid overall pacing drift.
+        #
+        # Problem: even with comparable speech-rate metrics, ZH translation often has more syllables
+        # and TTS tends to speak slower, so the whole output can become noticeably longer (\"慢\").
+        # We compute a per-video bias using the original EN segment time budget vs the raw (trimmed)
+        # ZH TTS durations, then apply it by effectively increasing the EN reference rate.
+        align_global_bias = 1.0
+        if align_enabled:
+            try:
+                total_en = 0.0
+                for _seg in translation:
+                    try:
+                        s0 = float(_seg.get("start", 0.0) or 0.0)
+                        s1 = float(_seg.get("end", 0.0) or 0.0)
+                        if s1 < s0:
+                            s0, s1 = s1, s0
+                        total_en += float(max(0.0, s1 - s0))
+                    except Exception:
+                        continue
+
+                total_zh = 0.0
+                for _i in range(expected_count):
+                    check_cancelled()
+                    wav_path = os.path.join(wavs_folder, wav_files[_i])
+                    if not os.path.exists(wav_path):
+                        continue
+                    try:
+                        y, _sr = librosa.load(wav_path, sr=sample_rate, mono=True)
+                        y = y.astype(np.float32, copy=False)
+                        if y.size > 0:
+                            try:
+                                trimmed, _idx = librosa.effects.trim(y, top_db=float(trim_top_db))
+                                if trimmed is not None and trimmed.size > 0:
+                                    y = trimmed.astype(np.float32, copy=False)
+                            except Exception:
+                                pass
+                        total_zh += float(y.shape[0]) / float(sample_rate) if y.size > 0 else 0.0
+                    except Exception:
+                        continue
+
+                if total_en > 0.0 and total_zh > 0.0:
+                    align_global_bias = float(total_en / total_zh)
+                    # We only use this to speed up overall pacing (cap at 1.0).
+                    align_global_bias = float(max(0.3, min(align_global_bias, 1.0)))
+                    logger.info(f"语速对齐: 全局bias={align_global_bias:.3f} (en={total_en:.1f}s, zh={total_zh:.1f}s)")
+            except Exception as exc:
+                logger.warning(f"语速对齐: 计算全局bias失败，将回退为 1.0: {exc}")
+                align_global_bias = 1.0
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1261,7 +1512,132 @@ def _ensure_audio_combined(
             if orig_end < orig_start:
                 orig_start, orig_end = orig_end, orig_start
 
-            # Output speech duration is exactly the (trimmed) TTS segment duration.
+            ratio_info: dict[str, Any] | None = None
+            en_stats: dict[str, Any] | None = None
+            zh_stats: dict[str, Any] | None = None
+
+            # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
+            if align_enabled and tts_audio.size > 0:
+                try:
+                    en_text = str(seg.get("text") or "")
+                    en_total_duration = float(max(0.0, orig_end - orig_start))
+
+                    # Estimate EN voiced duration from the original vocal stem (VAD).
+                    en_voiced_duration = float(en_total_duration)
+                    if en_total_duration > 0 and os.path.exists(audio_vocals_path):
+                        try:
+                            en_audio, en_sr = librosa.load(
+                                audio_vocals_path,
+                                sr=None,
+                                mono=True,
+                                offset=max(0.0, float(orig_start)),
+                                duration=float(en_total_duration),
+                            )
+                            en_audio = np.asarray(en_audio, dtype=np.float32).reshape(-1)
+                            if en_audio.size > 0 and int(en_sr or 0) > 0:
+                                try:
+                                    intervals = librosa.effects.split(en_audio, top_db=float(en_vad_top_db))
+                                except Exception:
+                                    intervals = np.zeros((0, 2), dtype=np.int64)
+                                voiced_samples = 0
+                                for st, ed in intervals:
+                                    st_i = int(st)
+                                    ed_i = int(ed)
+                                    if ed_i > st_i:
+                                        voiced_samples += (ed_i - st_i)
+                                en_voiced_duration = float(voiced_samples) / float(en_sr) if voiced_samples > 0 else 0.0
+                        except Exception:
+                            en_voiced_duration = float(en_total_duration)
+
+                    en_voiced_duration = float(max(0.0, min(en_voiced_duration, en_total_duration)))
+                    en_silence_duration = float(max(0.0, en_total_duration - en_voiced_duration))
+                    en_pause_ratio = float(en_silence_duration / en_total_duration) if en_total_duration > 0 else 0.0
+
+                    en_stats = dict(compute_en_speech_rate(en_text, en_voiced_duration))
+                    en_stats.update(
+                        {
+                            "total_duration": float(en_total_duration),
+                            "voiced_duration": float(en_voiced_duration),
+                            "silence_duration": float(en_silence_duration),
+                            "pause_ratio": float(en_pause_ratio),
+                        }
+                    )
+                except Exception as exc:
+                    logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
+                    en_stats = None
+
+                if en_stats:
+                    try:
+                        zh_text = str(seg.get("translation") or "")
+                        zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
+
+                        # ZH voiced duration from TTS itself (VAD).
+                        zh_voiced_duration = float(zh_total_duration)
+                        if tts_audio.size > 0 and sample_rate > 0:
+                            try:
+                                intervals = librosa.effects.split(tts_audio.astype(np.float32, copy=False), top_db=float(zh_vad_top_db))
+                            except Exception:
+                                intervals = np.zeros((0, 2), dtype=np.int64)
+                            voiced_samples = 0
+                            for st, ed in intervals:
+                                st_i = int(st)
+                                ed_i = int(ed)
+                                if ed_i > st_i:
+                                    voiced_samples += (ed_i - st_i)
+                            zh_voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
+
+                        zh_voiced_duration = float(max(0.0, min(zh_voiced_duration, zh_total_duration)))
+                        zh_silence_duration = float(max(0.0, zh_total_duration - zh_voiced_duration))
+                        zh_pause_ratio = float(zh_silence_duration / zh_total_duration) if zh_total_duration > 0 else 0.0
+
+                        zh_stats = dict(compute_zh_speech_rate(zh_text, zh_voiced_duration))
+                        zh_stats.update(
+                            {
+                                "total_duration": float(zh_total_duration),
+                                "voiced_duration": float(zh_voiced_duration),
+                                "silence_duration": float(zh_silence_duration),
+                                "pause_ratio": float(zh_pause_ratio),
+                            }
+                        )
+
+                        # Apply global bias by effectively increasing EN reference rate.
+                        en_stats_used = dict(en_stats)
+                        if float(align_global_bias) > 1e-6 and abs(float(align_global_bias) - 1.0) > 1e-6:
+                            en_stats_used["syllable_rate"] = float(en_stats_used.get("syllable_rate", 0.0)) / float(
+                                align_global_bias
+                            )
+
+                        ratio_info = compute_scaling_ratio(
+                            en_stats_used,
+                            zh_stats,
+                            mode=align_mode,
+                            budget_weight=float(budget_weight),
+                            voice_min=voice_min,
+                            voice_max=voice_max,
+                            silence_min=silence_min,
+                            silence_max=silence_max,
+                            overall_min=overall_min,
+                            overall_max=overall_max,
+                        )
+                        if abs(float(ratio_info.get("voice_ratio", 1.0)) - 1.0) > float(align_threshold) or abs(
+                            float(ratio_info.get("silence_ratio", 1.0)) - 1.0
+                        ) > float(align_threshold):
+                            tts_audio, _scale_info = apply_scaling_ratio(
+                                tts_audio, sample_rate, ratio_info, mode=str(ratio_info.get("mode", align_mode))
+                            )
+                            if bool(ratio_info.get("clamped")):
+                                logger.warning(
+                                    f"段落 {i}: 语速比例已触发 clamp "
+                                    f"(voice={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{ratio_info.get('voice_ratio', 1.0):.3f}, "
+                                    f"silence={ratio_info.get('silence_ratio_raw', 1.0):.3f}->{ratio_info.get('silence_ratio', 1.0):.3f})"
+                                )
+                    except Exception as exc:
+                        logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
+                        ratio_info = None
+                        en_stats = None
+                        zh_stats = None
+
+            # Output speech duration is exactly the (trimmed + optionally stretched) TTS segment duration.
             target_samples = int(tts_audio.shape[0])
             target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
 
@@ -1285,6 +1661,34 @@ def _ensure_audio_combined(
                     "src_end": round(orig_end, 6),
                     "target_duration": round(target_duration, 6),
                     "target_samples": int(target_samples),
+                    "speech_rate_mode": (ratio_info.get("mode") if ratio_info else None),
+                    "voice_ratio": (round(float(ratio_info.get("voice_ratio", 1.0)), 6) if ratio_info else None),
+                    "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
+                    "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
+                    "voice_ratio_rate_raw": (
+                        round(float(ratio_info.get("voice_ratio_rate_raw", 1.0)), 6) if ratio_info else None
+                    ),
+                    "voice_ratio_budget_raw": (
+                        round(float(ratio_info.get("voice_ratio_budget_raw", 1.0)), 6) if ratio_info else None
+                    ),
+                    "speech_rate_budget_weight": (
+                        round(float(ratio_info.get("speech_rate_budget_weight", 0.0)), 6) if ratio_info else None
+                    ),
+                    "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
+                    "speech_rate_global_bias": (round(float(align_global_bias), 6) if ratio_info else None),
+                    "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
+                    "speech_rate_zh": (round(float(zh_stats.get("syllable_rate", 0.0)), 6) if zh_stats else None),
+                    "speech_syllables_en": (int(en_stats.get("syllable_count", 0)) if en_stats else None),
+                    "speech_syllables_zh": (int(zh_stats.get("syllable_count", 0)) if zh_stats else None),
+                    "en_total_duration": (round(float(en_stats.get("total_duration", 0.0)), 6) if en_stats else None),
+                    "en_voiced_duration": (round(float(en_stats.get("voiced_duration", 0.0)), 6) if en_stats else None),
+                    "en_silence_duration": (round(float(en_stats.get("silence_duration", 0.0)), 6) if en_stats else None),
+                    "en_pause_ratio": (round(float(en_stats.get("pause_ratio", 0.0)), 6) if en_stats else None),
+                    "zh_total_duration": (round(float(zh_stats.get("total_duration", 0.0)), 6) if zh_stats else None),
+                    "zh_voiced_duration": (round(float(zh_stats.get("voiced_duration", 0.0)), 6) if zh_stats else None),
+                    "zh_silence_duration": (round(float(zh_stats.get("silence_duration", 0.0)), 6) if zh_stats else None),
+                    "zh_pause_ratio": (round(float(zh_stats.get("pause_ratio", 0.0)), 6) if zh_stats else None),
+                    "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
                 }
             )
 
@@ -1675,7 +2079,6 @@ def _ensure_audio_combined(
 def synthesize_video(
     folder: str, 
     subtitles: bool = True, 
-    speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
     use_nvenc: bool = False,
@@ -1685,8 +2088,7 @@ def synthesize_video(
     check_cancelled()
     output_video = os.path.join(folder, "video.mp4")
 
-    # 缓存元数据中的“有效参数”（自适应模式下 speed_up/fps 不参与输出）
-    meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
+    # 缓存元数据中的“有效参数”（自适应模式下 fps 不参与输出）
     meta_fps = 0 if adaptive_segment_stretch else int(fps)
 
     # NOTE:
@@ -1699,7 +2101,6 @@ def synthesize_video(
         subtitles=subtitles,
         bilingual_subtitle=bilingual_subtitle,
         adaptive_segment_stretch=adaptive_segment_stretch,
-        speed_up=meta_speed_up,
         fps=meta_fps,
         resolution=resolution,
         use_nvenc=use_nvenc,
@@ -1818,12 +2219,9 @@ def synthesize_video(
 
     srt_path = os.path.join(folder, 'subtitles.srt')
     if subtitles:
-        # 自适应模式下，translation_adaptive.json 已经在输出时间轴，不应再做 speed_up 缩放。
-        subs_speed = 1.0 if adaptive_segment_stretch else speed_up
         generate_srt(
             translation,
             srt_path,
-            subs_speed,
             bilingual_subtitle=bilingual_subtitle,
             max_chars_zh=max_chars_zh,
             max_chars_en=max_chars_en,
@@ -1841,7 +2239,6 @@ def synthesize_video(
             generate_bilingual_ass(
                 translation,
                 ass_path,
-                speed_up=(1.0 if adaptive_segment_stretch else speed_up),
                 play_res_x=width,
                 play_res_y=height,
                 font_name="Arial",
@@ -1856,7 +2253,6 @@ def synthesize_video(
             generate_monolingual_ass(
                 translation,
                 ass_path,
-                speed_up=(1.0 if adaptive_segment_stretch else speed_up),
                 play_res_x=width,
                 play_res_y=height,
                 font_name="Arial",
@@ -1927,13 +2323,11 @@ def synthesize_video(
         with open(filter_script_path, "w", encoding="utf-8") as f:
             f.write(";\n".join(lines) + "\n")
     else:
-        # Legacy global speed-up path (video+audio).
-        video_speed_filter = f"setpts=PTS/{speed_up}"
-        audio_speed_filter = f"atempo={speed_up}"
-        v_filters: list[str] = [video_speed_filter, f"scale={width}:{height}"]
+        # Non-adaptive path: no global speed-up, only scale + optional subtitles.
+        v_filters: list[str] = [f"scale={width}:{height}"]
         if subtitles:
             v_filters.append(subtitle_filter)
-        filter_complex = f"[0:v]{','.join(v_filters)}[v];[1:a]{audio_speed_filter}[a]"
+        filter_complex = f"[0:v]{','.join(v_filters)}[v]"
         
     video_encoder = "h264_nvenc" if use_nvenc else "libx264"
     # 音频编码参数：上采样到 48kHz 并使用较高码率以保证音质
@@ -1985,7 +2379,7 @@ def synthesize_video(
             "-map",
             "[v]",
             "-map",
-            "[a]",
+            "1:a",
             "-r",
             str(fps),
             "-c:v",
@@ -2105,7 +2499,6 @@ def synthesize_video(
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
             adaptive_segment_stretch=adaptive_segment_stretch,
-            speed_up=meta_speed_up,
             fps=meta_fps,
             resolution=resolution,
             use_nvenc=use_nvenc,
@@ -2128,7 +2521,6 @@ def synthesize_video(
                 subtitles=subtitles,
                 bilingual_subtitle=bilingual_subtitle,
                 adaptive_segment_stretch=adaptive_segment_stretch,
-                speed_up=meta_speed_up,
                 fps=meta_fps,
                 resolution=resolution,
                 use_nvenc=False,
@@ -2143,7 +2535,6 @@ def synthesize_video(
 def synthesize_all_video_under_folder(
     folder: str, 
     subtitles: bool = True, 
-    speed_up: float = 1.2, 
     fps: int = 30, 
     resolution: str = '1080p',
     use_nvenc: bool = False,
@@ -2159,14 +2550,12 @@ def synthesize_all_video_under_folder(
         if "download.mp4" not in files:
             continue
         # Use the same freshness logic as synthesize_video() to avoid stale reuse.
-        meta_speed_up = 1.0 if adaptive_segment_stretch else float(speed_up)
         meta_fps = 0 if adaptive_segment_stretch else int(fps)
         up_to_date = _video_up_to_date(
             root,
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
             adaptive_segment_stretch=adaptive_segment_stretch,
-            speed_up=meta_speed_up,
             fps=meta_fps,
             resolution=resolution,
             use_nvenc=use_nvenc,
@@ -2213,7 +2602,6 @@ def synthesize_all_video_under_folder(
             root,
             subtitles=subtitles,
             bilingual_subtitle=bilingual_subtitle,
-            speed_up=speed_up,
             fps=fps,
             resolution=resolution,
             use_nvenc=use_nvenc,

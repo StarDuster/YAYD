@@ -79,8 +79,8 @@ class ModelManager:
     def _whisper_diarization_requirement(self) -> ModelRequirement:
         path = self.settings.resolve_path(self.settings.whisper_diarization_model_dir)
         hint = (
-            "需要 pyannote 说话人分离离线缓存（speaker-diarization-3.1 + segmentation-3.0）。"
-            "请先把模型下载到 WHISPER_DIARIZATION_MODEL_DIR，并配置 HF_TOKEN（首次下载/校验需要）。"
+            "需要 pyannote 说话人分离离线缓存（speaker-diarization-community-1）。"
+            "请先把模型下载到 WHISPER_DIARIZATION_MODEL_DIR，并配置 HF_TOKEN（需先在 HuggingFace 同意模型协议）。"
         )
         return ModelRequirement(
             name="Speaker Diarization (pyannote)",

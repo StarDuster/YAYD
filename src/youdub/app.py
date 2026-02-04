@@ -31,8 +31,6 @@ settings = Settings()
 model_manager = ModelManager(settings)
 pipeline = VideoPipeline(settings=settings, model_manager=model_manager)
 
-DEFAULT_SPEED_UP = 1.2
-
 # --- Gradio UI（中文）---
 _RESOLUTION_CHOICES = ["4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"]
 _DEVICE_CHOICES = [("自动", "auto"), ("GPU", "cuda"), ("CPU", "cpu")]
@@ -116,73 +114,6 @@ _AUTO_SCROLL_JS = r"""
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
-
-  // 监听“按段自适应拉伸”checkbox，禁用/灰化同一页的“加速倍率”slider。
-  // TabbedInterface 会同时挂载多个页面，因此这里显式绑定两组（全自动 / 视频合成）。
-  const setupAdaptiveStretchToggles = () => {
-    const pairs = [
-      {
-        checkboxSelector: "#adaptive-stretch-checkbox input[type='checkbox']",
-        sliderId: "speed-up-slider",
-      },
-      {
-        checkboxSelector: "#adaptive-stretch-checkbox-synthesize input[type='checkbox']",
-        sliderId: "speed-up-slider-synthesize",
-      },
-    ];
-
-    let anyFound = false;
-    let allReady = true;
-
-    pairs.forEach(({ checkboxSelector, sliderId }) => {
-      const checkbox = document.querySelector(checkboxSelector);
-      const sliderContainer = document.getElementById(sliderId);
-      if (!checkbox || !sliderContainer) {
-        allReady = false;
-        return;
-      }
-      anyFound = true;
-
-      // Avoid duplicate binding across retries.
-      if (checkbox.dataset.youdubAdaptiveBound === sliderId) return;
-
-      const setDisabled = (disabled) => {
-        sliderContainer.classList.toggle("youdub-disabled", !!disabled);
-        sliderContainer.setAttribute("aria-disabled", disabled ? "true" : "false");
-
-        // Gradio slider 通常包含 range + number + reset button；统一禁用。
-        const controls = sliderContainer.querySelectorAll("input, button, select, textarea");
-        controls.forEach((el) => {
-          try {
-            el.disabled = !!disabled;
-          } catch (e) {}
-          try {
-            el.setAttribute("aria-disabled", disabled ? "true" : "false");
-          } catch (e) {}
-        });
-      };
-
-      const update = () => {
-        const isAdaptive = !!checkbox.checked;
-        setDisabled(isAdaptive);
-      };
-
-      checkbox.addEventListener("change", update);
-      update();
-      checkbox.dataset.youdubAdaptiveBound = sliderId;
-    });
-
-    // Wait until both pages are mounted so both bindings work reliably.
-    return anyFound && allReady;
-  };
-
-  // 重试直到元素就绪（Gradio 动态加载/切 tab 时会延迟挂载）
-  const trySetup = () => {
-    if (!setupAdaptiveStretchToggles()) {
-      setTimeout(trySetup, 500);
-    }
-  };
-  trySetup();
 })();
 """
 
@@ -197,16 +128,6 @@ _OUTPUT_CSS = r"""
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 12px;
   line-height: 1.4;
-}
-
-/* 通用禁用态：用于“启用自适应拉伸后，加速倍率无效”的灰化展示 */
-.youdub-disabled {
-  opacity: 0.5 !important;
-  filter: grayscale(1) !important;
-}
-.youdub-disabled * {
-  pointer-events: none !important;
-  cursor: not-allowed !important;
 }
 """
 
@@ -540,7 +461,6 @@ def run_pipeline(
     subtitles,
     bilingual_subtitle,
     tts_adaptive_segment_stretch,
-    speed_up,
     fps,
     use_nvenc,
     target_resolution,
@@ -549,8 +469,6 @@ def run_pipeline(
     auto_upload_video,
 ):
     try:
-        # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
-        effective_speed_up = 1.0 if tts_adaptive_segment_stretch else speed_up
         with _temp_env(
             {
                 "TRANSLATION_STRATEGY": translation_strategy,
@@ -584,7 +502,6 @@ def run_pipeline(
                 tts_adaptive_segment_stretch=bool(tts_adaptive_segment_stretch),
                 subtitles=subtitles,
                 bilingual_subtitle=bool(bilingual_subtitle),
-                speed_up=effective_speed_up,
                 fps=fps,
                 target_resolution=target_resolution,
                 use_nvenc=use_nvenc,
@@ -629,12 +546,9 @@ def download_models(selected_models: list[str], hf_token: str):
             "revision": "edc79942a0352e00c3b03657b4943f293cf0f1d0",
         },
         "diarization": {
-            "repo_id": "pyannote/speaker-diarization-3.1",
-            "revision": "84fd25912480287da0247647c3d2b4853cb3ee5d",
-        },
-        "segmentation": {
-            "repo_id": "pyannote/segmentation-3.0",
-            "revision": "4ca4d5a8d2ab82ddfbea8aa3b29c15431671239c",
+            "repo_id": "pyannote/speaker-diarization-community-1",
+            # community-1 is gated: requires accepting conditions + HF token.
+            "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
         },
         "qwen_asr": {
             "repo_id": "Qwen/Qwen3-ASR-1.7B",
@@ -711,27 +625,21 @@ def download_models(selected_models: list[str], hf_token: str):
                 logger.warning("未提供 HF_TOKEN，跳过 Pyannote 模型下载（需要同意协议并设置 token）")
             else:
                 diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
-                old_hf_home = os.environ.get("HF_HOME")
-                os.environ["HF_HOME"] = str(diar_dir)
+                diar_dir.mkdir(parents=True, exist_ok=True)
 
-                for key in ["diarization", "segmentation"]:
-                    conf = MODELS_TO_DOWNLOAD[key]
-                    logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
-                    try:
-                        snapshot_download(
-                            repo_id=conf["repo_id"],
-                            revision=conf["revision"],
-                            token=hf_token,
-                            resume_download=True,
-                        )
-                        logger.info(f"{conf['repo_id']} 下载完成。")
-                    except Exception as e:
-                        logger.error(f"下载失败 {conf['repo_id']}: {e}")
-
-                if old_hf_home is not None:
-                    os.environ["HF_HOME"] = old_hf_home
-                else:
-                    os.environ.pop("HF_HOME", None)
+                conf = MODELS_TO_DOWNLOAD["diarization"]
+                logger.info(f"下载 {conf['repo_id']} ({conf['revision'][:7]}) ...")
+                try:
+                    snapshot_download(
+                        repo_id=conf["repo_id"],
+                        revision=conf["revision"],
+                        token=hf_token,
+                        cache_dir=str(diar_dir),
+                        resume_download=True,
+                    )
+                    logger.info(f"{conf['repo_id']} 下载完成。")
+                except Exception as e:
+                    logger.error(f"下载失败 {conf['repo_id']}: {e}")
 
         # 4. Qwen3-ASR
         if "qwen_asr" in selected_models:
@@ -921,13 +829,6 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             label="按段自适应拉伸语音(减少无声)",
             value=False,
             elem_id="adaptive-stretch-checkbox",
-            info="启用后下方的加速倍率无效",
-        )
-        speed_up_input = gr.Slider(
-            minimum=0.5, maximum=1.8, step=0.05,
-            label="加速倍率",
-            value=DEFAULT_SPEED_UP,
-            elem_id="speed-up-slider",
         )
         fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
         use_nvenc_input = gr.Checkbox(label="使用 NVENC（h264_nvenc）", value=DEFAULT_USE_NVENC, info="需要 NVIDIA GPU")
@@ -1003,7 +904,6 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             subtitles_input,
             bilingual_subtitle_input,
             adaptive_stretch_input,
-            speed_up_input,
             fps_input,
             use_nvenc_input,
             target_resolution_input,
@@ -1346,21 +1246,17 @@ def _synthesize_video_wrapper(
     subtitles,
     bilingual_subtitle,
     adaptive_stretch,
-    speed_up,
     fps,
     resolution,
     use_nvenc,
     max_workers,
     auto_upload_video,
 ):
-    # 当启用自适应拉伸时，忽略 speed_up，强制设为 1.0
-    effective_speed_up = 1.0 if adaptive_stretch else speed_up
     return synthesize_all_video_under_folder(
         folder,
         subtitles=subtitles,
         bilingual_subtitle=bilingual_subtitle,
         adaptive_segment_stretch=bool(adaptive_stretch),
-        speed_up=effective_speed_up,
         fps=fps,
         resolution=resolution,
         use_nvenc=use_nvenc,
@@ -1379,15 +1275,6 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             label="按段自适应拉伸语音(减少无声)",
             value=False,
             elem_id="adaptive-stretch-checkbox-synthesize",
-            info="启用后下方的加速倍率无效",
-        )
-        synth_speed_input = gr.Slider(
-            minimum=0.5,
-            maximum=1.8,
-            step=0.05,
-            label="加速倍率",
-            value=DEFAULT_SPEED_UP,
-            elem_id="speed-up-slider-synthesize",
         )
         synth_fps_input = gr.Slider(minimum=1, maximum=60, step=1, label="帧率（每秒帧数）", value=30)
         synth_resolution_input = gr.Radio(_RESOLUTION_CHOICES, label="输出分辨率", value="1080p")
@@ -1416,7 +1303,6 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
             synth_subtitles_input,
             synth_bilingual_input,
             synth_adaptive_input,
-            synth_speed_input,
             synth_fps_input,
             synth_resolution_input,
             synth_nvenc_input,

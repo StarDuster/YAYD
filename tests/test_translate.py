@@ -342,8 +342,9 @@ def test_translate_content_guide_parallel_returns_indexed_translations(monkeypat
                 ensure_ascii=False,
             )
 
-        # Chunk translation step: user message is a JSON map {idx: text}.
-        payload = json.loads(user)
+        # Chunk translation step: user message is a JSON object containing sentences/speakers/contexts.
+        obj = json.loads(user)
+        payload = obj.get("sentences", obj) if isinstance(obj, dict) else obj
         out = {k: (f"句{k}" if str(v).strip() else "") for k, v in payload.items()}
         return json.dumps(out, ensure_ascii=False)
 
@@ -488,6 +489,73 @@ def test_translate_folder_skips_when_translation_and_summary_exist(tmp_path: Pat
     ok = tr.translate_folder(str(folder), target_language="简体中文")
     assert ok is True
     assert not (folder / "translation_raw.json").exists()
+
+
+def test_translate_folder_retranslates_when_transcript_length_changes(tmp_path: Path, monkeypatch):
+    import youdub.steps.translate as tr
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    # Disable punctuation fix to avoid LLM calls in tests.
+    monkeypatch.setenv("YOUDUB_PUNCTUATION_FIX_BEFORE_TRANSLATE", "0")
+
+    (folder / "download.info.json").write_text(
+        json.dumps({"title": "t", "uploader": "u", "upload_date": "20260101"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # Existing translation files (from an older transcript segmentation)
+    (folder / "translation_raw.json").write_text(
+        json.dumps(
+            [{"start": 0.0, "end": 1.0, "text": "old", "speaker": "SPEAKER_00", "translation": "旧"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (folder / "translation.json").write_text(
+        json.dumps(
+            [{"start": 0.0, "end": 1.0, "text": "old", "speaker": "SPEAKER_00", "translation": "旧"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (folder / "summary.json").write_text(
+        json.dumps({"title": "t", "author": "u", "summary": "s", "tags": [], "translation_model": "dummy"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # Transcript is newer and has different length -> should trigger re-translation.
+    (folder / "transcript.json").write_text(
+        json.dumps(
+            [
+                {"start": 0.0, "end": 1.0, "text": "a", "speaker": "SPEAKER_00"},
+                {"start": 1.0, "end": 2.0, "text": "b", "speaker": "SPEAKER_00"},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    calls = {"n": 0}
+
+    def _fake_translate_content(_summary, transcript, *_args, **_kwargs):
+        calls["n"] += 1
+        return ["好"] * len(transcript)
+
+    def _should_not_call(*_args, **_kwargs):
+        raise AssertionError("summarize should not be called when summary.json already exists")
+
+    monkeypatch.setattr(tr, "summarize", _should_not_call)
+    monkeypatch.setattr(tr, "_translate_content", _fake_translate_content)
+
+    ok = tr.translate_folder(str(folder), target_language="简体中文", settings=tr.Settings(openai_api_key="dummy"))
+    assert ok is True
+    assert calls["n"] == 1
+
+    raw = json.loads((folder / "translation_raw.json").read_text(encoding="utf-8"))
+    assert isinstance(raw, list)
+    assert len(raw) == 2
 
 
 # --------------------------------------------------------------------------- #

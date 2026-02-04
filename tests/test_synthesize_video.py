@@ -49,3 +49,26 @@ def test_subtitle_style_params_4k_not_huge():
     # (e.g. accidentally using max(width,height) or an overly aggressive scale factor)
     font_size, *_rest = sv._calc_subtitle_style_params(3840, 2160)
     assert font_size < 100
+
+
+def test_bilingual_source_text_keeps_multiple_sentences():
+    import youdub.steps.synthesize_video as sv
+
+    src = "Hello world. How are you? I'm fine!"
+    out = sv._bilingual_source_text(src)
+    # Should not truncate to only the first sentence.
+    assert out.startswith("Hello world.")
+    assert "How are you?" in out
+    assert "I'm fine!" in out
+
+
+def test_bilingual_source_text_splits_overlong_sentence_by_clauses():
+    import youdub.steps.synthesize_video as sv
+
+    src = (
+        "This is clause one, this is clause two, this is clause three, "
+        "this is clause four, this is clause five."
+    )
+    out = sv._bilingual_source_text(src, max_words=6, max_chars=10_000)
+    # When a single sentence is too long, we split by clauses and insert newlines.
+    assert "\n" in out

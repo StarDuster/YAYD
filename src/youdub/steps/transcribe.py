@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import importlib.util
 import json
@@ -21,41 +20,11 @@ from ..config import Settings
 from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
 from ..utils import (
-    ensure_torchaudio_backend_compat,
     read_speaker_ref_seconds,
     save_wav,
+    torch_load_weights_only_compat,
     wav_duration_seconds,
 )
-
-
-@contextlib.contextmanager
-def _torch_load_weights_only_compat():
-    """Temporarily force `torch.load(weights_only=False)` for legacy checkpoints.
-
-    Newer PyTorch versions changed `weights_only` default to True, which breaks loading
-    older (pickled) checkpoints used by pyannote.audio. We scope this monkeypatch to
-    diarization pipeline loading only.
-    """
-
-    orig_load = torch.load
-
-    def _load(*args, **kwargs):  # type: ignore[no-untyped-def]
-        # Force legacy behavior even if callers explicitly pass weights_only=True
-        # (e.g. lightning_fabric cloud_io).
-        patched = dict(kwargs)
-        patched["weights_only"] = False
-        try:
-            return orig_load(*args, **patched)
-        except TypeError:
-            # Older torch versions may not accept `weights_only`.
-            patched.pop("weights_only", None)
-            return orig_load(*args, **patched)
-
-    torch.load = _load  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        torch.load = orig_load  # type: ignore[assignment]
 
 
 def _import_faster_whisper():
@@ -82,6 +51,7 @@ _QWEN_ASR_KEY: str | None = None
 
 _DIARIZATION_PIPELINE = None
 _DIARIZATION_KEY: str | None = None
+_PYANNOTE_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
 
 
 _CUDNN_PRELOADED = False
@@ -403,9 +373,48 @@ def init_asr(settings: Settings | None = None, model_manager: ModelManager | Non
 def _find_pyannote_config(root_dir: Path) -> Path | None:
     if not root_dir.exists():
         return None
-    for path in root_dir.rglob("config.yaml"):
-        if "snapshots" in path.parts:
-            return path
+
+    # Local clone layout (recommended by pyannote for offline use):
+    #   <dir>/config.yaml
+    direct = root_dir / "config.yaml"
+    if direct.exists():
+        return direct
+
+    org, repo = _PYANNOTE_DIARIZATION_MODEL_ID.split("/", 1)
+
+    # HF cache layout (new):
+    #   <HF_HOME>/hub/models--ORG--REPO/snapshots/<rev>/config.yaml
+    candidates = [
+        root_dir / f"models--{org}--{repo}",
+        root_dir / "hub" / f"models--{org}--{repo}",
+    ]
+
+    for base in candidates:
+        if not base.exists() or not base.is_dir():
+            continue
+
+        cfg_direct = base / "config.yaml"
+        if cfg_direct.exists():
+            return cfg_direct
+
+        snapshots = base / "snapshots"
+        if snapshots.exists() and snapshots.is_dir():
+            best: Path | None = None
+            best_mtime = -1.0
+            for snap in snapshots.iterdir():
+                cfg = snap / "config.yaml"
+                if not cfg.exists():
+                    continue
+                try:
+                    mtime = float(cfg.stat().st_mtime)
+                except Exception:
+                    mtime = 0.0
+                if mtime > best_mtime:
+                    best = cfg
+                    best_mtime = mtime
+            if best is not None:
+                return best
+
     return None
 
 
@@ -425,15 +434,36 @@ def load_diarize_model(
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    def _read_float_env(name: str) -> float | None:
+        raw = os.getenv(name)
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            logger.warning(f"环境变量 {name} 不是有效浮点数，将忽略: {raw!r}")
+            return None
+
+    # Optional: allow users to tune diarization hyperparameters without code changes.
+    # These names intentionally match pipeline.parameters() keys:
+    # - segmentation.min_duration_off
+    # - clustering.threshold
+    seg_min_off = _read_float_env("PYANNOTE_SEGMENTATION_MIN_DURATION_OFF")
+    clust_thr = _read_float_env("PYANNOTE_CLUSTERING_THRESHOLD")
+
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     diar_dir_str = str(diar_dir) if diar_dir else ""
-    key = f"{device}|{diar_dir_str}"
+    cache_dir = diar_dir_str or None
+    key = (
+        f"{device}|{diar_dir_str}|{_PYANNOTE_DIARIZATION_MODEL_ID}"
+        f"|seg_min_off={seg_min_off if seg_min_off is not None else 'default'}"
+        f"|clust_thr={clust_thr if clust_thr is not None else 'default'}"
+    )
     if _DIARIZATION_PIPELINE is not None and _DIARIZATION_KEY == key:
         return
-
-    # pyannote.audio<=3.1 imports torchaudio.set_audio_backend at import time, but torchaudio>=2.10 removed it.
-    # Provide a no-op shim so diarization can still work with the default backend.
-    ensure_torchaudio_backend_compat()
 
     try:
         from pyannote.audio import Pipeline  # type: ignore
@@ -444,32 +474,50 @@ def load_diarize_model(
             f"原始错误: {exc}"
         ) from exc
 
-    if diar_dir:
-        # Force HF cache into the provided directory for offline execution.
-        os.environ["HF_HOME"] = diar_dir_str
-        os.environ["TRANSFORMERS_CACHE"] = diar_dir_str
-
+    token = settings.hf_token
     cfg = _find_pyannote_config(diar_dir) if diar_dir else None
-
-    logger.info(f"加载说话人分离管道 (设备={device})")
+    logger.info(f"加载说话人分离管道: {_PYANNOTE_DIARIZATION_MODEL_ID} (设备={device})")
     t0 = time.time()
-    with _torch_load_weights_only_compat():
+    with torch_load_weights_only_compat():
         if cfg and cfg.exists():
-            pipeline = Pipeline.from_pretrained(str(cfg))
+            try:
+                pipeline = Pipeline.from_pretrained(str(cfg), token=token, cache_dir=cache_dir)
+            except TypeError:
+                try:
+                    pipeline = Pipeline.from_pretrained(str(cfg), use_auth_token=token, cache_dir=cache_dir)
+                except TypeError:
+                    # Older pyannote versions may not accept auth/cache kwargs for local checkpoints.
+                    pipeline = Pipeline.from_pretrained(str(cfg))
         else:
-            token = settings.hf_token
             if not token:
-                raise ModelCheckError("缺少 HF_TOKEN，无法加载 pyannote/speaker-diarization-3.1。")
+                raise ModelCheckError(f"缺少 HF_TOKEN，无法加载 {_PYANNOTE_DIARIZATION_MODEL_ID}。")
             # pyannote.audio v4 uses `token=...`; older versions use `use_auth_token=...`.
             try:
-                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=token)
+                pipeline = Pipeline.from_pretrained(_PYANNOTE_DIARIZATION_MODEL_ID, token=token, cache_dir=cache_dir)
             except TypeError:
-                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+                try:
+                    pipeline = Pipeline.from_pretrained(
+                        _PYANNOTE_DIARIZATION_MODEL_ID, use_auth_token=token, cache_dir=cache_dir
+                    )
+                except TypeError:
+                    pipeline = Pipeline.from_pretrained(_PYANNOTE_DIARIZATION_MODEL_ID, use_auth_token=token)
+    logger.info(f"说话人分离管道加载完成，耗时 {time.time() - t0:.2f}秒")
 
     pipeline.to(torch.device(device))
+    # Apply user-provided hyperparameters (best-effort).
+    if seg_min_off is not None or clust_thr is not None:
+        params: dict[str, dict[str, float]] = {}
+        if seg_min_off is not None:
+            params.setdefault("segmentation", {})["min_duration_off"] = float(seg_min_off)
+        if clust_thr is not None:
+            params.setdefault("clustering", {})["threshold"] = float(clust_thr)
+        try:
+            pipeline.instantiate(params)
+            logger.info(f"已应用说话人分离参数: {params}")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f"应用说话人分离参数失败（忽略，使用默认值）: {exc}")
     _DIARIZATION_PIPELINE = pipeline
     _DIARIZATION_KEY = key
-    logger.info(f"说话人分离管道加载完成，耗时 {time.time() - t0:.2f}秒")
 
 
 def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~') -> list[dict[str, Any]]:
@@ -494,6 +542,13 @@ def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~
 
         buffer["text"] = (str(buffer.get("text", "")).strip() + " " + str(segment.get("text", "")).strip()).strip()
         buffer["end"] = segment.get("end", buffer.get("end"))
+        # Merge word-level timestamps only when both sides have them.
+        buf_words = buffer.get("words")
+        seg_words = segment.get("words")
+        if buf_words is None or seg_words is None:
+            buffer["words"] = None
+        else:
+            buffer["words"] = list(buf_words) + list(seg_words)
 
     if buffer is not None:
         merged.append(buffer)
@@ -649,6 +704,44 @@ def transcribe_audio(
                 pass
         else:
             logger.info(f"转录已存在于 {folder}")
+            # Optional: re-run diarization on existing transcript to refresh speaker labels.
+            # IMPORTANT: do not change segmentation/text here (keep downstream alignment stable).
+            if diarization:
+                wav_path_existing = os.path.join(folder, "audio_vocals.wav")
+                if not os.path.exists(wav_path_existing):
+                    logger.warning(f"转录已存在但缺少人声轨，无法重新说话人分离: {wav_path_existing}")
+                else:
+                    try:
+                        check_cancelled()
+                        load_diarize_model(device=device, settings=settings, model_manager=model_manager)
+                        assert _DIARIZATION_PIPELINE is not None
+                        model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
+                        logger.info(f"转录已存在，重新计算说话人分离 ({model_tag})...")
+                        check_cancelled()
+                        ann = _DIARIZATION_PIPELINE(
+                            wav_path_existing, min_speakers=min_speakers, max_speakers=max_speakers
+                        )
+                        ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
+                        turns: list[dict[str, Any]] = []
+                        for seg, _, speaker in ann_view.itertracks(yield_label=True):
+                            check_cancelled()
+                            turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
+                        _assign_speakers_by_overlap(transcript, turns)
+
+                        check_cancelled()
+                        with open(transcript_path, "w", encoding="utf-8") as f:
+                            json.dump(transcript, f, indent=2, ensure_ascii=False)
+                        logger.info(f"已更新转录说话人标签: {transcript_path}")
+
+                        # Speaker refs are derived from speaker labels; refresh them best-effort.
+                        try:
+                            check_cancelled()
+                            generate_speaker_audio(folder, transcript)
+                        except Exception as exc:  # pylint: disable=broad-except
+                            logger.warning(f"生成说话人参考音频失败（忽略）: {exc}")
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.warning(f"重新说话人分离失败，保留原转录说话人标签: {exc}")
+
             # Ensure speaker reference files exist even when transcript step is skipped.
             try:
                 speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
@@ -789,6 +882,7 @@ def transcribe_audio(
 
         _preload_cudnn_for_onnxruntime_gpu()
 
+        # VAD: 使用 faster-whisper 默认参数（避免过度切分导致重复/幻觉）
         # Prefer batched pipeline if available (much higher throughput on GPU).
         if _ASR_PIPELINE is not None:
             check_cancelled()
@@ -798,6 +892,8 @@ def transcribe_audio(
                 beam_size=5,
                 vad_filter=True,
                 condition_on_previous_text=False,
+                word_timestamps=True,  # 开启词级时间戳
+                no_speech_threshold=0.8,  # 提高阈值，防止漏句
             )
         else:
             check_cancelled()
@@ -806,6 +902,8 @@ def transcribe_audio(
                 beam_size=5,
                 vad_filter=True,
                 condition_on_previous_text=False,
+                word_timestamps=True,  # 开启词级时间戳
+                no_speech_threshold=0.8,  # 提高阈值，防止漏句
             )
 
         segments_list = []
@@ -821,12 +919,32 @@ def transcribe_audio(
             text = (getattr(seg, "text", "") or "").strip()
             if not text:
                 continue
+            words = getattr(seg, "words", None)
+            words_data: list[dict[str, Any]] | None = None
+            if words:
+                words_data = []
+                for w in words:
+                    if w is None:
+                        continue
+                    words_data.append(
+                        {
+                            "start": float(getattr(w, "start", 0.0) or 0.0),
+                            "end": float(getattr(w, "end", 0.0) or 0.0),
+                            "word": str(getattr(w, "word", "") or ""),
+                            "probability": (
+                                float(getattr(w, "probability", 0.0) or 0.0)
+                                if getattr(w, "probability", None) is not None
+                                else None
+                            ),
+                        }
+                    )
             transcript.append(
                 {
                     "start": float(getattr(seg, "start", 0.0)),
                     "end": float(getattr(seg, "end", 0.0)),
                     "text": text,
                     "speaker": "SPEAKER_00",
+                    "words": words_data,
                 }
             )
 
@@ -835,11 +953,15 @@ def transcribe_audio(
         try:
             load_diarize_model(device=device, settings=settings, model_manager=model_manager)
             assert _DIARIZATION_PIPELINE is not None
-            logger.info("开始说话人分离 (pyannote)...")
+            model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
+            logger.info(f"开始说话人分离 ({model_tag})...")
             check_cancelled()
             ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+            # Some pyannote pipelines provide a non-overlapping ("exclusive") diarization view which
+            # generally aligns better with ASR timestamps. Fall back to legacy tracks when unavailable.
+            ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
             turns: list[dict[str, Any]] = []
-            for seg, _, speaker in ann.itertracks(yield_label=True):
+            for seg, _, speaker in ann_view.itertracks(yield_label=True):
                 check_cancelled()
                 turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
             _assign_speakers_by_overlap(transcript, turns)

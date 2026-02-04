@@ -267,7 +267,7 @@ def test_generate_wavs_bytedance_produces_audio_combined_and_srt(tmp_path: Path,
     _assert_translation_items_schema(translation)
 
     srt_path = folder / "subtitles.srt"
-    sv.generate_srt(translation, str(srt_path), speed_up=1.0)
+    sv.generate_srt(translation, str(srt_path))
     assert srt_path.exists()
     content = srt_path.read_text(encoding="utf-8")
     assert "-->" in content
