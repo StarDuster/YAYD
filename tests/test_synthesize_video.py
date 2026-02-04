@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -16,6 +19,55 @@ def test_synthesize_video_raises_when_missing_inputs(tmp_path: Path):
     # Missing translation.json/audio_combined.wav/download.mp4 should raise.
     with pytest.raises(FileNotFoundError):
         sv.synthesize_video(str(folder))
+
+
+def test_ensure_audio_combined_adaptive_generates_plan_and_audio(tmp_path: Path, monkeypatch):
+    import youdub.steps.synthesize_video as sv
+    from youdub.utils import save_wav
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "wavs").mkdir(parents=True, exist_ok=True)
+
+    # Minimal translation timeline (1 segment == 1 wav).
+    (folder / "translation.json").write_text(
+        json.dumps(
+            [{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好。"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # Create a short TTS wav with leading/trailing silence so trim() is exercised.
+    sr = 24000
+    tone_s = 0.2
+    n_tone = int(sr * tone_s)
+    t = np.linspace(0.0, tone_s, n_tone, endpoint=False, dtype=np.float32)
+    tone = (0.1 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32, copy=False)
+    silence = np.zeros((int(sr * 0.05),), dtype=np.float32)
+    wav = np.concatenate([silence, tone, silence]).astype(np.float32, copy=False)
+    save_wav(wav, str(folder / "wavs" / "0000.wav"), sample_rate=sr)
+    (folder / "wavs" / ".tts_done.json").write_text(
+        json.dumps({"tts_method": "bytedance"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # Disable speech-rate alignment to keep test fast/deterministic.
+    monkeypatch.setenv("SPEECH_RATE_ALIGN_ENABLED", "0")
+
+    # Should generate plan + adaptive timeline + audio outputs without needing instruments/video.
+    sv._ensure_audio_combined(str(folder), adaptive_segment_stretch=True, sample_rate=sr)  # noqa: SLF001
+
+    assert (folder / "translation_adaptive.json").exists()
+    assert (folder / "adaptive_plan.json").exists()
+    assert (folder / "audio_tts.wav").exists()
+    assert (folder / "audio_combined.wav").exists()
+
+    meta = json.loads((folder / ".audio_combined.json").read_text(encoding="utf-8"))
+    assert meta.get("adaptive_segment_stretch") is True
+
+    with wave.open(str(folder / "audio_combined.wav"), "rb") as wf:
+        assert int(wf.getframerate() or 0) == sr
 
 
 def test_subtitle_style_params_1080p_not_tiny():
