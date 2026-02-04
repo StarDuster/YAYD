@@ -151,6 +151,93 @@ def _preload_cudnn_for_onnxruntime_gpu() -> None:
         logger.warning(f"预加载cuDNN失败 onnxruntime-gpu: {exc}")
 
 
+_TORCHAUDIO_BACKEND_COMPAT_PATCHED = False
+
+
+def _patch_torchaudio_backend_compat() -> None:
+    """
+    torchaudio 2.10+ removed legacy backend APIs:
+      - torchaudio.list_audio_backends
+      - torchaudio.get_audio_backend
+      - torchaudio.set_audio_backend
+
+    Some downstream libs (notably older pyannote.audio pipelines) still call them.
+    We inject a tiny compatibility shim so those calls won't crash.
+
+    NOTE: This does NOT actually switch torchaudio I/O backends (2.10+ doesn't expose that
+    mechanism publicly). It only prevents AttributeError and records the requested backend.
+    """
+    global _TORCHAUDIO_BACKEND_COMPAT_PATCHED  # noqa: PLW0603
+
+    if _TORCHAUDIO_BACKEND_COMPAT_PATCHED:
+        return
+    _TORCHAUDIO_BACKEND_COMPAT_PATCHED = True
+
+    try:
+        import torchaudio  # type: ignore
+    except Exception:
+        return
+
+    if (
+        hasattr(torchaudio, "list_audio_backends")
+        and hasattr(torchaudio, "get_audio_backend")
+        and hasattr(torchaudio, "set_audio_backend")
+    ):
+        return
+
+    backends: list[str] = []
+    try:
+        import soundfile  # noqa: F401
+
+        backends.append("soundfile")
+    except Exception:
+        pass
+
+    # Attach best-effort state onto torchaudio module.
+    try:
+        setattr(torchaudio, "_youdub_audio_backends", backends)
+        setattr(torchaudio, "_youdub_audio_backend", backends[0] if backends else None)
+    except Exception:
+        # If we cannot attach state, still patch functions (they'll return defaults).
+        pass
+
+    def _list_audio_backends() -> list[str]:
+        try:
+            v = getattr(torchaudio, "_youdub_audio_backends", None)
+            return list(v) if isinstance(v, list) else []
+        except Exception:
+            return []
+
+    def _get_audio_backend() -> str | None:
+        try:
+            v = getattr(torchaudio, "_youdub_audio_backend", None)
+            return str(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _set_audio_backend(name: object) -> None:
+        try:
+            s = str(name).strip() if name is not None else ""
+        except Exception:
+            s = ""
+        try:
+            setattr(torchaudio, "_youdub_audio_backend", s or None)
+        except Exception:
+            return
+
+    # Inject
+    try:
+        if not hasattr(torchaudio, "list_audio_backends"):
+            setattr(torchaudio, "list_audio_backends", _list_audio_backends)
+        if not hasattr(torchaudio, "get_audio_backend"):
+            setattr(torchaudio, "get_audio_backend", _get_audio_backend)
+        if not hasattr(torchaudio, "set_audio_backend"):
+            setattr(torchaudio, "set_audio_backend", _set_audio_backend)
+        logger.info("已为 torchaudio 注入 backend 兼容 API（list/get/set_audio_backend），用于 pyannote 兼容。")
+    except Exception:
+        return
+
+
 def _env_flag(name: str, *, default: bool = False) -> bool:
     raw = os.getenv(name, None)
     if raw is None:
@@ -212,6 +299,8 @@ def _load_embedding_inference(
 
     if _EMBEDDING_MODEL_LOAD_FAILED:
         return None
+
+    _patch_torchaudio_backend_compat()
 
     diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
     cache_dir = str(diar_dir) if diar_dir else None
@@ -837,6 +926,8 @@ def load_diarize_model(
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
     _ensure_assets(settings, model_manager, require_diarization=True)
+
+    _patch_torchaudio_backend_compat()
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
