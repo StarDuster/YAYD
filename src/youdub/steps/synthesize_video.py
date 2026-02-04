@@ -14,44 +14,33 @@ import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..speech_rate import apply_scaling_ratio, compute_en_speech_rate, compute_scaling_ratio, compute_zh_speech_rate
+from ..speech_rate import (
+    apply_scaling_ratio,
+    compute_clamp_gap,
+    compute_global_baseline,
+    compute_scaling_ratio,
+    count_en_syllables,
+    count_zh_syllables,
+    is_outlier_by_clamp_gap,
+)
 from ..utils import save_wav, save_wav_norm, valid_file
 
 
 _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
-# Bump when the mixing/output semantics change.
-# v2: audio_combined = audio_tts + instruments (NO original vocals mixed in)
-# v3: match TTS loudness to original vocals peak + normalize output;
-#     adaptive mode no longer phase-vocoder stretches TTS (avoid “回音/空洞”感)
-# v4: restore original mix balance by estimating stem scales against audio.wav;
-#     match TTS loudness to original vocals (RMS on active samples) instead of peak.
-# v5: estimate voice/BGM levels on multiple windows and pick the best-balanced ones;
-#     log original voice/BGM loudness + ratio to make debugging easy.
-# v6: improve window search by probing stems first (avoid missing music-heavy moments).
-# v7: adaptive mode aligns instruments per adaptive_plan (fix BGM drift vs stretched video).
-# v8: adaptive mode optionally applies speech-rate based TTS time-scale modification (TSM) per segment.
-# v9: refine speech-rate alignment metadata and clamp behavior.
-# v10: refine EN stats by using segment start/end bounds (affects speech-rate alignment output).
-# v11: switch to subtitle syllable counting for speech rate alignment.
-# v12: normalize EN syllable counting for numbers/initialisms (affects alignment ratios).
-# v13: use VAD-based voiced duration + global bias for alignment (avoid overall pacing drift).
-# v14: blend speech-rate ratio with time-budget ratio (stabilize per-segment pacing).
-_AUDIO_COMBINED_MIX_VERSION = 14
+# Cache version for adaptive audio synthesis outputs:
+# - audio_tts.wav / audio_combined.wav
+# - translation_adaptive.json / adaptive_plan.json
+#
+# V1 (baseline):
+# - Segment-wise TTS TSM alignment; NEVER slow down voice (voice_max=1.0)
+# - Prefer post-silence padding instead of stretching pause clips (adaptive_plan: kind="segment" only)
+# - No "budget" blending in ratio estimation (ratio based on speech rate only + global baseline fallback)
+_AUDIO_COMBINED_MIX_VERSION = 1
 
 _VIDEO_META_NAME = ".video_synth.json"
-# Bump when the video output semantics/config keys change.
-# v3: subtitles style/scale tweaks (font size, wrap, original_size for libass)
-# v4: make wrap heuristic more conservative; shrink default font size further
-# v5: shrink non-bilingual subtitle font size further (1080p -> ~26)
-# v6: shrink non-bilingual subtitle size further (1080p -> ~19) and reduce outline
-# v7: use ASS for monolingual subtitles too (ensures font size is respected via PlayRes)
-# v8: restore subtitle font scaling (1080p -> ~36) for readability
-# v9: separate portrait/landscape subtitle scaling (landscape slightly larger)
-# v10: keep 1080p landscape at ~36; portrait slightly smaller
-# v11: increase 1080p landscape subtitle size (~49) to match expected readability
-# v12: bilingual subtitles no longer truncate source text to first sentence
-# v13: remove legacy global speed-up (drop speed_up from metadata)
-_VIDEO_META_VERSION = 13
+# Cache version for final video synthesis.
+# V1 (baseline): per-segment video concat in adaptive mode + ASS subtitles.
+_VIDEO_META_VERSION = 1
 
 # Video output audio encoding (keep high enough to avoid AAC artifacts).
 _VIDEO_AUDIO_SAMPLE_RATE = 48000
@@ -1396,7 +1385,8 @@ def _ensure_audio_combined(
         align_enabled = _read_env_bool("SPEECH_RATE_ALIGN_ENABLED", True)
         align_mode = str(os.getenv("SPEECH_RATE_ALIGN_MODE", "single") or "single").strip().lower()
         voice_min = _read_env_float("SPEECH_RATE_VOICE_MIN_RATIO", 0.7)
-        voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.3)
+        # Slow-down on TTS is very audible; by default we do NOT slow down voice.
+        voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.0)
         silence_min = _read_env_float("SPEECH_RATE_SILENCE_MIN_RATIO", 0.3)
         silence_max = _read_env_float("SPEECH_RATE_SILENCE_MAX_RATIO", 3.0)
         overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
@@ -1404,11 +1394,37 @@ def _ensure_audio_combined(
         align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
         en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
         zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
-        # Blend weight between speech-rate ratio and time-budget ratio (en_total / zh_total).
-        # - 0.0: pure speech-rate (more natural articulation)
-        # - 1.0: pure time-budget (more aggressive, keeps pacing closer to original timestamps)
-        budget_weight = _read_env_float("SPEECH_RATE_BUDGET_WEIGHT", 0.7)
         audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
+
+        # Post-silence padding (preferred over slowing down voice):
+        # when a segment's speech is much shorter than its original time budget, append a short silence
+        # after speech so the output doesn't feel unnaturally rushed, while keeping BGM/video aligned.
+        pause_comp_enabled = _read_env_bool("SPEECH_RATE_PAUSE_COMPENSATION_ENABLED", True)
+        pause_min_sec = _read_env_float("SPEECH_RATE_PAUSE_MIN_SEC", 0.1)
+        pause_max_sec = _read_env_float("SPEECH_RATE_PAUSE_MAX_SEC", 2.0)
+        pause_min_sec = float(max(0.0, pause_min_sec))
+        pause_max_sec = float(max(pause_min_sec, pause_max_sec))
+        # Weight in [0, 1]: how much of (budget_B - speech_D) we absorb into the next pause.
+        # - 1.0: fully preserve the original pacing budget (closest to source timeline)
+        # - 0.0: no compensation (output length follows TTS more closely, usually faster)
+        pause_comp_weight = _read_env_float(
+            "SPEECH_RATE_PAUSE_COMP_WEIGHT", _read_env_float("SPEECH_RATE_PAUSE_COMPENSATION_WEIGHT", 0.4)
+        )
+        pause_comp_weight = float(max(0.0, min(float(pause_comp_weight), 1.0)))
+
+        # Fallback: when a segment ratio is clamped far away, treat it as unreliable and use a global baseline ratio.
+        fallback_enabled = _read_env_bool("SPEECH_RATE_FALLBACK_ENABLED", True)
+        fallback_clamp_gap = _read_env_float("SPEECH_RATE_FALLBACK_CLAMP_GAP", 1.7)
+        fallback_clamp_gap = float(max(1.0, fallback_clamp_gap))
+        # Additional outlier checks (beyond clamp gap).
+        fallback_en_rate_min = float(max(0.0, _read_env_float("SPEECH_RATE_FALLBACK_EN_RATE_MIN", 1.5)))
+        fallback_en_rate_max = float(max(fallback_en_rate_min, _read_env_float("SPEECH_RATE_FALLBACK_EN_RATE_MAX", 12.0)))
+        fallback_zh_rate_min = float(max(0.0, _read_env_float("SPEECH_RATE_FALLBACK_ZH_RATE_MIN", 1.5)))
+        fallback_zh_rate_max = float(max(fallback_zh_rate_min, _read_env_float("SPEECH_RATE_FALLBACK_ZH_RATE_MAX", 12.0)))
+        # EN voiced-duration estimation sanity bounds (used to pick a VAD threshold that yields a plausible EN rate).
+        vad_en_rate_min = float(max(0.0, _read_env_float("SPEECH_RATE_VAD_EN_RATE_MIN", 2.0)))
+        vad_en_rate_max = float(max(vad_en_rate_min, _read_env_float("SPEECH_RATE_VAD_EN_RATE_MAX", 8.0)))
+        vad_en_rate_target = float(max(0.1, _read_env_float("SPEECH_RATE_VAD_EN_RATE_TARGET", 4.5)))
 
         # Global bias to avoid overall pacing drift.
         #
@@ -1416,10 +1432,15 @@ def _ensure_audio_combined(
         # and TTS tends to speak slower, so the whole output can become noticeably longer (\"慢\").
         # We compute a per-video bias using the original EN segment time budget vs the raw (trimmed)
         # ZH TTS durations, then apply it by effectively increasing the EN reference rate.
+        baseline_mode = str(os.getenv("SPEECH_RATE_GLOBAL_BASELINE_MODE", "syllable") or "syllable").strip().lower()
+        baseline_cap_at_1 = _read_env_bool("SPEECH_RATE_GLOBAL_BASELINE_CAP_AT_1", True)
         align_global_bias = 1.0
+        align_global_fallback_ratio = 1.0
         if align_enabled:
             try:
                 total_en = 0.0
+                total_en_syllables = 0
+                total_zh_syllables = 0
                 for _seg in translation:
                     try:
                         s0 = float(_seg.get("start", 0.0) or 0.0)
@@ -1428,7 +1449,16 @@ def _ensure_audio_combined(
                             s0, s1 = s1, s0
                         total_en += float(max(0.0, s1 - s0))
                     except Exception:
-                        continue
+                        pass
+                    # Global syllable counts (text-only, fast; used for baseline fallback/bias).
+                    try:
+                        total_en_syllables += int(count_en_syllables(str(_seg.get("text") or "")))
+                    except Exception:
+                        pass
+                    try:
+                        total_zh_syllables += int(count_zh_syllables(str(_seg.get("translation") or "")))
+                    except Exception:
+                        pass
 
                 total_zh = 0.0
                 for _i in range(expected_count):
@@ -1450,14 +1480,60 @@ def _ensure_audio_combined(
                     except Exception:
                         continue
 
-                if total_en > 0.0 and total_zh > 0.0:
-                    align_global_bias = float(total_en / total_zh)
-                    # We only use this to speed up overall pacing (cap at 1.0).
-                    align_global_bias = float(max(0.3, min(align_global_bias, 1.0)))
-                    logger.info(f"语速对齐: 全局bias={align_global_bias:.3f} (en={total_en:.1f}s, zh={total_zh:.1f}s)")
+                baseline_dur = float(
+                    compute_global_baseline(
+                        en_total_duration=total_en,
+                        zh_total_duration=total_zh,
+                        mode="duration",
+                        default=1.0,
+                    )
+                )
+                baseline_syl = float(
+                    compute_global_baseline(
+                        en_total_syllables=total_en_syllables,
+                        zh_total_syllables=total_zh_syllables,
+                        mode="syllable",
+                        default=1.0,
+                    )
+                )
+
+                # Select baseline mode.
+                m = str(baseline_mode or "duration").strip().lower()
+                if m in {"syllable", "syllables", "syl"}:
+                    baseline_sel_raw = float(baseline_syl)
+                elif m in {"min", "auto"}:
+                    # Prefer speed-up (ratio < 1). When both are valid, take the smaller one.
+                    cand = [x for x in (baseline_dur, baseline_syl) if math.isfinite(x) and x > 0.0]
+                    baseline_sel_raw = float(min(cand)) if cand else 1.0
+                elif m in {"blend", "geo", "geometric"}:
+                    # Geometric mean, stable for ratios.
+                    a = baseline_dur if (math.isfinite(baseline_dur) and baseline_dur > 0.0) else 1.0
+                    b = baseline_syl if (math.isfinite(baseline_syl) and baseline_syl > 0.0) else 1.0
+                    try:
+                        baseline_sel_raw = float(math.sqrt(float(a) * float(b)))
+                    except Exception:
+                        baseline_sel_raw = float(a)
+                else:
+                    baseline_sel_raw = float(baseline_dur)
+
+                baseline_sel = float(baseline_sel_raw)
+                if baseline_cap_at_1 and baseline_sel > 1.0:
+                    baseline_sel = 1.0
+
+                # Keep in sane positive bounds (final voice ratio is still clamped separately).
+                align_global_fallback_ratio = float(max(0.05, min(float(baseline_sel), 20.0)))
+
+                # We only use bias to speed up overall pacing (cap at 1.0).
+                align_global_bias = float(max(0.3, min(align_global_fallback_ratio, 1.0)))
+                logger.info(
+                    f"语速对齐: 全局bias={align_global_bias:.3f} baseline={align_global_fallback_ratio:.3f} "
+                    f"(mode={m}, dur={baseline_dur:.3f}, syl={baseline_syl:.3f}, "
+                    f"en={total_en:.1f}s, zh={total_zh:.1f}s, en_syl={total_en_syllables}, zh_syl={total_zh_syllables})"
+                )
             except Exception as exc:
                 logger.warning(f"语速对齐: 计算全局bias失败，将回退为 1.0: {exc}")
                 align_global_bias = 1.0
+                align_global_fallback_ratio = 1.0
 
         def _gap_seconds_for_text(text: str) -> float:
             s = (text or "").strip()
@@ -1487,6 +1563,82 @@ def _ensure_audio_combined(
             audio_chunks.append(np.zeros(n, dtype=np.float32))
             t_cursor_samples += n
 
+        def _estimate_en_voiced_duration(
+            y: np.ndarray,
+            sr: int,
+            *,
+            total_duration: float,
+            syllables: int,
+            top_db_base: float,
+        ) -> float:
+            """
+            Estimate EN voiced duration from audio using librosa energy split, but keep it sane.
+
+            Why: `audio_vocals.wav` can contain residual music/noise; a single `top_db` often overestimates
+            voiced duration (making EN rate unrealistically low), which in turn makes ratios suggest slowing
+            down ZH TTS even when it already feels slow.
+
+            Strategy:
+            - Probe several `top_db` values around the configured one
+            - Pick the one that yields an implied EN syllable rate closest to `vad_en_rate_target`
+              while staying within [`vad_en_rate_min`, `vad_en_rate_max`]
+            - If none look reasonable, fall back to a text-only estimate (syllables / target_rate)
+            """
+            total_dur = float(max(0.0, float(total_duration)))
+            if total_dur <= 0.0:
+                return 0.0
+            n_syl = int(max(0, int(syllables)))
+            if n_syl <= 0:
+                return 0.0
+
+            base = float(top_db_base)
+            cand = [base + d for d in (-15.0, -10.0, -5.0, 0.0, 5.0, 10.0)]
+            cand = sorted({float(max(5.0, min(60.0, c))) for c in cand})
+
+            best_voiced: float | None = None
+            best_score: float | None = None
+
+            for top_db in cand:
+                try:
+                    intervals = librosa.effects.split(y, top_db=float(top_db))
+                except Exception:
+                    intervals = np.zeros((0, 2), dtype=np.int64)
+
+                voiced_samples = 0
+                for st, ed in intervals:
+                    st_i = int(st)
+                    ed_i = int(ed)
+                    if ed_i > st_i:
+                        voiced_samples += (ed_i - st_i)
+
+                voiced_dur = float(voiced_samples) / float(sr) if voiced_samples > 0 else 0.0
+                voiced_dur = float(max(0.0, min(voiced_dur, total_dur)))
+                if voiced_dur <= 1e-6:
+                    continue
+
+                rate = float(n_syl) / float(voiced_dur)
+                if not (math.isfinite(rate) and rate > 0.0):
+                    continue
+
+                in_range = (rate + 1e-9) >= float(vad_en_rate_min) and (rate - 1e-9) <= float(vad_en_rate_max)
+                try:
+                    dist = abs(float(math.log(float(rate) / float(vad_en_rate_target))))
+                except Exception:
+                    dist = float("inf")
+                score = float(dist + (0.0 if in_range else 2.0))
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_voiced = float(voiced_dur)
+
+            if best_voiced is not None and best_voiced > 0.0:
+                return float(max(0.0, min(best_voiced, total_dur)))
+
+            # Text-only fallback: assume a typical EN articulation rate.
+            voiced = float(n_syl) / float(vad_en_rate_target) if float(vad_en_rate_target) > 0 else 0.0
+            voiced = float(max(0.08, min(voiced, total_dur)))
+            return float(voiced)
+
         for i, seg in enumerate(translation):
             check_cancelled()
             # Load per-segment TTS audio.
@@ -1513,8 +1665,12 @@ def _ensure_audio_combined(
                 orig_start, orig_end = orig_end, orig_start
 
             ratio_info: dict[str, Any] | None = None
+            ratio_info_pre_fallback: dict[str, Any] | None = None
             en_stats: dict[str, Any] | None = None
             zh_stats: dict[str, Any] | None = None
+            clamp_gap: float | None = None
+            fallback_used = False
+            fallback_ratio_requested: float | None = None
 
             # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
             if align_enabled and tts_audio.size > 0:
@@ -1522,8 +1678,15 @@ def _ensure_audio_combined(
                     en_text = str(seg.get("text") or "")
                     en_total_duration = float(max(0.0, orig_end - orig_start))
 
-                    # Estimate EN voiced duration from the original vocal stem (VAD).
-                    en_voiced_duration = float(en_total_duration)
+                    en_syllables = int(max(0, int(count_en_syllables(en_text))))
+
+                    # Estimate EN voiced duration from the original vocal stem (VAD), but keep it sane.
+                    # Start with a text-only default, then refine with audio if available.
+                    if en_total_duration > 0.0 and en_syllables > 0:
+                        en_voiced_duration = float(en_syllables) / float(vad_en_rate_target) if float(vad_en_rate_target) > 0 else 0.0
+                        en_voiced_duration = float(max(0.08, min(en_voiced_duration, en_total_duration)))
+                    else:
+                        en_voiced_duration = 0.0
                     if en_total_duration > 0 and os.path.exists(audio_vocals_path):
                         try:
                             en_audio, en_sr = librosa.load(
@@ -1534,34 +1697,34 @@ def _ensure_audio_combined(
                                 duration=float(en_total_duration),
                             )
                             en_audio = np.asarray(en_audio, dtype=np.float32).reshape(-1)
-                            if en_audio.size > 0 and int(en_sr or 0) > 0:
-                                try:
-                                    intervals = librosa.effects.split(en_audio, top_db=float(en_vad_top_db))
-                                except Exception:
-                                    intervals = np.zeros((0, 2), dtype=np.int64)
-                                voiced_samples = 0
-                                for st, ed in intervals:
-                                    st_i = int(st)
-                                    ed_i = int(ed)
-                                    if ed_i > st_i:
-                                        voiced_samples += (ed_i - st_i)
-                                en_voiced_duration = float(voiced_samples) / float(en_sr) if voiced_samples > 0 else 0.0
+                            en_sr_i = int(en_sr or 0)
+                            if en_audio.size > 0 and en_sr_i > 0 and en_syllables > 0:
+                                en_voiced_duration = float(
+                                    _estimate_en_voiced_duration(
+                                        en_audio,
+                                        en_sr_i,
+                                        total_duration=float(en_total_duration),
+                                        syllables=int(en_syllables),
+                                        top_db_base=float(en_vad_top_db),
+                                    )
+                                )
                         except Exception:
-                            en_voiced_duration = float(en_total_duration)
+                            pass
 
                     en_voiced_duration = float(max(0.0, min(en_voiced_duration, en_total_duration)))
                     en_silence_duration = float(max(0.0, en_total_duration - en_voiced_duration))
                     en_pause_ratio = float(en_silence_duration / en_total_duration) if en_total_duration > 0 else 0.0
 
-                    en_stats = dict(compute_en_speech_rate(en_text, en_voiced_duration))
-                    en_stats.update(
-                        {
-                            "total_duration": float(en_total_duration),
-                            "voiced_duration": float(en_voiced_duration),
-                            "silence_duration": float(en_silence_duration),
-                            "pause_ratio": float(en_pause_ratio),
-                        }
-                    )
+                    en_rate = float(en_syllables) / float(en_voiced_duration) if en_voiced_duration > 0 else 0.0
+                    en_stats = {
+                        "syllable_count": int(en_syllables),
+                        "duration": float(en_voiced_duration),
+                        "syllable_rate": float(en_rate),
+                        "total_duration": float(en_total_duration),
+                        "voiced_duration": float(en_voiced_duration),
+                        "silence_duration": float(en_silence_duration),
+                        "pause_ratio": float(en_pause_ratio),
+                    }
                 except Exception as exc:
                     logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
                     en_stats = None
@@ -1569,6 +1732,7 @@ def _ensure_audio_combined(
                 if en_stats:
                     try:
                         zh_text = str(seg.get("translation") or "")
+                        zh_syllables = int(max(0, int(count_zh_syllables(zh_text))))
                         zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
 
                         # ZH voiced duration from TTS itself (VAD).
@@ -1590,15 +1754,16 @@ def _ensure_audio_combined(
                         zh_silence_duration = float(max(0.0, zh_total_duration - zh_voiced_duration))
                         zh_pause_ratio = float(zh_silence_duration / zh_total_duration) if zh_total_duration > 0 else 0.0
 
-                        zh_stats = dict(compute_zh_speech_rate(zh_text, zh_voiced_duration))
-                        zh_stats.update(
-                            {
-                                "total_duration": float(zh_total_duration),
-                                "voiced_duration": float(zh_voiced_duration),
-                                "silence_duration": float(zh_silence_duration),
-                                "pause_ratio": float(zh_pause_ratio),
-                            }
-                        )
+                        zh_rate = float(zh_syllables) / float(zh_voiced_duration) if zh_voiced_duration > 0 else 0.0
+                        zh_stats = {
+                            "syllable_count": int(zh_syllables),
+                            "duration": float(zh_voiced_duration),
+                            "syllable_rate": float(zh_rate),
+                            "total_duration": float(zh_total_duration),
+                            "voiced_duration": float(zh_voiced_duration),
+                            "silence_duration": float(zh_silence_duration),
+                            "pause_ratio": float(zh_pause_ratio),
+                        }
 
                         # Apply global bias by effectively increasing EN reference rate.
                         en_stats_used = dict(en_stats)
@@ -1607,11 +1772,10 @@ def _ensure_audio_combined(
                                 align_global_bias
                             )
 
-                        ratio_info = compute_scaling_ratio(
+                        ratio_info_pre_fallback = compute_scaling_ratio(
                             en_stats_used,
                             zh_stats,
                             mode=align_mode,
-                            budget_weight=float(budget_weight),
                             voice_min=voice_min,
                             voice_max=voice_max,
                             silence_min=silence_min,
@@ -1619,6 +1783,90 @@ def _ensure_audio_combined(
                             overall_min=overall_min,
                             overall_max=overall_max,
                         )
+                        ratio_info = ratio_info_pre_fallback
+
+                        # Outlier fallback: trust the global baseline when per-segment estimates look unreliable.
+                        outlier_reasons: list[str] = []
+                        if ratio_info_pre_fallback:
+                            raw_r = ratio_info_pre_fallback.get("voice_ratio_raw", 1.0)
+                            applied_r = ratio_info_pre_fallback.get("voice_ratio", 1.0)
+                            if is_outlier_by_clamp_gap(
+                                raw_r,
+                                applied_r,
+                                clamp_gap_threshold=float(fallback_clamp_gap),
+                            ):
+                                try:
+                                    _gap = float(compute_clamp_gap(raw_r, applied_r))
+                                except Exception:
+                                    _gap = float("inf")
+                                outlier_reasons.append(f"clamp_gap={_gap:.3f}>{fallback_clamp_gap:.3f}")
+
+                            # Sanity-check EN/ZH syllable rates (pre-bias) to catch obviously broken segments.
+                            try:
+                                en_r0 = float(en_stats.get("syllable_rate", 0.0)) if en_stats else 0.0
+                                if en_r0 > 0.0 and (
+                                    en_r0 < float(fallback_en_rate_min) - 1e-9
+                                    or en_r0 > float(fallback_en_rate_max) + 1e-9
+                                ):
+                                    outlier_reasons.append(
+                                        f"en_rate={en_r0:.2f}∉[{fallback_en_rate_min:.2f},{fallback_en_rate_max:.2f}]"
+                                    )
+                            except Exception:
+                                pass
+                            try:
+                                zh_r0 = float(zh_stats.get("syllable_rate", 0.0)) if zh_stats else 0.0
+                                if zh_r0 > 0.0 and (
+                                    zh_r0 < float(fallback_zh_rate_min) - 1e-9
+                                    or zh_r0 > float(fallback_zh_rate_max) + 1e-9
+                                ):
+                                    outlier_reasons.append(
+                                        f"zh_rate={zh_r0:.2f}∉[{fallback_zh_rate_min:.2f},{fallback_zh_rate_max:.2f}]"
+                                    )
+                            except Exception:
+                                pass
+
+                        if fallback_enabled and ratio_info_pre_fallback and outlier_reasons:
+                            fallback_used = True
+                            fallback_ratio_requested = float(
+                                max(1e-6, float(align_global_fallback_ratio if align_global_fallback_ratio > 0 else 1.0))
+                            )
+                            clamp_gap = float(
+                                compute_clamp_gap(
+                                    ratio_info_pre_fallback.get("voice_ratio_raw", 1.0),
+                                    ratio_info_pre_fallback.get("voice_ratio", 1.0),
+                                )
+                            )
+
+                            # Build a synthetic (rate-only) pair so compute_scaling_ratio can handle two_stage/overall bounds.
+                            en_fb = dict(en_stats_used)
+                            zh_fb = dict(zh_stats)
+                            en_fb["syllable_rate"] = 1.0
+                            zh_fb["syllable_rate"] = float(fallback_ratio_requested)
+
+                            ratio_info = compute_scaling_ratio(
+                                en_fb,
+                                zh_fb,
+                                mode=align_mode,
+                                voice_min=voice_min,
+                                voice_max=voice_max,
+                                silence_min=silence_min,
+                                silence_max=silence_max,
+                                overall_min=overall_min,
+                                overall_max=overall_max,
+                            )
+                            logger.warning(
+                                f"段落 {i}: 语速比例疑似异常 ({'; '.join(outlier_reasons)})，"
+                                f"回退全局baseline={fallback_ratio_requested:.3f}"
+                            )
+
+                        if clamp_gap is None and ratio_info_pre_fallback:
+                            clamp_gap = float(
+                                compute_clamp_gap(
+                                    ratio_info_pre_fallback.get("voice_ratio_raw", 1.0),
+                                    ratio_info_pre_fallback.get("voice_ratio", 1.0),
+                                )
+                            )
+
                         if abs(float(ratio_info.get("voice_ratio", 1.0)) - 1.0) > float(align_threshold) or abs(
                             float(ratio_info.get("silence_ratio", 1.0)) - 1.0
                         ) > float(align_threshold):
@@ -1634,8 +1882,12 @@ def _ensure_audio_combined(
                     except Exception as exc:
                         logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
                         ratio_info = None
+                        ratio_info_pre_fallback = None
                         en_stats = None
                         zh_stats = None
+                        clamp_gap = None
+                        fallback_used = False
+                        fallback_ratio_requested = None
 
             # Output speech duration is exactly the (trimmed + optionally stretched) TTS segment duration.
             target_samples = int(tts_audio.shape[0])
@@ -1655,24 +1907,26 @@ def _ensure_audio_combined(
             # Record plan for video composition.
             adaptive_plan.append(
                 {
-                    "kind": "speech",
+                    # One output segment per translation item.
+                    # Post-silence (if any) is absorbed into this segment (no separate pause segments)
+                    # to avoid visual stutter from stretching tiny pause clips.
+                    "kind": "segment",
                     "index": i,
                     "src_start": round(orig_start, 6),
                     "src_end": round(orig_end, 6),
+                    "speech_src_end": round(orig_end, 6),
                     "target_duration": round(target_duration, 6),
                     "target_samples": int(target_samples),
+                    "speech_target_duration": round(target_duration, 6),
+                    "speech_target_samples": int(target_samples),
+                    "post_silence_duration": 0.0,
+                    "post_silence_samples": 0,
                     "speech_rate_mode": (ratio_info.get("mode") if ratio_info else None),
                     "voice_ratio": (round(float(ratio_info.get("voice_ratio", 1.0)), 6) if ratio_info else None),
                     "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
                     "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
                     "voice_ratio_rate_raw": (
                         round(float(ratio_info.get("voice_ratio_rate_raw", 1.0)), 6) if ratio_info else None
-                    ),
-                    "voice_ratio_budget_raw": (
-                        round(float(ratio_info.get("voice_ratio_budget_raw", 1.0)), 6) if ratio_info else None
-                    ),
-                    "speech_rate_budget_weight": (
-                        round(float(ratio_info.get("speech_rate_budget_weight", 0.0)), 6) if ratio_info else None
                     ),
                     "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
                     "speech_rate_global_bias": (round(float(align_global_bias), 6) if ratio_info else None),
@@ -1689,40 +1943,82 @@ def _ensure_audio_combined(
                     "zh_silence_duration": (round(float(zh_stats.get("silence_duration", 0.0)), 6) if zh_stats else None),
                     "zh_pause_ratio": (round(float(zh_stats.get("pause_ratio", 0.0)), 6) if zh_stats else None),
                     "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
+                    # Debug: budget vs realized speech duration (for pause compensation).
+                    "budget_B": round(float(max(0.0, orig_end - orig_start)), 6),
+                    "speech_D": round(float(target_duration), 6),
+                    # Debug: clamp/outlier + fallback.
+                    "clamp_gap": (round(float(clamp_gap), 6) if clamp_gap is not None else None),
+                    "fallback_used": (bool(fallback_used) if ratio_info_pre_fallback else None),
+                    "fallback_ratio_requested": (round(float(fallback_ratio_requested), 6) if fallback_used else None),
+                    "voice_ratio_raw_pre_fallback": (
+                        round(float(ratio_info_pre_fallback.get("voice_ratio_raw", 1.0)), 6)
+                        if (fallback_used and ratio_info_pre_fallback)
+                        else None
+                    ),
+                    "voice_ratio_pre_fallback": (
+                        round(float(ratio_info_pre_fallback.get("voice_ratio", 1.0)), 6)
+                        if (fallback_used and ratio_info_pre_fallback)
+                        else None
+                    ),
+                    "silence_ratio_raw_pre_fallback": (
+                        round(float(ratio_info_pre_fallback.get("silence_ratio_raw", 1.0)), 6)
+                        if (fallback_used and ratio_info_pre_fallback)
+                        else None
+                    ),
+                    "silence_ratio_pre_fallback": (
+                        round(float(ratio_info_pre_fallback.get("silence_ratio", 1.0)), 6)
+                        if (fallback_used and ratio_info_pre_fallback)
+                        else None
+                    ),
                 }
             )
 
             t_cursor_samples += target_samples
 
-            # Insert pause between speech segments (except after last).
+            # Append a short post-silence after speech (except after last).
+            # This keeps pacing natural without stretching voice too much, and avoids
+            # per-pause visual stutter from stretching tiny pause clips.
             if i < (len(translation) - 1):
                 try:
                     next_start = float(translation[i + 1].get("start", orig_end) or orig_end)
                 except Exception:
                     next_start = orig_end
-                gap = float(next_start - orig_end)
-                if gap > 0:
-                    pause_src_start = orig_end
-                    pause_src_end = next_start
-                else:
-                    # Overlap/adjacent: take a small tail slice from the previous segment as "pause" visuals.
-                    tail = 0.08
-                    pause_src_end = orig_end
-                    pause_src_start = max(0.0, pause_src_end - tail)
-                pause_duration = _gap_seconds_for_text(str(seg.get("translation") or ""))
+                # Prefer using the original gap as visuals/BGM if available.
+                seg_src_end = float(max(float(orig_end), float(next_start)))
 
-                # Compute pause samples using the exact same rounding as the audio cursor.
-                n_pause = int(round(float(pause_duration) * float(sample_rate)))
-                _append_silence(pause_duration)
-                adaptive_plan.append(
-                    {
-                        "kind": "pause",
-                        "src_start": round(float(pause_src_start), 6),
-                        "src_end": round(float(pause_src_end), 6),
-                        "target_duration": round(float(pause_duration), 6),
-                        "target_samples": int(max(0, n_pause)),
-                    }
-                )
+                post_base = float(_gap_seconds_for_text(str(seg.get("translation") or "")))
+                post_extra = 0.0
+                post_raw = float(post_base)
+                if pause_comp_enabled:
+                    # Only pad when speech+base is shorter than the original segment time budget.
+                    budget_B = float(max(0.0, orig_end - orig_start))
+                    remain = float(max(0.0, budget_B - float(target_duration) - float(post_base)))
+                    post_extra = float(float(pause_comp_weight) * remain)
+                    post_raw = float(post_base + post_extra)
+
+                post_silence = float(max(pause_min_sec, min(post_raw, pause_max_sec)))
+
+                # Compute samples using the exact same rounding as the audio cursor.
+                n_post = int(round(float(post_silence) * float(sample_rate)))
+                if n_post > 0:
+                    _append_silence(post_silence)
+
+                # Update the segment plan entry to absorb post-silence.
+                try:
+                    seg_plan = adaptive_plan[-1]
+                    seg_plan["src_end"] = round(float(seg_src_end), 6)
+                    seg_plan["post_silence_base_duration"] = round(float(post_base), 6)
+                    seg_plan["post_silence_extra_duration"] = (round(float(post_extra), 6) if pause_comp_enabled else None)
+                    seg_plan["post_silence_raw_duration"] = (round(float(post_raw), 6) if pause_comp_enabled else None)
+                    seg_plan["post_silence_duration"] = round(float(post_silence), 6)
+                    seg_plan["post_silence_samples"] = int(max(0, n_post))
+                    seg_plan["post_silence_min_sec"] = round(float(pause_min_sec), 6)
+                    seg_plan["post_silence_max_sec"] = round(float(pause_max_sec), 6)
+                    seg_plan["post_silence_weight"] = (round(float(pause_comp_weight), 6) if pause_comp_enabled else None)
+                    seg_plan["target_duration"] = round(float(target_duration + float(post_silence)), 6)
+                    seg_plan["target_samples"] = int(int(target_samples) + int(max(0, n_post)))
+                except Exception:
+                    pass
 
         if not audio_chunks:
             raise ValueError("没有有效的TTS音频片段")
@@ -1734,7 +2030,7 @@ def _ensure_audio_combined(
             json.dump(adaptive_translation, f, ensure_ascii=False, indent=2)
         logger.info(f"已生成 translation_adaptive.json: {translation_adaptive_path}")
 
-        # Save plan for video composition (speech + pause segments).
+        # Save plan for video composition (one segment per utterance; post-silence absorbed).
         plan_payload = {"segments": adaptive_plan}
         with open(adaptive_plan_path, "w", encoding="utf-8") as f:
             json.dump(plan_payload, f, ensure_ascii=False, indent=2)
@@ -2151,36 +2447,28 @@ def synthesize_video(
                     a1 = float(_adapt[i].get("end", 0.0) or 0.0)
                     if a1 < a0:
                         a0, a1 = a1, a0
+                    # Rebuild one segment per translation item:
+                    # duration spans speech + the following silence, i.e. [a0, next_a0).
+                    min_len = min(len(_orig), len(_adapt))
+                    if i < (min_len - 1):
+                        next_a0 = float(_adapt[i + 1].get("start", a1) or a1)
+                        total_dur = float(max(0.001, next_a0 - a0))
+                        # Prefer using the original gap as visuals/BGM when available.
+                        next_o0 = float(_orig[i + 1].get("start", o1) or o1)
+                        src_end = float(max(o1, next_o0))
+                    else:
+                        total_dur = float(max(0.001, a1 - a0))
+                        src_end = float(o1)
+
                     segs.append(
                         {
-                            "kind": "speech",
+                            "kind": "segment",
                             "index": i,
                             "src_start": round(o0, 6),
-                            "src_end": round(o1, 6),
-                            "target_duration": round(max(0.001, a1 - a0), 6),
+                            "src_end": round(src_end, 6),
+                            "target_duration": round(total_dur, 6),
                         }
                     )
-                    if i < (min(len(_orig), len(_adapt)) - 1):
-                        # Pause duration in output timeline comes from adaptive timestamps.
-                        next_a0 = float(_adapt[i + 1].get("start", a1) or a1)
-                        pause_dur = max(0.0, next_a0 - a1)
-                        # Pause visuals from original gap if possible; else take a small tail slice.
-                        next_o0 = float(_orig[i + 1].get("start", o1) or o1)
-                        gap = float(next_o0 - o1)
-                        if gap > 0:
-                            p0, p1 = o1, next_o0
-                        else:
-                            p1 = o1
-                            p0 = max(0.0, p1 - 0.08)
-                        if pause_dur > 1e-6:
-                            segs.append(
-                                {
-                                    "kind": "pause",
-                                    "src_start": round(p0, 6),
-                                    "src_end": round(p1, 6),
-                                    "target_duration": round(pause_dur, 6),
-                                }
-                            )
                 with open(adaptive_plan_path, "w", encoding="utf-8") as f:
                     json.dump({"segments": segs}, f, ensure_ascii=False, indent=2)
                 logger.info(f"已重建 adaptive_plan.json: {adaptive_plan_path}")

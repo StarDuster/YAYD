@@ -161,7 +161,7 @@ def _patch_torchaudio_backend_compat() -> None:
       - torchaudio.get_audio_backend
       - torchaudio.set_audio_backend
 
-    Some downstream libs (notably older pyannote.audio pipelines) still call them.
+    Some downstream libs (notably speechbrain imported by pyannote.audio pipelines) still call them.
     We inject a tiny compatibility shim so those calls won't crash.
 
     NOTE: This does NOT actually switch torchaudio I/O backends (2.10+ doesn't expose that
