@@ -1,33 +1,38 @@
 from __future__ import annotations
 
-import ctypes
-import html
-import importlib.util
 import json
-import math
 import os
-import re
-import sys
-import tempfile
 import time
-from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import librosa
-import numpy as np
 import torch
 from loguru import logger
 
 from ..config import Settings
-from ..models import ModelCheckError, ModelManager
 from ..interrupts import check_cancelled
-from ..utils import (
-    read_speaker_ref_seconds,
-    save_wav,
-    torch_load_weights_only_compat,
-    wav_duration_seconds,
+from ..models import ModelCheckError, ModelManager
+from ..utils import torch_load_weights_only_compat
+from .transcribe_asr_run import run_qwen_asr, run_whisper_asr
+from .transcribe_assets import ensure_assets
+from .transcribe_compat import (
+    patch_torchaudio_backend_compat as _patch_torchaudio_backend_compat,
+    preload_cudnn_for_onnxruntime_gpu as _preload_cudnn_for_onnxruntime_gpu,
+)
+from .transcribe_segments import _assign_speakers_by_overlap, generate_speaker_audio, merge_segments
+from .transcribe_speaker_repair import (
+    _repair_speakers_by_embedding,
+    _speaker_repair_enabled,
+    _update_translation_speakers_from_transcript,
+)
+from .transcribe_subtitles import (
+    _find_subtitle_file,
+    _invalidate_downstream_cache_for_new_transcript,
+    _is_youtube_subtitle_transcript,
+    _parse_subtitle_file,
+    _pick_preferred_manual_subtitle_lang,
+    _read_download_info,
+    _save_youtube_subtitle_transcript,
 )
 
 
@@ -43,6 +48,18 @@ def _import_faster_whisper():
     return WhisperModel, BatchedInferencePipeline
 
 
+def _import_qwen_asr():
+    try:
+        from qwen_asr import Qwen3ASRModel  # type: ignore
+    except Exception as exc:  # pylint: disable=broad-except
+        raise RuntimeError(
+            "缺少依赖 qwen-asr，无法使用 Qwen3-ASR。\n"
+            "请在当前虚拟环境中安装：`uv sync`（或 `uv add qwen-asr`）。\n"
+            f"原始错误: {exc}"
+        ) from exc
+    return Qwen3ASRModel
+
+
 _DEFAULT_SETTINGS = Settings()
 _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
 
@@ -56,588 +73,6 @@ _QWEN_ASR_KEY: str | None = None
 _DIARIZATION_PIPELINE = None
 _DIARIZATION_KEY: str | None = None
 _PYANNOTE_DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
-
-_EMBEDDING_MODEL = None
-_EMBEDDING_INFERENCE = None
-_EMBEDDING_KEY: str | None = None
-_EMBEDDING_MODEL_LOAD_FAILED = False
-
-
-_CUDNN_PRELOADED = False
-
-
-def _import_qwen_asr():
-    try:
-        from qwen_asr import Qwen3ASRModel  # type: ignore
-    except Exception as exc:  # pylint: disable=broad-except
-        raise RuntimeError(
-            "缺少依赖 qwen-asr，无法使用 Qwen3-ASR。\n"
-            "请在当前虚拟环境中安装：`uv sync`（或 `uv add qwen-asr`）。\n"
-            f"原始错误: {exc}"
-        ) from exc
-    return Qwen3ASRModel
-
-
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\.])\s*")
-
-
-def _split_text_with_timing(text: str, start_s: float, end_s: float) -> list[dict[str, Any]]:
-    s = (text or "").strip()
-    if not s:
-        return []
-    duration = float(max(0.0, end_s - start_s))
-    if duration <= 0:
-        return [{"start": float(start_s), "end": float(start_s), "text": s, "speaker": "SPEAKER_00"}]
-
-    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(s) if p and p.strip()]
-    if not parts:
-        return [{"start": float(start_s), "end": float(end_s), "text": s, "speaker": "SPEAKER_00"}]
-
-    weights = [max(1, len(p.replace(" ", ""))) for p in parts]
-    total = float(sum(weights)) or 1.0
-
-    out: list[dict[str, Any]] = []
-    cur = float(start_s)
-    for i, (p, w) in enumerate(zip(parts, weights)):
-        seg_dur = duration * (float(w) / total)
-        seg_end = float(end_s) if i == (len(parts) - 1) else float(cur + seg_dur)
-        out.append({"start": float(cur), "end": float(seg_end), "text": p, "speaker": "SPEAKER_00"})
-        cur = seg_end
-    return out
-
-
-def _preload_cudnn_for_onnxruntime_gpu() -> None:
-    """Ensure onnxruntime-gpu can find cuDNN shipped as pip wheels.
-
-    In some environments (notably WSL / minimal containers), CUDA libraries are available
-    system-wide, but cuDNN is installed via `nvidia-cudnn-cu12` inside the venv only.
-    `onnxruntime-gpu` loads `libonnxruntime_providers_cuda.so`, which depends on `libcudnn.so.9`.
-    The dynamic loader won't search the venv site-packages directory by default, leading to
-    a hard crash/abort in downstream libraries.
-
-    We preload `libcudnn.so.9` via an absolute path and RTLD_GLOBAL so that subsequent loads
-    can resolve the dependency by SONAME.
-    """
-
-    global _CUDNN_PRELOADED  # noqa: PLW0603
-
-    if _CUDNN_PRELOADED:
-        return
-    _CUDNN_PRELOADED = True
-
-    if sys.platform != "linux":
-        return
-
-    try:
-        ort_spec = importlib.util.find_spec("onnxruntime")
-        if not ort_spec or not ort_spec.submodule_search_locations:
-            return
-        ort_root = Path(list(ort_spec.submodule_search_locations)[0])
-        if not (ort_root / "capi" / "libonnxruntime_providers_cuda.so").exists():
-            # CPU-only build; nothing to do.
-            return
-
-        cudnn_spec = importlib.util.find_spec("nvidia.cudnn")
-        if not cudnn_spec or not cudnn_spec.submodule_search_locations:
-            return
-        cudnn_root = Path(list(cudnn_spec.submodule_search_locations)[0])
-        cudnn_lib = cudnn_root / "lib" / "libcudnn.so.9"
-        if not cudnn_lib.exists():
-            return
-
-        ctypes.CDLL(str(cudnn_lib), mode=ctypes.RTLD_GLOBAL)
-        logger.info(f"已预加载cuDNN用于onnxruntime-gpu: {cudnn_lib}")
-    except Exception as exc:  # pylint: disable=broad-except
-        # Never hard-fail here; downstream may still work if the system has cuDNN installed.
-        logger.warning(f"预加载cuDNN失败 onnxruntime-gpu: {exc}")
-
-
-_TORCHAUDIO_BACKEND_COMPAT_PATCHED = False
-
-
-def _patch_torchaudio_backend_compat() -> None:
-    """
-    torchaudio 2.10+ removed legacy backend APIs:
-      - torchaudio.list_audio_backends
-      - torchaudio.get_audio_backend
-      - torchaudio.set_audio_backend
-
-    Some downstream libs (notably speechbrain imported by pyannote.audio pipelines) still call them.
-    We inject a tiny compatibility shim so those calls won't crash.
-
-    NOTE: This does NOT actually switch torchaudio I/O backends (2.10+ doesn't expose that
-    mechanism publicly). It only prevents AttributeError and records the requested backend.
-    """
-    global _TORCHAUDIO_BACKEND_COMPAT_PATCHED  # noqa: PLW0603
-
-    if _TORCHAUDIO_BACKEND_COMPAT_PATCHED:
-        return
-    _TORCHAUDIO_BACKEND_COMPAT_PATCHED = True
-
-    try:
-        import torchaudio  # type: ignore
-    except Exception:
-        return
-
-    if (
-        hasattr(torchaudio, "list_audio_backends")
-        and hasattr(torchaudio, "get_audio_backend")
-        and hasattr(torchaudio, "set_audio_backend")
-    ):
-        return
-
-    backends: list[str] = []
-    try:
-        import soundfile  # noqa: F401
-
-        backends.append("soundfile")
-    except Exception:
-        pass
-
-    # Attach best-effort state onto torchaudio module.
-    try:
-        setattr(torchaudio, "_youdub_audio_backends", backends)
-        setattr(torchaudio, "_youdub_audio_backend", backends[0] if backends else None)
-    except Exception:
-        # If we cannot attach state, still patch functions (they'll return defaults).
-        pass
-
-    def _list_audio_backends() -> list[str]:
-        try:
-            v = getattr(torchaudio, "_youdub_audio_backends", None)
-            return list(v) if isinstance(v, list) else []
-        except Exception:
-            return []
-
-    def _get_audio_backend() -> str | None:
-        try:
-            v = getattr(torchaudio, "_youdub_audio_backend", None)
-            return str(v) if v is not None else None
-        except Exception:
-            return None
-
-    def _set_audio_backend(name: object) -> None:
-        try:
-            s = str(name).strip() if name is not None else ""
-        except Exception:
-            s = ""
-        try:
-            setattr(torchaudio, "_youdub_audio_backend", s or None)
-        except Exception:
-            return
-
-    # Inject
-    try:
-        if not hasattr(torchaudio, "list_audio_backends"):
-            setattr(torchaudio, "list_audio_backends", _list_audio_backends)
-        if not hasattr(torchaudio, "get_audio_backend"):
-            setattr(torchaudio, "get_audio_backend", _get_audio_backend)
-        if not hasattr(torchaudio, "set_audio_backend"):
-            setattr(torchaudio, "set_audio_backend", _set_audio_backend)
-        logger.info("已为 torchaudio 注入 backend 兼容 API（list/get/set_audio_backend），用于 pyannote 兼容。")
-    except Exception:
-        return
-
-
-def _env_flag(name: str, *, default: bool = False) -> bool:
-    raw = os.getenv(name, None)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, None)
-    if raw is None:
-        return float(default)
-    s = str(raw).strip()
-    if not s:
-        return float(default)
-    try:
-        x = float(s)
-    except Exception:
-        return float(default)
-    return float(x) if math.isfinite(x) else float(default)
-
-
-def _speaker_repair_enabled() -> bool:
-    return _env_flag("YOUDUB_SPEAKER_REPAIR", default=False)
-
-
-def _speaker_repair_params() -> dict[str, float]:
-    # Conservative defaults: only fix very confident mismatches.
-    min_dur = float(max(0.2, _env_float("YOUDUB_SPEAKER_REPAIR_MIN_DURATION", 1.5)))
-    centroid_min_dur = float(max(min_dur, _env_float("YOUDUB_SPEAKER_REPAIR_CENTROID_MIN_DURATION", 3.0)))
-    sim_th = float(max(-1.0, min(1.0, _env_float("YOUDUB_SPEAKER_REPAIR_SIM_THRESHOLD", 0.20))))
-    margin_th = float(max(0.0, min(1.0, _env_float("YOUDUB_SPEAKER_REPAIR_MARGIN_THRESHOLD", 0.10))))
-    clip_min = float(max(0.5, _env_float("YOUDUB_SPEAKER_REPAIR_CLIP_MIN_SECONDS", 2.0)))
-    clip_max = float(max(clip_min, _env_float("YOUDUB_SPEAKER_REPAIR_CLIP_MAX_SECONDS", 6.0)))
-    max_changes_ratio = float(max(0.0, min(1.0, _env_float("YOUDUB_SPEAKER_REPAIR_MAX_CHANGES_RATIO", 0.30))))
-    return {
-        "min_duration": min_dur,
-        "centroid_min_duration": centroid_min_dur,
-        "sim_threshold": sim_th,
-        "margin_threshold": margin_th,
-        "clip_min_seconds": clip_min,
-        "clip_max_seconds": clip_max,
-        "max_changes_ratio": max_changes_ratio,
-    }
-
-
-def _load_embedding_inference(
-    *,
-    device: str,
-    settings: Settings,
-    model_manager: ModelManager,
-) -> object | None:
-    """
-    Best-effort load pyannote/embedding for post-diarization speaker repair.
-
-    - Works offline when cached under whisper_diarization_model_dir.
-    - If unavailable, returns None (repair will be skipped).
-    """
-    global _EMBEDDING_MODEL, _EMBEDDING_INFERENCE, _EMBEDDING_KEY, _EMBEDDING_MODEL_LOAD_FAILED  # noqa: PLW0603
-
-    if _EMBEDDING_MODEL_LOAD_FAILED:
-        return None
-
-    _patch_torchaudio_backend_compat()
-
-    diar_dir = settings.resolve_path(settings.whisper_diarization_model_dir)
-    cache_dir = str(diar_dir) if diar_dir else None
-    token = settings.hf_token
-
-    key = f"{device}|{cache_dir or ''}|pyannote/embedding"
-    if _EMBEDDING_INFERENCE is not None and _EMBEDDING_KEY == key:
-        return _EMBEDDING_INFERENCE
-
-    try:
-        from pyannote.audio import Inference, Model  # type: ignore
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(f"说话人修复: 缺少 pyannote.audio，跳过 embedding 修复: {exc}")
-        _EMBEDDING_MODEL_LOAD_FAILED = True
-        return None
-
-    # Ensure diarization assets are ready (offline). Embedding model shares the same cache dir.
-    try:
-        _ensure_assets(settings, model_manager, require_diarization=True)
-    except Exception:
-        # Best-effort; proceed anyway.
-        pass
-
-    try:
-        logger.info("说话人修复: 加载 pyannote/embedding 模型...")
-        with torch_load_weights_only_compat():
-            try:
-                model = Model.from_pretrained("pyannote/embedding", token=token, cache_dir=cache_dir)
-            except TypeError:
-                try:
-                    model = Model.from_pretrained("pyannote/embedding", use_auth_token=token, cache_dir=cache_dir)
-                except TypeError:
-                    try:
-                        model = Model.from_pretrained("pyannote/embedding", token=token)
-                    except TypeError:
-                        model = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
-
-        if model is None:
-            raise RuntimeError("Model.from_pretrained returned None")
-
-        try:
-            model.to(torch.device(device))
-        except Exception:
-            # Best-effort: keep default device.
-            pass
-
-        _EMBEDDING_MODEL = model
-        _EMBEDDING_INFERENCE = Inference(_EMBEDDING_MODEL, window="whole")
-        _EMBEDDING_KEY = key
-        logger.info("说话人修复: pyannote/embedding 模型就绪")
-        return _EMBEDDING_INFERENCE
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(f"说话人修复: 加载 embedding 模型失败，跳过修复: {exc}")
-        _EMBEDDING_MODEL_LOAD_FAILED = True
-        return None
-
-
-def _speaker_repair_segment_embedding(
-    wav_path: str,
-    *,
-    start_s: float,
-    end_s: float,
-    inference: object,
-    clip_min_seconds: float,
-    clip_max_seconds: float,
-    sample_rate: int = 16000,
-) -> np.ndarray | None:
-    dur = float(max(0.0, float(end_s) - float(start_s)))
-    if dur <= 0.0:
-        return None
-
-    clip_s = float(min(float(clip_max_seconds), max(float(clip_min_seconds), dur)))
-    mid = float((float(start_s) + float(end_s)) * 0.5)
-    offset = float(max(0.0, mid - 0.5 * clip_s))
-
-    try:
-        y, _sr = librosa.load(wav_path, sr=int(sample_rate), mono=True, offset=float(offset), duration=float(clip_s))
-    except Exception:
-        return None
-
-    y = np.asarray(y, dtype=np.float32).reshape(-1)
-    if y.size <= int(sample_rate):
-        return None
-
-    try:
-        yt, _ = librosa.effects.trim(y, top_db=30.0)
-        if yt is not None and yt.size > 0:
-            y = np.asarray(yt, dtype=np.float32).reshape(-1)
-    except Exception:
-        pass
-
-    if y.size <= int(sample_rate):
-        return None
-
-    peak = float(np.max(np.abs(y))) if y.size else 0.0
-    if peak > 1e-6:
-        y = (y / np.float32(peak)).astype(np.float32, copy=False)
-
-    tmp_path: str | None = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(prefix="youdub_spkrepair_", suffix=".wav")
-        os.close(fd)
-        save_wav(y.astype(np.float32, copy=False), tmp_path, sample_rate=int(sample_rate))
-        # pyannote Inference expects a path.
-        emb = inference(tmp_path)  # type: ignore[operator]
-        e = np.asarray(emb, dtype=np.float32).reshape(-1)
-        n = float(np.linalg.norm(e))
-        if n > 1e-9:
-            e = (e / np.float32(n)).astype(np.float32, copy=False)
-        return e if e.size > 0 else None
-    except Exception:
-        return None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-
-def _repair_speakers_by_embedding(
-    *,
-    folder: str,
-    transcript: list[dict[str, Any]],
-    wav_path: str,
-    settings: Settings,
-    model_manager: ModelManager,
-    device: str,
-) -> dict[str, Any] | None:
-    """
-    Post-process speaker labels using embeddings on real audio chunks.
-
-    This is a *repair* step: only apply changes when confidence is high.
-    """
-    if not transcript:
-        return None
-
-    params = _speaker_repair_params()
-    inference = _load_embedding_inference(device=device, settings=settings, model_manager=model_manager)
-    if inference is None:
-        return None
-
-    min_dur = float(params["min_duration"])
-    centroid_min_dur = float(params["centroid_min_duration"])
-    sim_th = float(params["sim_threshold"])
-    margin_th = float(params["margin_threshold"])
-    clip_min_s = float(params["clip_min_seconds"])
-    clip_max_s = float(params["clip_max_seconds"])
-    max_changes_ratio = float(params["max_changes_ratio"])
-
-    seg_emb: dict[int, np.ndarray] = {}
-    seg_dur: dict[int, float] = {}
-    for i, seg in enumerate(transcript):
-        check_cancelled()
-        try:
-            st = float(seg.get("start", 0.0) or 0.0)
-            ed = float(seg.get("end", st) or st)
-        except Exception:
-            continue
-        dur = float(max(0.0, ed - st))
-        seg_dur[i] = dur
-        if dur + 1e-9 < min_dur:
-            continue
-        e = _speaker_repair_segment_embedding(
-            wav_path,
-            start_s=st,
-            end_s=ed,
-            inference=inference,
-            clip_min_seconds=clip_min_s,
-            clip_max_seconds=clip_max_s,
-            sample_rate=16000,
-        )
-        if e is not None and e.size > 0:
-            seg_emb[i] = e
-
-    if not seg_emb:
-        return None
-
-    # Build centroids from longer segments (more stable embeddings).
-    by_spk: dict[str, list[np.ndarray]] = defaultdict(list)
-    for i, seg in enumerate(transcript):
-        e = seg_emb.get(i)
-        if e is None:
-            continue
-        if float(seg_dur.get(i, 0.0)) + 1e-9 < centroid_min_dur:
-            continue
-        spk = str(seg.get("speaker") or "SPEAKER_00")
-        by_spk[spk].append(e)
-
-    centroid: dict[str, np.ndarray] = {}
-    support: dict[str, int] = {}
-    for spk, arr in by_spk.items():
-        if len(arr) < 3:
-            continue
-        m = np.mean(np.stack(arr, axis=0), axis=0)
-        n = float(np.linalg.norm(m))
-        if n > 1e-9:
-            m = (m / np.float32(n)).astype(np.float32, copy=False)
-        centroid[spk] = np.asarray(m, dtype=np.float32).reshape(-1)
-        support[spk] = int(len(arr))
-
-    if len(centroid) < 2:
-        # Not enough speakers/centroids to repair.
-        return None
-
-    spk_list = sorted(centroid.keys())
-    changes: list[dict[str, Any]] = []
-    confusion: Counter[tuple[str, str]] = Counter()
-    for i, seg in enumerate(transcript):
-        check_cancelled()
-        old = str(seg.get("speaker") or "SPEAKER_00")
-        e = seg_emb.get(i)
-        if e is None:
-            confusion[(old, old)] += 1
-            continue
-
-        best_spk = None
-        best_sim = -999.0
-        second_sim = -999.0
-        for spk in spk_list:
-            sim = float(np.dot(e, centroid[spk]))
-            if sim > best_sim:
-                second_sim = best_sim
-                best_sim = sim
-                best_spk = spk
-            elif sim > second_sim:
-                second_sim = sim
-
-        if best_spk is None:
-            confusion[(old, old)] += 1
-            continue
-
-        margin = float(best_sim - second_sim) if math.isfinite(second_sim) else float("inf")
-        new = old
-        if best_spk != old and best_sim >= sim_th and margin >= margin_th:
-            new = best_spk
-            changes.append(
-                {
-                    "index": int(i),
-                    "start": float(seg.get("start", 0.0) or 0.0),
-                    "end": float(seg.get("end", 0.0) or 0.0),
-                    "duration": float(seg_dur.get(i, 0.0)),
-                    "old": old,
-                    "new": new,
-                    "best_sim": float(best_sim),
-                    "margin": float(margin),
-                    "text": str(seg.get("text") or "")[:160],
-                }
-            )
-        confusion[(old, new)] += 1
-
-    # Guardrail: if too many changes, centroids are likely unreliable (heavy mixing / overlap).
-    applied = False
-    if changes:
-        ratio = float(len(changes)) / float(max(1, len(transcript)))
-        if ratio > max_changes_ratio + 1e-9:
-            logger.warning(
-                f"说话人修复: 变更比例过高 {ratio:.1%} ({len(changes)}/{len(transcript)})，"
-                f"超过阈值 {max_changes_ratio:.1%}；将只输出报告，不自动应用。"
-            )
-        else:
-            for ch in changes:
-                idx = int(ch["index"])
-                if 0 <= idx < len(transcript):
-                    transcript[idx]["speaker"] = str(ch["new"])
-            applied = True
-
-    report = {
-        "version": 1,
-        "applied": bool(applied),
-        "params": params,
-        "device": str(device),
-        "wav_path": str(wav_path),
-        "segments_total": int(len(transcript)),
-        "segments_with_embedding": int(len(seg_emb)),
-        "centroids": {k: int(support.get(k, 0)) for k in spk_list},
-        "changes": changes,
-        "confusion": {f"{a}->{b}": int(n) for (a, b), n in confusion.items()},
-    }
-
-    try:
-        out_path = os.path.join(folder, "speaker_repair_report.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        logger.info(
-            f"说话人修复: {'已应用' if applied else '未应用'} {len(changes)} 条变更，报告: {out_path}"
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(f"说话人修复: 写报告失败（忽略）: {exc}")
-
-    return report
-
-
-def _update_translation_speakers_from_transcript(
-    folder: str,
-    transcript: list[dict[str, Any]],
-) -> bool:
-    """Best-effort: patch translation.json speaker labels by time overlap with transcript."""
-    tr_path = os.path.join(folder, "translation.json")
-    if not os.path.exists(tr_path):
-        return False
-    try:
-        with open(tr_path, "r", encoding="utf-8") as f:
-            items = json.load(f) or []
-        if not isinstance(items, list) or not items:
-            return False
-    except Exception:
-        return False
-
-    turns: list[dict[str, Any]] = []
-    for seg in transcript:
-        try:
-            s0 = float(seg.get("start", 0.0) or 0.0)
-            s1 = float(seg.get("end", s0) or s0)
-        except Exception:
-            continue
-        if s1 <= s0:
-            continue
-        turns.append({"start": float(s0), "end": float(s1), "speaker": str(seg.get("speaker") or "SPEAKER_00")})
-
-    if not turns:
-        return False
-
-    before = [str(it.get("speaker") or "SPEAKER_00") for it in items]
-    _assign_speakers_by_overlap(items, turns, default_speaker="SPEAKER_00")
-    after = [str(it.get("speaker") or "SPEAKER_00") for it in items]
-    if before == after:
-        return False
-
-    try:
-        with open(tr_path, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
-        logger.info(f"说话人修复: 已更新 translation.json 的 speaker 标签: {tr_path}")
-        return True
-    except Exception:
-        return False
 
 
 def unload_all_models() -> None:
@@ -690,21 +125,6 @@ def unload_all_models() -> None:
         pass
 
 
-def _ensure_assets(
-    settings: Settings,
-    model_manager: ModelManager,
-    require_diarization: bool,
-) -> None:
-    model_manager.enforce_offline()
-    # NOTE: Whisper ASR model path is often provided via UI arguments (not only Settings).
-    # Avoid enforcing a fixed Settings-based path here; `load_asr_model()` will validate the
-    # actual model_dir passed in (expects model.bin).
-    if require_diarization:
-        model_manager.ensure_ready(
-            names=[model_manager._whisper_diarization_requirement().name]  # type: ignore[attr-defined]
-        )
-
-
 def _default_compute_type(device: str) -> str:
     return "float16" if device == "cuda" else "int8"
 
@@ -723,7 +143,7 @@ def load_asr_model(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
-    _ensure_assets(settings, model_manager, require_diarization=False)
+    ensure_assets(settings, model_manager, require_diarization=False)
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -805,7 +225,7 @@ def load_qwen_asr_model(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
-    _ensure_assets(settings, model_manager, require_diarization=False)
+    ensure_assets(settings, model_manager, require_diarization=False)
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -926,7 +346,7 @@ def load_diarize_model(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
-    _ensure_assets(settings, model_manager, require_diarization=True)
+    ensure_assets(settings, model_manager, require_diarization=True)
 
     _patch_torchaudio_backend_compat()
 
@@ -1019,576 +439,35 @@ def load_diarize_model(
     _DIARIZATION_KEY = key
 
 
-def merge_segments(transcript: list[dict[str, Any]], ending: str = '!"\').:;?]}~') -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    buffer: dict[str, Any] | None = None
-
-    for segment in transcript:
-        if buffer is None:
-            buffer = segment
-            continue
-
-        # Never merge across speaker boundaries.
-        if buffer.get("speaker") != segment.get("speaker"):
-            merged.append(buffer)
-            buffer = segment
-            continue
-
-        if buffer.get("text") and str(buffer["text"])[-1] in ending:
-            merged.append(buffer)
-            buffer = segment
-            continue
-
-        buffer["text"] = (str(buffer.get("text", "")).strip() + " " + str(segment.get("text", "")).strip()).strip()
-        buffer["end"] = segment.get("end", buffer.get("end"))
-        # Merge word-level timestamps only when both sides have them.
-        buf_words = buffer.get("words")
-        seg_words = segment.get("words")
-        if buf_words is None or seg_words is None:
-            buffer["words"] = None
-        else:
-            buffer["words"] = list(buf_words) + list(seg_words)
-
-    if buffer is not None:
-        merged.append(buffer)
-    return merged
-
-
-def generate_speaker_audio(folder: str, transcript: list[dict[str, Any]]) -> None:
-    check_cancelled()
-    wav_path = os.path.join(folder, "audio_vocals.wav")
-    if not os.path.exists(wav_path):
-        logger.warning(f"未找到音频文件: {wav_path}")
-        return
-
-    target_sr = 24000
-    max_ref_seconds = read_speaker_ref_seconds()
-    max_ref_samples = int(max_ref_seconds * float(target_sr))
-    delay = 0.05
-    speakers = {str(seg.get("speaker") or "SPEAKER_00") for seg in transcript}
-    speaker_dict: dict[str, np.ndarray] = {}
-    for spk in speakers:
-        check_cancelled()
-        speaker_dict[spk] = np.zeros((0,), dtype=np.float32)
-
-    for segment in transcript:
-        check_cancelled()
-        start_s = float(segment.get("start", 0.0))
-        end_s = float(segment.get("end", 0.0))
-        speaker = str(segment.get("speaker") or "SPEAKER_00")
-        if max_ref_samples > 0 and speaker_dict.get(speaker, np.zeros((0,), dtype=np.float32)).shape[0] >= max_ref_samples:
-            continue
-
-        offset = max(0.0, start_s - delay)
-        duration = max(0.0, (end_s - start_s) + 2.0 * delay)
-        if duration <= 0:
-            continue
-        try:
-            check_cancelled()
-            chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=offset, duration=duration)
-        except Exception as exc:
-            logger.warning(f"加载说话人音频块失败 (speaker={speaker}, offset={offset:.2f}秒): {exc}")
-            continue
-        if chunk.size <= 0:
-            continue
-
-        remaining = max_ref_samples - int(speaker_dict[speaker].shape[0]) if max_ref_samples > 0 else chunk.shape[0]
-        if remaining <= 0:
-            continue
-        if chunk.shape[0] > remaining:
-            chunk = chunk[:remaining]
-        speaker_dict[speaker] = np.concatenate((speaker_dict[speaker], chunk.astype(np.float32)))
-
-        if max_ref_samples > 0 and all(v.shape[0] >= max_ref_samples for v in speaker_dict.values()):
-            break
-
-    speaker_folder = os.path.join(folder, "SPEAKER")
-    os.makedirs(speaker_folder, exist_ok=True)
-
-    # Fallback: if a speaker has 0 samples, take the first N seconds from the file.
-    for speaker in speakers:
-        check_cancelled()
-        if speaker_dict[speaker].size > 0:
-            continue
-        try:
-            check_cancelled()
-            chunk, _sr = librosa.load(wav_path, sr=target_sr, mono=True, offset=0.0, duration=max_ref_seconds)
-            if chunk.size > 0:
-                speaker_dict[speaker] = chunk.astype(np.float32)
-        except Exception:
-            # Best-effort: keep empty
-            continue
-
-    for speaker, audio in speaker_dict.items():
-        check_cancelled()
-        if audio.size <= 0:
-            continue
-        speaker_file_path = os.path.join(speaker_folder, f"{speaker}.wav")
-        save_wav(audio, speaker_file_path, sample_rate=target_sr)
-        if max_ref_samples > 0 and audio.shape[0] >= max_ref_samples:
-            logger.info(f"已保存说话人参考 ({max_ref_seconds:.1f}秒): {speaker_file_path}")
-
-
-def _assign_speakers_by_overlap(
-    segments: list[dict[str, Any]],
-    turns: list[dict[str, Any]],
-    default_speaker: str = "SPEAKER_00",
-) -> None:
-    if not segments or not turns:
-        for seg in segments:
-            check_cancelled()
-            seg["speaker"] = default_speaker
-        return
-
-    turns_sorted = sorted(turns, key=lambda x: float(x["start"]))
-    idx = 0
-
-    for seg in segments:
-        check_cancelled()
-        seg_start = float(seg.get("start", 0.0))
-        seg_end = float(seg.get("end", 0.0))
-        if seg_end <= seg_start:
-            seg["speaker"] = default_speaker
-            continue
-
-        while idx < len(turns_sorted) and float(turns_sorted[idx]["end"]) <= seg_start:
-            check_cancelled()
-            idx += 1
-
-        best_speaker = None
-        best_overlap = 0.0
-        j = idx
-        while j < len(turns_sorted) and float(turns_sorted[j]["start"]) < seg_end:
-            check_cancelled()
-            t = turns_sorted[j]
-            ov = max(0.0, min(seg_end, float(t["end"])) - max(seg_start, float(t["start"])))
-            if ov > best_overlap:
-                best_overlap = ov
-                best_speaker = str(t.get("speaker") or default_speaker)
-            j += 1
-
-        seg["speaker"] = best_speaker if best_speaker is not None else default_speaker
-
-
-def _read_download_info(folder: str) -> dict[str, Any] | None:
-    info_path = os.path.join(folder, "download.info.json")
-    if not os.path.exists(info_path):
-        return None
-    try:
-        with open(info_path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-def _pick_preferred_manual_subtitle_lang(info: dict[str, Any]) -> str | None:
-    subtitles = info.get("subtitles")
-    if not isinstance(subtitles, dict) or not subtitles:
-        return None
-
-    keys = [str(k) for k in subtitles.keys() if str(k).strip()]
-    if not keys:
-        return None
-
-    preferred: list[str] = []
-    for k in (info.get("language"), info.get("original_language")):
-        if isinstance(k, str) and k.strip():
-            preferred.append(k.strip())
-
-    # 1) Prefer the video's language / original_language when available.
-    for p in preferred:
-        if p in subtitles:
-            return p
-
-    # 2) Prefer English (en / en-*)
-    if "en" in subtitles:
-        return "en"
-    for k in keys:
-        if k.lower().startswith("en"):
-            return k
-
-    # 3) Fallback: first available language key (stable).
-    return keys[0]
-
-
-_VTT_TS_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})\.(\d{3})$")
-_SRT_TS_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2}),(\d{3})$")
-_SUB_TAG_RE = re.compile(r"<[^>]+>")
-_SUB_WS_RE = re.compile(r"\s+")
-
-
-def _parse_vtt_timestamp(ts: str) -> float | None:
-    s = (ts or "").strip()
-    m = _VTT_TS_RE.match(s)
-    if not m:
-        return None
-    hh = int(m.group(1) or 0)
-    mm = int(m.group(2) or 0)
-    ss = int(m.group(3) or 0)
-    ms = int(m.group(4) or 0)
-    return float(hh * 3600 + mm * 60 + ss) + float(ms) / 1000.0
-
-
-def _parse_srt_timestamp(ts: str) -> float | None:
-    s = (ts or "").strip()
-    m = _SRT_TS_RE.match(s)
-    if not m:
-        return None
-    hh = int(m.group(1) or 0)
-    mm = int(m.group(2) or 0)
-    ss = int(m.group(3) or 0)
-    ms = int(m.group(4) or 0)
-    return float(hh * 3600 + mm * 60 + ss) + float(ms) / 1000.0
-
-
-def _clean_subtitle_text(text: str) -> str:
-    s = (text or "").replace("\r", "\n")
-    # Unescape entities first so `&lt;...&gt;` can be stripped by tag regex.
-    try:
-        s = html.unescape(s)
-    except Exception:
-        pass
-    # Strip basic tags (WebVTT often contains <c>, <v>, <i>, etc).
-    s = _SUB_TAG_RE.sub("", s)
-    # Collapse whitespace across lines.
-    s = _SUB_WS_RE.sub(" ", s).strip()
-    return s
-
-
-def _parse_vtt_segments(content: str) -> list[dict[str, Any]]:
-    lines = (content or "").splitlines()
-    if lines and lines[0].startswith("\ufeff"):
-        lines[0] = lines[0].lstrip("\ufeff")
-
-    segs: list[dict[str, Any]] = []
-    i = 0
-    n = len(lines)
-
-    # Skip header (WEBVTT + optional metadata until blank line).
-    if i < n and lines[i].strip().upper().startswith("WEBVTT"):
-        i += 1
-        while i < n and lines[i].strip() != "":
-            i += 1
-    while i < n and lines[i].strip() == "":
-        i += 1
-
-    while i < n:
-        check_cancelled()
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
-
-        # Skip NOTE/STYLE/REGION blocks.
-        if line.startswith("NOTE") or line.startswith("STYLE") or line.startswith("REGION"):
-            i += 1
-            while i < n and lines[i].strip() != "":
-                i += 1
-            continue
-
-        # Optional cue identifier line.
-        if "-->" not in line and (i + 1) < n and ("-->" in lines[i + 1]):
-            i += 1
-            line = lines[i].strip()
-
-        if "-->" not in line:
-            i += 1
-            continue
-
-        left, right = line.split("-->", 1)
-        start_ts = left.strip().split()[0] if left.strip() else ""
-        end_ts = right.strip().split()[0] if right.strip() else ""
-        start_s = _parse_vtt_timestamp(start_ts)
-        end_s = _parse_vtt_timestamp(end_ts)
-        if start_s is None or end_s is None:
-            i += 1
-            continue
-
-        i += 1
-        text_lines: list[str] = []
-        while i < n and lines[i].strip() != "":
-            text_lines.append(lines[i])
-            i += 1
-
-        text = _clean_subtitle_text("\n".join(text_lines))
-        if text and end_s > start_s:
-            segs.append(
-                {
-                    "start": round(float(start_s), 3),
-                    "end": round(float(end_s), 3),
-                    "text": text,
-                    "speaker": "SPEAKER_00",
-                }
-            )
-
-        while i < n and lines[i].strip() == "":
-            i += 1
-
-    return segs
-
-
-def _parse_srt_segments(content: str) -> list[dict[str, Any]]:
-    lines = (content or "").splitlines()
-    if lines and lines[0].startswith("\ufeff"):
-        lines[0] = lines[0].lstrip("\ufeff")
-
-    segs: list[dict[str, Any]] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        check_cancelled()
-        if not lines[i].strip():
-            i += 1
-            continue
-
-        # Optional numeric index line
-        if lines[i].strip().isdigit():
-            i += 1
-            if i >= n:
-                break
-
-        if "-->" not in lines[i]:
-            i += 1
-            continue
-
-        left, right = lines[i].split("-->", 1)
-        start_ts = left.strip()
-        end_ts = right.strip().split()[0] if right.strip() else ""
-        start_s = _parse_srt_timestamp(start_ts)
-        end_s = _parse_srt_timestamp(end_ts)
-        i += 1
-
-        text_lines: list[str] = []
-        while i < n and lines[i].strip() != "":
-            text_lines.append(lines[i])
-            i += 1
-
-        if start_s is None or end_s is None:
-            continue
-
-        text = _clean_subtitle_text("\n".join(text_lines))
-        if text and end_s > start_s:
-            segs.append(
-                {
-                    "start": round(float(start_s), 3),
-                    "end": round(float(end_s), 3),
-                    "text": text,
-                    "speaker": "SPEAKER_00",
-                }
-            )
-
-    return segs
-
-
-def _find_subtitle_file(folder: str, preferred_lang: str | None) -> tuple[str | None, str | None]:
-    """
-    Find a parseable subtitle file written by yt-dlp under `folder`.
-
-    Returns: (file_path, detected_lang)
-    """
-    exts = (".vtt", ".srt")
-
-    def _candidate(lang: str, ext: str) -> str:
-        return os.path.join(folder, f"download.{lang}{ext}")
-
-    if preferred_lang:
-        for ext in exts:
-            p = _candidate(preferred_lang, ext)
-            if os.path.exists(p):
-                return p, preferred_lang
-
-    # Fallback: scan folder for any download.*.vtt/srt
-    try:
-        names = [
-            n
-            for n in os.listdir(folder)
-            if n.startswith("download.")
-            and n.lower().endswith(exts)
-            # Ignore auto captions artifacts (yt-dlp typically uses *.auto.vtt).
-            and (".auto." not in n.lower())
-            and (not n.lower().endswith(".auto.vtt"))
-            and (not n.lower().endswith(".auto.srt"))
-        ]
-    except Exception:
-        names = []
-
-    def _lang_from_name(name: str) -> str:
-        low = name
-        for ext in exts:
-            if low.lower().endswith(ext):
-                low = low[: -len(ext)]
-                break
-        # download.<lang>
-        if low.startswith("download."):
-            return low[len("download.") :]
-        return ""
-
-    candidates: list[tuple[str, str]] = []
-    for n in sorted(names):
-        lang = _lang_from_name(n).strip()
-        candidates.append((os.path.join(folder, n), lang))
-
-    if not candidates:
-        return None, None
-
-    if preferred_lang:
-        # Case-insensitive match.
-        for p, lang in candidates:
-            if lang.lower() == preferred_lang.lower():
-                return p, lang
-        for p, lang in candidates:
-            ll = lang.lower()
-            pl = preferred_lang.lower()
-            if ll.startswith(pl) and (len(ll) == len(pl) or ll[len(pl)] in {"-", "_"}):
-                return p, lang
-
-    # Prefer English if present.
-    for p, lang in candidates:
-        ll = lang.lower()
-        if ll == "en" or (ll.startswith("en") and (len(ll) == 2 or ll[2] in {"-", "_"})):
-            return p, lang
-
-    return candidates[0]
-
-
-def _parse_subtitle_file(path: str) -> list[dict[str, Any]]:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-    except Exception:
-        return []
-
-    low = path.lower()
-    if low.endswith(".vtt"):
-        return _parse_vtt_segments(content)
-    if low.endswith(".srt"):
-        return _parse_srt_segments(content)
-    return []
-
-
-def _is_youtube_subtitle_transcript(transcript: Any, *, lang: str | None = None) -> bool:
-    if not isinstance(transcript, list) or not transcript:
-        return False
-    # Best-effort marker: we store source/lang per-segment.
-    head = transcript[0]
-    if not isinstance(head, dict):
-        return False
-    if str(head.get("source") or "") != "youtube_subtitles":
-        return False
-    if lang is None:
-        return True
-    return str(head.get("subtitle_lang") or "") == str(lang)
-
-
-def _save_youtube_subtitle_transcript(
-    folder: str,
-    segments: list[dict[str, Any]],
+def _compute_diarization_turns(
+    wav_path: str,
     *,
-    subtitle_lang: str | None,
-    diarization: bool,
     device: str,
     min_speakers: int | None,
     max_speakers: int | None,
     settings: Settings | None,
     model_manager: ModelManager | None,
-) -> list[dict[str, Any]]:
-    transcript: list[dict[str, Any]] = segments
-    for seg in transcript:
-        seg["source"] = "youtube_subtitles"
-        seg["subtitle_lang"] = str(subtitle_lang or "")
-
-    # If diarization requested, still compute speakers and align them to subtitle segments.
-    if diarization:
-        wav_path_existing = os.path.join(folder, "audio_vocals.wav")
-        if not os.path.exists(wav_path_existing):
-            logger.warning(f"检测到字幕但缺少人声轨，无法说话人分离: {wav_path_existing}")
-            for seg in transcript:
-                seg["speaker"] = "SPEAKER_00"
-        else:
-            try:
-                check_cancelled()
-                load_diarize_model(device=device, settings=settings, model_manager=model_manager)
-                assert _DIARIZATION_PIPELINE is not None
-                model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
-                logger.info(f"字幕转录：计算说话人分离 ({model_tag})...")
-                check_cancelled()
-                ann = _DIARIZATION_PIPELINE(
-                    wav_path_existing, min_speakers=min_speakers, max_speakers=max_speakers
-                )
-                ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
-                turns: list[dict[str, Any]] = []
-                for seg, _, speaker in ann_view.itertracks(yield_label=True):
-                    check_cancelled()
-                    turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
-                _assign_speakers_by_overlap(transcript, turns)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(f"说话人分离失败，回退到单说话人: {exc}")
-                for seg in transcript:
-                    seg["speaker"] = "SPEAKER_00"
-
-    check_cancelled()
-    transcript = merge_segments(transcript)
-
-    check_cancelled()
-    transcript_path = os.path.join(folder, "transcript.json")
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        json.dump(transcript, f, indent=2, ensure_ascii=False)
-    logger.info(f"已保存字幕转录: {transcript_path}")
-
-    # Best-effort: refresh speaker reference files.
+    log_hint: str,
+) -> list[dict[str, Any]] | None:
+    if not os.path.exists(wav_path):
+        return None
     try:
         check_cancelled()
-        generate_speaker_audio(folder, transcript)
+        load_diarize_model(device=device, settings=settings, model_manager=model_manager)
+        assert _DIARIZATION_PIPELINE is not None
+        model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
+        logger.info(f"{log_hint} ({model_tag})...")
+        check_cancelled()
+        ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
+        ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
+        turns: list[dict[str, Any]] = []
+        for seg, _, speaker in ann_view.itertracks(yield_label=True):
+            check_cancelled()
+            turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
+        return turns
     except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(f"生成说话人参考音频失败（忽略）: {exc}")
-
-    return transcript
-
-
-def _invalidate_downstream_cache_for_new_transcript(folder: str) -> None:
-    """
-    When transcript.json is replaced, downstream artifacts (translation/TTS) become invalid.
-
-    Best-effort cleanup only; failures should not block the pipeline.
-    """
-
-    # Translation artifacts
-    rm_files = [
-        os.path.join(folder, "translation.json"),
-        os.path.join(folder, "translation_raw.json"),
-        os.path.join(folder, "summary.json"),
-        os.path.join(folder, "transcript_punctuated.json"),
-    ]
-    removed = 0
-    for p in rm_files:
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-                removed += 1
-        except Exception:
-            continue
-
-    # TTS artifacts under wavs/
-    wavs_dir = os.path.join(folder, "wavs")
-    wavs_removed = 0
-    try:
-        if os.path.isdir(wavs_dir):
-            for ent in os.scandir(wavs_dir):
-                if not ent.is_file():
-                    continue
-                name = ent.name.lower()
-                if name.endswith(".wav") or name.endswith(".json"):
-                    try:
-                        os.remove(ent.path)
-                        wavs_removed += 1
-                    except Exception:
-                        continue
-    except Exception:
-        wavs_removed = 0
-
-    if removed or wavs_removed:
-        logger.info(f"已清理下游缓存: {folder} (translation={removed}, wavs={wavs_removed})")
+        logger.warning(f"{log_hint}失败: {exc}")
+        return None
 
 
 def transcribe_audio(
@@ -1643,16 +522,28 @@ def transcribe_audio(
                 if not _is_youtube_subtitle_transcript(transcript, lang=chosen_lang):
                     logger.info("检测到人工字幕，将使用字幕替换ASR转录")
                     _invalidate_downstream_cache_for_new_transcript(folder)
+
+                    turns: list[dict[str, Any]] | None = None
+                    if diarization:
+                        wav_path_existing = os.path.join(folder, "audio_vocals.wav")
+                        if not os.path.exists(wav_path_existing):
+                            logger.warning(f"检测到字幕但缺少人声轨，无法说话人分离: {wav_path_existing}")
+                        else:
+                            turns = _compute_diarization_turns(
+                                wav_path_existing,
+                                device=device,
+                                min_speakers=min_speakers,
+                                max_speakers=max_speakers,
+                                settings=settings,
+                                model_manager=model_manager,
+                                log_hint="字幕转录：计算说话人分离",
+                            )
+
                     _save_youtube_subtitle_transcript(
                         folder,
                         subtitle_segments,
                         subtitle_lang=chosen_lang,
-                        diarization=bool(diarization),
-                        device=device,
-                        min_speakers=min_speakers,
-                        max_speakers=max_speakers,
-                        settings=settings,
-                        model_manager=model_manager,
+                        turns=turns,
                     )
                     return True
 
@@ -1665,33 +556,29 @@ def transcribe_audio(
                     logger.warning(f"转录已存在但缺少人声轨，无法重新说话人分离: {wav_path_existing}")
                 else:
                     try:
-                        check_cancelled()
-                        load_diarize_model(device=device, settings=settings, model_manager=model_manager)
-                        assert _DIARIZATION_PIPELINE is not None
-                        model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
-                        logger.info(f"转录已存在，重新计算说话人分离 ({model_tag})...")
-                        check_cancelled()
-                        ann = _DIARIZATION_PIPELINE(
-                            wav_path_existing, min_speakers=min_speakers, max_speakers=max_speakers
+                        turns = _compute_diarization_turns(
+                            wav_path_existing,
+                            device=device,
+                            min_speakers=min_speakers,
+                            max_speakers=max_speakers,
+                            settings=settings,
+                            model_manager=model_manager,
+                            log_hint="转录已存在，重新计算说话人分离",
                         )
-                        ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
-                        turns: list[dict[str, Any]] = []
-                        for seg, _, speaker in ann_view.itertracks(yield_label=True):
-                            check_cancelled()
-                            turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
-                        _assign_speakers_by_overlap(transcript, turns)
+                        if turns:
+                            _assign_speakers_by_overlap(transcript, turns)
 
-                        check_cancelled()
-                        with open(transcript_path, "w", encoding="utf-8") as f:
-                            json.dump(transcript, f, indent=2, ensure_ascii=False)
-                        logger.info(f"已更新转录说话人标签: {transcript_path}")
-
-                        # Speaker refs are derived from speaker labels; refresh them best-effort.
-                        try:
                             check_cancelled()
-                            generate_speaker_audio(folder, transcript)
-                        except Exception as exc:  # pylint: disable=broad-except
-                            logger.warning(f"生成说话人参考音频失败（忽略）: {exc}")
+                            with open(transcript_path, "w", encoding="utf-8") as f:
+                                json.dump(transcript, f, indent=2, ensure_ascii=False)
+                            logger.info(f"已更新转录说话人标签: {transcript_path}")
+
+                            # Speaker refs are derived from speaker labels; refresh them best-effort.
+                            try:
+                                check_cancelled()
+                                generate_speaker_audio(folder, transcript)
+                            except Exception as exc:  # pylint: disable=broad-except
+                                logger.warning(f"生成说话人参考音频失败（忽略）: {exc}")
                     except Exception as exc:  # pylint: disable=broad-except
                         logger.warning(f"重新说话人分离失败，保留原转录说话人标签: {exc}")
 
@@ -1734,7 +621,7 @@ def transcribe_audio(
                         need = True
                         break
                 if need:
-                    generate_speaker_audio(folder, transcript)
+                    generate_speaker_audio(folder, transcript)  # type: ignore[arg-type]
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning(f"确保说话人参考音频失败: {exc}")
             return True
@@ -1742,17 +629,22 @@ def transcribe_audio(
     # transcript.json 不存在：若有人工字幕，直接用字幕生成转录并跳过 ASR。
     if subtitle_segments:
         _invalidate_downstream_cache_for_new_transcript(folder)
-        _save_youtube_subtitle_transcript(
-            folder,
-            subtitle_segments,
-            subtitle_lang=chosen_lang,
-            diarization=bool(diarization),
-            device=device,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            settings=settings,
-            model_manager=model_manager,
-        )
+        turns: list[dict[str, Any]] | None = None
+        if diarization:
+            wav_path_existing = os.path.join(folder, "audio_vocals.wav")
+            if not os.path.exists(wav_path_existing):
+                logger.warning(f"检测到字幕但缺少人声轨，无法说话人分离: {wav_path_existing}")
+            else:
+                turns = _compute_diarization_turns(
+                    wav_path_existing,
+                    device=device,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    settings=settings,
+                    model_manager=model_manager,
+                    log_hint="字幕转录：计算说话人分离",
+                )
+        _save_youtube_subtitle_transcript(folder, subtitle_segments, subtitle_lang=chosen_lang, turns=turns)
         return True
 
     wav_path = os.path.join(folder, "audio_vocals.wav")
@@ -1772,18 +664,15 @@ def transcribe_audio(
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    transcript: list[dict[str, Any]] = []
+    transcript_out: list[dict[str, Any]] = []
 
     if method == "qwen":
-        # Qwen3-ASR: chunk the audio (seconds) and approximate timestamps per sentence.
-        qwen_model_dir = (qwen_asr_model_dir or str(getattr(settings, "qwen_asr_model_path", "") or "")).strip()
+        qwen_model_dir2 = (qwen_asr_model_dir or str(getattr(settings, "qwen_asr_model_path", "") or "")).strip()
         qwen_threads = int(qwen_asr_num_threads or getattr(settings, "qwen_asr_num_threads", 1) or 1)
         qwen_chunk_s = int(qwen_asr_vad_segment_threshold or getattr(settings, "qwen_asr_vad_segment_threshold", 60) or 60)
-        qwen_threads = max(1, min(qwen_threads, 32))
-        qwen_chunk_s = max(5, qwen_chunk_s)
 
         load_qwen_asr_model(
-            model_dir=qwen_model_dir,
+            model_dir=qwen_model_dir2,
             device=device,
             settings=settings,
             model_manager=model_manager,
@@ -1791,66 +680,11 @@ def transcribe_audio(
         )
         assert _QWEN_ASR_MODEL is not None
 
-        logger.info(f"转录中(Qwen3-ASR) {wav_path}")
-        t0 = time.time()
-
-        dur = wav_duration_seconds(wav_path)
-        if dur is None:
-            # Fallback: use librosa header-based duration.
-            try:
-                dur = float(librosa.get_duration(filename=wav_path))
-            except Exception:
-                dur = None
-
-        if dur is None:
-            # Last resort: treat whole file as one chunk without timestamps.
-            dur = float(qwen_chunk_s)
-
-        starts = [float(x) for x in np.arange(0.0, float(dur) + 1e-6, float(qwen_chunk_s)).tolist()]
-
-        def _run_chunk(start_s: float) -> tuple[float, float, str, str | None]:
-            check_cancelled()
-            logger.info(f"Qwen3-ASR: 处理 chunk offset={start_s:.1f}s / {dur:.1f}s")
-            # Load chunk as 16k mono.
-            chunk, sr = librosa.load(wav_path, sr=16000, mono=True, offset=max(0.0, float(start_s)), duration=float(qwen_chunk_s))
-            if chunk.size <= 0:
-                return float(start_s), float(start_s), "", None
-            chunk_dur = float(chunk.shape[0]) / float(sr)
-            end_s = float(start_s) + chunk_dur
-            check_cancelled()
-            results = _QWEN_ASR_MODEL.transcribe(audio=(chunk, int(sr)), language=None)  # type: ignore[attr-defined]
-            if not results:
-                return float(start_s), float(end_s), "", None
-            r0 = results[0]
-            text = str(getattr(r0, "text", "") or "").strip()
-            lang = getattr(r0, "language", None)
-            lang_str = str(lang) if lang is not None else None
-            return float(start_s), float(end_s), text, lang_str
-
-        chunk_results: list[tuple[float, float, str, str | None]] = []
-        if qwen_threads <= 1 or len(starts) <= 1:
-            for st in starts:
-                check_cancelled()
-                chunk_results.append(_run_chunk(float(st)))
-        else:
-            with ThreadPoolExecutor(max_workers=qwen_threads) as ex:
-                futs = [ex.submit(_run_chunk, float(st)) for st in starts]
-                for fut in as_completed(futs):
-                    check_cancelled()
-                    chunk_results.append(fut.result())
-
-        chunk_results.sort(key=lambda x: x[0])
-        lang_seen: str | None = None
-        for st, ed, txt, lang in chunk_results:
-            check_cancelled()
-            if lang and not lang_seen:
-                lang_seen = lang
-            if not txt:
-                continue
-            transcript.extend(_split_text_with_timing(txt, st, ed))
-
-        logger.info(
-            f"ASR完成(Qwen3-ASR)，耗时 {time.time() - t0:.2f}秒 (段数={len(transcript)}, 语言={lang_seen})"
+        transcript_out, _lang_seen = run_qwen_asr(
+            wav_path,
+            model=_QWEN_ASR_MODEL,
+            num_threads=qwen_threads,
+            vad_segment_threshold_seconds=qwen_chunk_s,
         )
     else:
         if device == "cpu":
@@ -1870,104 +704,34 @@ def transcribe_audio(
             model_manager=model_manager,
             use_batched=True,
         )
-
         assert _ASR_MODEL is not None
 
-        logger.info(f"转录中 {wav_path}")
-        t0 = time.time()
-
         _preload_cudnn_for_onnxruntime_gpu()
-
-        # VAD: 使用 faster-whisper 默认参数（避免过度切分导致重复/幻觉）
-        # Prefer batched pipeline if available (much higher throughput on GPU).
-        if _ASR_PIPELINE is not None:
-            check_cancelled()
-            segments_iter, info = _ASR_PIPELINE.transcribe(
-                wav_path,
-                batch_size=batch_size,
-                beam_size=5,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                word_timestamps=True,  # 开启词级时间戳
-                no_speech_threshold=0.8,  # 提高阈值，防止漏句
-            )
-        else:
-            check_cancelled()
-            segments_iter, info = _ASR_MODEL.transcribe(
-                wav_path,
-                beam_size=5,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                word_timestamps=True,  # 开启词级时间戳
-                no_speech_threshold=0.8,  # 提高阈值，防止漏句
-            )
-
-        segments_list = []
-        for seg in segments_iter:
-            check_cancelled()
-            segments_list.append(seg)
-        logger.info(
-            f"ASR完成，耗时 {time.time() - t0:.2f}秒 (段数={len(segments_list)}, 语言={getattr(info, 'language', None)})"
+        transcript_out, _lang = run_whisper_asr(
+            wav_path,
+            asr_model=_ASR_MODEL,
+            asr_pipeline=_ASR_PIPELINE,
+            batch_size=batch_size,
         )
 
-        for seg in segments_list:
-            check_cancelled()
-            text = (getattr(seg, "text", "") or "").strip()
-            if not text:
-                continue
-            words = getattr(seg, "words", None)
-            words_data: list[dict[str, Any]] | None = None
-            if words:
-                words_data = []
-                for w in words:
-                    if w is None:
-                        continue
-                    words_data.append(
-                        {
-                            "start": float(getattr(w, "start", 0.0) or 0.0),
-                            "end": float(getattr(w, "end", 0.0) or 0.0),
-                            "word": str(getattr(w, "word", "") or ""),
-                            "probability": (
-                                float(getattr(w, "probability", 0.0) or 0.0)
-                                if getattr(w, "probability", None) is not None
-                                else None
-                            ),
-                        }
-                    )
-            transcript.append(
-                {
-                    "start": float(getattr(seg, "start", 0.0)),
-                    "end": float(getattr(seg, "end", 0.0)),
-                    "text": text,
-                    "speaker": "SPEAKER_00",
-                    "words": words_data,
-                }
-            )
-
     if diarization:
-        check_cancelled()
-        try:
-            load_diarize_model(device=device, settings=settings, model_manager=model_manager)
-            assert _DIARIZATION_PIPELINE is not None
-            model_tag = (_DIARIZATION_KEY.split("|")[-1] if _DIARIZATION_KEY else "pyannote")
-            logger.info(f"开始说话人分离 ({model_tag})...")
-            check_cancelled()
-            ann = _DIARIZATION_PIPELINE(wav_path, min_speakers=min_speakers, max_speakers=max_speakers)
-            # Some pyannote pipelines provide a non-overlapping ("exclusive") diarization view which
-            # generally aligns better with ASR timestamps. Fall back to legacy tracks when unavailable.
-            ann_view = getattr(ann, "exclusive_speaker_diarization", None) or ann
-            turns: list[dict[str, Any]] = []
-            for seg, _, speaker in ann_view.itertracks(yield_label=True):
-                check_cancelled()
-                turns.append({"start": float(seg.start), "end": float(seg.end), "speaker": str(speaker)})
-            _assign_speakers_by_overlap(transcript, turns)
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f"说话人分离失败，回退到单说话人: {exc}")
-            for item in transcript:
+        turns = _compute_diarization_turns(
+            wav_path,
+            device=device,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            settings=settings,
+            model_manager=model_manager,
+            log_hint="开始说话人分离",
+        )
+        if turns:
+            _assign_speakers_by_overlap(transcript_out, turns)
+        else:
+            for item in transcript_out:
                 item["speaker"] = "SPEAKER_00"
 
     check_cancelled()
-    transcript = merge_segments(transcript)
+    transcript_out = merge_segments(transcript_out)
 
     # Optional: embedding-based speaker repair (must not change segmentation/count).
     if diarization and _speaker_repair_enabled():
@@ -1975,23 +739,23 @@ def transcribe_audio(
             check_cancelled()
             _repair_speakers_by_embedding(
                 folder=folder,
-                transcript=transcript,
+                transcript=transcript_out,
                 wav_path=wav_path,
                 settings=settings,
                 model_manager=model_manager,
                 device=device,
             )
-            _update_translation_speakers_from_transcript(folder, transcript)
+            _update_translation_speakers_from_transcript(folder, transcript_out)
         except Exception as exc_rep:  # pylint: disable=broad-except
             logger.warning(f"说话人修复失败（忽略，保留 diarization 结果）: {exc_rep}")
 
     check_cancelled()
     with open(transcript_path, "w", encoding="utf-8") as f:
-        json.dump(transcript, f, indent=2, ensure_ascii=False)
+        json.dump(transcript_out, f, indent=2, ensure_ascii=False)
     logger.info(f"已保存转录: {transcript_path}")
 
     check_cancelled()
-    generate_speaker_audio(folder, transcript)
+    generate_speaker_audio(folder, transcript_out)
     return True
 
 
@@ -2038,3 +802,4 @@ def transcribe_all_audio_under_folder(
     msg = f"转录完成: {folder}（处理 {count} 个文件）"
     logger.info(msg)
     return msg
+
