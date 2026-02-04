@@ -27,7 +27,7 @@
 
 ```python
 # synthesize_video.py - 核心思路
-# 1. 不对TTS音频做相位声码器time_stretch（避免"回音/空洞"感）
+# 1. 不使用相位声码器 time_stretch（避免"回音/空洞"感）；可选用 audiostretchy 做逐段 TSM 语速对齐
 # 2. 裁剪TTS首尾静音，按自然停顿插入间隙
 # 3. 生成 adaptive_plan.json 记录每段的 src_start/src_end/target_duration
 # 4. 用FFmpeg filter_complex 逐段 trim+setpts 拉伸原视频
@@ -38,8 +38,8 @@
 - `adaptive_plan.json` - 视频合成计划（speech + pause 段）
 
 补充要点（实现见 `src/youdub/steps/synthesize_video.py::_ensure_audio_combined` + 合成阶段滤镜生成）：
-- 音频侧：自适应模式下 **不对 TTS 做 time_stretch**；只做首尾静音裁剪 + 插入短停顿，输出时间轴由“拼接后的样本游标”生成。
-- 停顿时长：按译文末尾标点粗略估计（句号/问号/感叹号更长，逗号/分号/冒号次之，其它更短）。
+- 音频侧：自适应模式下不使用相位声码器 `time_stretch`；默认裁剪 TTS 首尾静音，并在启用语速对齐（`SPEECH_RATE_ALIGN_ENABLED`）时对每段 TTS 做可控的 TSM（`audiostretchy`，默认只加速不减速，异常值可回退全局 baseline）。
+- 停顿时长：基础停顿按译文末尾标点估计（句号/问号/感叹号更长，逗号/分号/冒号次之），并可按原始时间预算做停顿补偿（`SPEECH_RATE_PAUSE_COMPENSATION_ENABLED` / `SPEECH_RATE_PAUSE_COMP_WEIGHT`），最终再 clamp 到最小/最大停顿范围。
 - 视频侧：按 `adaptive_plan.json` 逐段 `trim + setpts`（倍率 `factor = target_duration / src_duration`），然后 `concat`；避免强制固定 FPS（使用 `-vsync vfr`）。
 
 ### 2. 字幕样式参数（字号/描边/边距/换行阈值）
@@ -186,12 +186,13 @@ def _tts_text_for_attempt(raw_text, attempt):
 
 **问题**: 历史遗留的超长 SPEAKER/*.wav 会导致voice cloning显存/时间爆炸。
 
-**解决方案**: 自动裁剪到合理长度（默认15秒）。
+**解决方案**: 参考音频写入/复用时统一做“时长上限 + 防爆音处理”（默认15秒，可配），避免超长与爆音干扰克隆效果（实现见 `src/youdub/steps/synthesize_speech.py::_ensure_wav_max_duration` + `src/youdub/utils.py::prepare_speaker_ref_audio`）。
 
 ```python
-def _ensure_wav_max_duration(path, max_seconds, sample_rate=24000):
-    # 官方推荐10-20秒
-    # 超出则用librosa裁剪
+def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 24000) -> None:
+    # 1) 裁剪到 max_seconds（默认来自 TTS_SPEAKER_REF_SECONDS / read_speaker_ref_seconds）
+    # 2) prepare_speaker_ref_audio: trim_silence + soft_clip + smooth_transients + normalize
+    # 3) save_wav_norm 写回（必要时也会对“急剧瞬态/爆音”的旧文件做重处理）
 ```
 
 ---
@@ -295,21 +296,32 @@ def _audio_combined_needs_rebuild(folder, *, adaptive_segment_stretch, sample_ra
 
 ### 2. TTS音量匹配原始人声
 
+实现见 `src/youdub/steps/synthesize_video.py::_ensure_audio_combined`：
+- 先用 `audio.wav` 对 demucs stems 做线性拟合，估计更接近原始混音的比例：`mix ≈ a*vocals + b*instruments`（多窗口采样，取 Top-K 中位数，避免落在“纯人声/纯音乐”窗口导致 BGM 被拉没）。
+- 再用“有效样本 active RMS”（排除接近静音的样本）把 TTS 匹配到原人声响度，并把缩放系数 clamp 到合理范围，避免过度放大/压小（比 peak 更贴近听感）。
+
 ```python
-# 将TTS音量缩放到与原始人声峰值一致
-vocal_peak = max(abs(np.max(vocal_wav)), abs(np.min(vocal_wav)))
-tts_peak = max(abs(np.max(audio_tts)), abs(np.min(audio_tts)))
-scale = vocal_peak / tts_peak
-audio_tts = audio_tts * scale
+# 概念示意：匹配 TTS 到原人声响度（active RMS，而不是 peak）
+tts_scale = clamp(orig_voice_active_rms / tts_active_rms, 0.2, 3.0)
+audio_tts = audio_tts * tts_scale
 ```
 
 ### 3. Qwen Worker重启策略
 
 ```python
-def _should_restart_qwen_worker(err):
-    return ("已退出" in err) or ("超时" in err) or ("broken pipe" in s)
+def _should_restart_qwen_worker(err: str) -> bool:
+    s = (err or "").lower()
+    return (
+        ("已退出" in err)
+        or ("无输出" in err)
+        or ("超时" in err)
+        or ("broken pipe" in s)
+        or ("eof" in s)
+    )
 
-# 策略: 先在同一worker重试一次，仍失败再重启worker
+# 策略（简化）：
+# - 第一次遇到明显的 worker 异常：重启 worker 并重试一次
+# - 对单段生成：若连续两次判定为 invalid/超长，再重启 worker（避免坏状态持续）
 if attempt >= 1 and not qwen_restarted_for_this_segment:
     _restart_qwen_worker("segment invalid twice")
     qwen_restarted_for_this_segment = True
