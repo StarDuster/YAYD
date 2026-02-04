@@ -143,6 +143,11 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
         )
         return "ok"
 
+    def _stub_optimize_all(_folder: str, **_kwargs) -> str:
+        calls.append("optimize")
+        assert (job / "transcript.json").exists()
+        return "ok"
+
     def _stub_translate_all(_folder: str, **_kwargs) -> str:
         calls.append("translate")
         assert (job / "transcript.json").exists()
@@ -190,6 +195,7 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
     monkeypatch.setattr(pl.download, "download_single_video", _stub_download_single_video)
     monkeypatch.setattr(pl.separate_vocals, "separate_all_audio_under_folder", _stub_separate_all)
     monkeypatch.setattr(pl.transcribe, "transcribe_all_audio_under_folder", _stub_transcribe_all)
+    monkeypatch.setattr(pl.optimize_transcript, "optimize_all_transcript_under_folder", _stub_optimize_all)
     monkeypatch.setattr(pl.translate, "translate_all_transcript_under_folder", _stub_translate_all)
     monkeypatch.setattr(pl.synthesize_speech, "generate_all_wavs_under_folder", _stub_tts_all)
     monkeypatch.setattr(pl, "synthesize_all_video_under_folder", _stub_video_all)
@@ -222,7 +228,7 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
         whisper_cpu_model=None,
     )
     assert ok is True
-    assert calls == ["download", "separate", "transcribe", "translate", "tts", "video", "info"]
+    assert calls == ["download", "separate", "transcribe", "optimize", "translate", "tts", "video", "info"]
 
     assert (job / "download.mp4").exists()
     assert (job / "audio_vocals.wav").exists()

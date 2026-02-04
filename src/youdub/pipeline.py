@@ -16,6 +16,7 @@ from .utils import require_file, valid_file
 from .steps import (
     download,
     generate_all_info_under_folder,
+    optimize_transcript,
     separate_vocals,
     synthesize_all_video_under_folder,
     synthesize_speech,
@@ -137,6 +138,9 @@ class VideoPipeline:
                         pass
 
                 require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
+
+                check_cancelled()
+                optimize_transcript.optimize_all_transcript_under_folder(folder, settings=self.settings)
 
                 check_cancelled()
                 translate.translate_all_transcript_under_folder(
@@ -491,6 +495,9 @@ class VideoPipeline:
                             pass
 
                     require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
+
+                    check_cancelled()
+                    optimize_transcript.optimize_all_transcript_under_folder(folder, settings=self.settings)
 
                     check_cancelled()
                     translate.translate_all_transcript_under_folder(

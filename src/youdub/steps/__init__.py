@@ -23,6 +23,10 @@ from .translate import (
     translation_postprocess,
     translate_all_transcript_under_folder,
 )
+from .optimize_transcript import (
+    optimize_all_transcript_under_folder,
+    optimize_transcript_folder,
+)
 from .synthesize_speech import (
     adjust_audio_length,
     generate_all_wavs_under_folder,
@@ -62,6 +66,8 @@ __all__ = [
     "transcribe_all_audio_under_folder",
     "transcribe_audio",
     "translation_postprocess",
+    "optimize_transcript_folder",
+    "optimize_all_transcript_under_folder",
     "translate_all_transcript_under_folder",
     "adjust_audio_length",
     "generate_all_wavs_under_folder",
