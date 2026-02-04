@@ -7,10 +7,10 @@
 
 | 文档 | 说明 |
 |------|------|
-| [ADAPTIVE_ALIGNMENT.md](./ADAPTIVE_ALIGNMENT.md) | 自适应对轴算法详解 |
-| [bgm_align.md](./bgm_align.md) | BGM 对齐策略 |
-| [DIARIZATION_TUNING.md](./DIARIZATION_TUNING.md) | 说话人分离调参指南 |
-| [qwentts.md](./qwentts.md) | Qwen TTS 防劣化与优化机制 |
+| [adaptive-alignment.md](./adaptive-alignment.md) | 自适应对轴算法详解 |
+| [bgm-align.md](./bgm-align.md) | BGM 对齐策略 |
+| [diarization-tuning.md](./diarization-tuning.md) | 说话人分离调参指南 |
+| [qwen-tts.md](./qwen-tts.md) | Qwen TTS 防劣化与优化机制 |
 | [srt-render.md](./srt-render.md) | 字幕渲染策略 |
 | [translate.md](./translate.md) | 翻译策略文档 |
 | [youtube-srt-align.md](./youtube-srt-align.md) | YouTube SRT 说话人对齐 |
