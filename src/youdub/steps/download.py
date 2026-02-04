@@ -87,6 +87,52 @@ def _thumbnail_exists(folder: str) -> bool:
     return False
 
 
+def _subtitles_exist(folder: str) -> bool:
+    """检查字幕文件是否已存在（仅检测可解析格式：vtt/srt）。"""
+    try:
+        for name in os.listdir(folder):
+            # yt-dlp usually outputs as: download.<lang>.<ext> (e.g. download.en.vtt)
+            if not name.startswith("download."):
+                continue
+            low = name.lower()
+            if low.endswith(".vtt") or low.endswith(".srt"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _download_subtitles_only(
+    webpage_url: str,
+    output_folder: str,
+    settings: "Settings | None" = None,
+) -> bool:
+    """单独下载人工字幕（用于补下载）。"""
+    ydl_opts = {
+        "skip_download": True,
+        "writeinfojson": True,
+        # Manual subtitles only (NOT auto captions)
+        "writesubtitles": True,
+        "writeautomaticsub": False,
+        # Prefer vtt/srt so we can parse them later.
+        "subtitlesformat": "vtt/srt/best",
+        # Download all manual subtitles (exclude live chat)
+        "subtitleslangs": ["all", "-live_chat"],
+        "outtmpl": os.path.join(output_folder, "download.%(ext)s"),
+        "ignoreerrors": True,
+        "quiet": True,
+    }
+    _apply_ytdlp_auth_opts(ydl_opts, settings=settings)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([webpage_url])
+        return _subtitles_exist(output_folder)
+    except Exception as exc:
+        logger.debug(f"补下载字幕失败: {webpage_url} - {exc}")
+        return False
+
+
 def _download_thumbnail_only(
     webpage_url: str,
     output_folder: str,
@@ -202,6 +248,12 @@ def download_single_video(
                     if webpage_url:
                         logger.info(f"缩略图缺失，尝试补下载: {output_folder}")
                         _download_thumbnail_only(webpage_url, output_folder, settings)
+                # 检查字幕是否存在（人工字幕），不存在则补下载
+                if not _subtitles_exist(output_folder):
+                    webpage_url = info.get("webpage_url")
+                    if webpage_url:
+                        logger.info(f"字幕缺失，尝试补下载: {output_folder}")
+                        _download_subtitles_only(webpage_url, output_folder, settings)
                 logger.info(f"已下载: {output_folder}")
                 return output_folder
             else:
@@ -221,6 +273,11 @@ def download_single_video(
         'format': f'bestvideo[height<={resolution_val}]+bestaudio/best[height<={resolution_val}]/best',
         'writeinfojson': True,
         'writethumbnail': True,
+        # Prefer manual subtitles when available; do NOT download auto captions.
+        "writesubtitles": True,
+        "writeautomaticsub": False,
+        "subtitlesformat": "vtt/srt/best",
+        "subtitleslangs": ["all", "-live_chat"],
         'outtmpl': os.path.join(folder_path, sanitized_uploader, f'{upload_date} {sanitized_title}', 'download.%(ext)s'),
         'merge_output_format': 'mp4',  # 确保合并后输出为 mp4
         'ignoreerrors': True,
