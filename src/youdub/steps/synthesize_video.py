@@ -14,7 +14,7 @@ import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled, sleep_with_cancel
-from ..speech_rate import apply_scaling_ratio, compute_en_speech_rate, compute_scaling_ratio, compute_zh_speech_rate
+from ..speech_rate import apply_scaling_ratio
 from ..utils import save_wav, save_wav_norm, valid_file
 
 
@@ -1365,381 +1365,100 @@ def _ensure_audio_combined(
         )
     
     if adaptive_segment_stretch:
-        # 自适应模式：保持 TTS 基本原速（仅做静音裁剪），通过“拉伸视频段”来匹配每段音频时长。
+        # 自适应对轴：生成 translation_adaptive.json + adaptive_plan.json（若缺失或过期）。
+        from . import adaptive_align
+
+        check_cancelled()
+        adaptive_align.prepare_adaptive_alignment(folder, sample_rate=int(sample_rate))
+
+        # 按 adaptive_plan.json 重建“新时间轴”的 TTS 音轨（speech + pause），保证后续混音/视频合成一致。
+        try:
+            with open(adaptive_plan_path, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+            plan_segments = list(payload.get("segments") or [])
+        except Exception as exc:  # pylint: disable=broad-except
+            raise RuntimeError(f"读取 adaptive_plan.json 失败: {adaptive_plan_path} ({exc})") from exc
+
+        if not plan_segments:
+            raise RuntimeError(f"adaptive_plan.json 缺失或为空: {adaptive_plan_path}")
+
         trim_top_db = 35.0
-        gap_default_s = 0.12
-        gap_clause_s = 0.18
-        gap_sentence_s = 0.25
+        audio_segments: list[np.ndarray] = []
 
-        def _read_env_bool(name: str, default: bool) -> bool:
-            raw = os.getenv(name)
-            if raw is None:
-                return bool(default)
-            s = str(raw).strip().lower()
-            if not s:
-                return bool(default)
-            return s not in {"0", "false", "no", "off"}
-
-        def _read_env_float(name: str, default: float) -> float:
-            raw = os.getenv(name)
-            if raw is None:
-                return float(default)
-            s = str(raw).strip()
-            if not s:
-                return float(default)
-            try:
-                return float(s)
-            except Exception:
-                return float(default)
-
-        # Optional: speech-rate based TTS time-scale modification (TSM) to match EN pacing.
-        align_enabled = _read_env_bool("SPEECH_RATE_ALIGN_ENABLED", True)
-        align_mode = str(os.getenv("SPEECH_RATE_ALIGN_MODE", "single") or "single").strip().lower()
-        voice_min = _read_env_float("SPEECH_RATE_VOICE_MIN_RATIO", 0.7)
-        voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.3)
-        silence_min = _read_env_float("SPEECH_RATE_SILENCE_MIN_RATIO", 0.3)
-        silence_max = _read_env_float("SPEECH_RATE_SILENCE_MAX_RATIO", 3.0)
-        overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
-        overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
-        align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
-        en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
-        zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
-        # Blend weight between speech-rate ratio and time-budget ratio (en_total / zh_total).
-        # - 0.0: pure speech-rate (more natural articulation)
-        # - 1.0: pure time-budget (more aggressive, keeps pacing closer to original timestamps)
-        budget_weight = _read_env_float("SPEECH_RATE_BUDGET_WEIGHT", 0.7)
-        audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
-
-        # Global bias to avoid overall pacing drift.
-        #
-        # Problem: even with comparable speech-rate metrics, ZH translation often has more syllables
-        # and TTS tends to speak slower, so the whole output can become noticeably longer (\"慢\").
-        # We compute a per-video bias using the original EN segment time budget vs the raw (trimmed)
-        # ZH TTS durations, then apply it by effectively increasing the EN reference rate.
-        align_global_bias = 1.0
-        if align_enabled:
-            try:
-                total_en = 0.0
-                for _seg in translation:
-                    try:
-                        s0 = float(_seg.get("start", 0.0) or 0.0)
-                        s1 = float(_seg.get("end", 0.0) or 0.0)
-                        if s1 < s0:
-                            s0, s1 = s1, s0
-                        total_en += float(max(0.0, s1 - s0))
-                    except Exception:
-                        continue
-
-                total_zh = 0.0
-                for _i in range(expected_count):
-                    check_cancelled()
-                    wav_path = os.path.join(wavs_folder, wav_files[_i])
-                    if not os.path.exists(wav_path):
-                        continue
-                    try:
-                        y, _sr = librosa.load(wav_path, sr=sample_rate, mono=True)
-                        y = y.astype(np.float32, copy=False)
-                        if y.size > 0:
-                            try:
-                                trimmed, _idx = librosa.effects.trim(y, top_db=float(trim_top_db))
-                                if trimmed is not None and trimmed.size > 0:
-                                    y = trimmed.astype(np.float32, copy=False)
-                            except Exception:
-                                pass
-                        total_zh += float(y.shape[0]) / float(sample_rate) if y.size > 0 else 0.0
-                    except Exception:
-                        continue
-
-                if total_en > 0.0 and total_zh > 0.0:
-                    align_global_bias = float(total_en / total_zh)
-                    # We only use this to speed up overall pacing (cap at 1.0).
-                    align_global_bias = float(max(0.3, min(align_global_bias, 1.0)))
-                    logger.info(f"语速对齐: 全局bias={align_global_bias:.3f} (en={total_en:.1f}s, zh={total_zh:.1f}s)")
-            except Exception as exc:
-                logger.warning(f"语速对齐: 计算全局bias失败，将回退为 1.0: {exc}")
-                align_global_bias = 1.0
-
-        def _gap_seconds_for_text(text: str) -> float:
-            s = (text or "").strip()
-            if not s:
-                return float(gap_default_s)
-            tail = s[-1]
-            if tail in {"。", "！", "？", ".", "!", "?"}:
-                return float(gap_sentence_s)
-            if tail in {"，", "、", ",", ";", "；", ":", "："}:
-                return float(gap_clause_s)
-            return float(gap_default_s)
-
-        audio_chunks: list[np.ndarray] = []
-        adaptive_translation: list[dict[str, Any]] = []
-        adaptive_plan: list[dict[str, Any]] = []
-
-        t_cursor_samples = 0  # output timeline cursor (samples)
-
-        def _append_silence(seconds: float) -> None:
-            nonlocal t_cursor_samples
-            sec = float(seconds)
-            if sec <= 0:
-                return
-            n = int(round(sec * sample_rate))
-            if n <= 0:
-                return
-            audio_chunks.append(np.zeros(n, dtype=np.float32))
-            t_cursor_samples += n
-
-        for i, seg in enumerate(translation):
+        for pseg in plan_segments:
             check_cancelled()
-            # Load per-segment TTS audio.
-            wav_path = os.path.join(wavs_folder, wav_files[i])
+            kind = str(pseg.get("kind") or "").strip().lower()
+            if kind == "pause":
+                try:
+                    n = int(pseg.get("target_samples") or 0)
+                except Exception:
+                    n = 0
+                if n > 0:
+                    audio_segments.append(np.zeros((n,), dtype=np.float32))
+                continue
+
+            if kind != "speech":
+                continue
+
+            try:
+                idx = int(pseg.get("index") or 0)
+            except Exception:
+                idx = 0
+            if idx < 0 or idx >= len(wav_files):
+                raise IndexError(f"adaptive_plan.json 段落 index 越界: {idx} (len(wavs)={len(wav_files)})")
+
+            wav_path = os.path.join(wavs_folder, wav_files[idx])
             if not os.path.exists(wav_path):
                 raise FileNotFoundError(f"TTS音频文件不存在: {wav_path}")
 
             tts_audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
-            tts_audio = tts_audio.astype(np.float32, copy=False)
+            tts_audio = np.asarray(tts_audio, dtype=np.float32).reshape(-1)
 
-            # Trim leading/trailing silence to reduce dead air from TTS.
+            # Trim leading/trailing silence (must match plan generation).
             if tts_audio.size > 0:
                 try:
                     trimmed, _idx = librosa.effects.trim(tts_audio, top_db=float(trim_top_db))
                     if trimmed is not None and trimmed.size > 0:
-                        tts_audio = trimmed.astype(np.float32, copy=False)
+                        tts_audio = np.asarray(trimmed, dtype=np.float32).reshape(-1)
                 except Exception:
                     pass
 
-            # Original segment duration from ASR timestamps.
-            orig_start = float(seg.get("start", 0.0) or 0.0)
-            orig_end = float(seg.get("end", 0.0) or 0.0)
-            if orig_end < orig_start:
-                orig_start, orig_end = orig_end, orig_start
+            try:
+                target_samples = int(pseg.get("target_samples") or int(tts_audio.shape[0]))
+            except Exception:
+                target_samples = int(tts_audio.shape[0])
 
-            ratio_info: dict[str, Any] | None = None
-            en_stats: dict[str, Any] | None = None
-            zh_stats: dict[str, Any] | None = None
-
-            # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
-            if align_enabled and tts_audio.size > 0:
+            # Re-apply speech-rate scaling only when it actually affected output length.
+            vr = pseg.get("voice_ratio", None)
+            sr_mode = pseg.get("speech_rate_mode", None)
+            sil = pseg.get("silence_ratio", None)
+            if vr is not None and target_samples > 0 and tts_audio.size > 0 and int(tts_audio.shape[0]) != int(target_samples):
                 try:
-                    en_text = str(seg.get("text") or "")
-                    en_total_duration = float(max(0.0, orig_end - orig_start))
-
-                    # Estimate EN voiced duration from the original vocal stem (VAD).
-                    en_voiced_duration = float(en_total_duration)
-                    if en_total_duration > 0 and os.path.exists(audio_vocals_path):
-                        try:
-                            en_audio, en_sr = librosa.load(
-                                audio_vocals_path,
-                                sr=None,
-                                mono=True,
-                                offset=max(0.0, float(orig_start)),
-                                duration=float(en_total_duration),
-                            )
-                            en_audio = np.asarray(en_audio, dtype=np.float32).reshape(-1)
-                            if en_audio.size > 0 and int(en_sr or 0) > 0:
-                                try:
-                                    intervals = librosa.effects.split(en_audio, top_db=float(en_vad_top_db))
-                                except Exception:
-                                    intervals = np.zeros((0, 2), dtype=np.int64)
-                                voiced_samples = 0
-                                for st, ed in intervals:
-                                    st_i = int(st)
-                                    ed_i = int(ed)
-                                    if ed_i > st_i:
-                                        voiced_samples += (ed_i - st_i)
-                                en_voiced_duration = float(voiced_samples) / float(en_sr) if voiced_samples > 0 else 0.0
-                        except Exception:
-                            en_voiced_duration = float(en_total_duration)
-
-                    en_voiced_duration = float(max(0.0, min(en_voiced_duration, en_total_duration)))
-                    en_silence_duration = float(max(0.0, en_total_duration - en_voiced_duration))
-                    en_pause_ratio = float(en_silence_duration / en_total_duration) if en_total_duration > 0 else 0.0
-
-                    en_stats = dict(compute_en_speech_rate(en_text, en_voiced_duration))
-                    en_stats.update(
-                        {
-                            "total_duration": float(en_total_duration),
-                            "voiced_duration": float(en_voiced_duration),
-                            "silence_duration": float(en_silence_duration),
-                            "pause_ratio": float(en_pause_ratio),
-                        }
+                    voice_ratio = float(vr)
+                    silence_ratio = float(sil) if sil is not None else float(voice_ratio)
+                    ratio_info = {"voice_ratio": float(voice_ratio), "silence_ratio": float(silence_ratio)}
+                    tts_audio, _scale_info = apply_scaling_ratio(
+                        tts_audio, sample_rate, ratio_info, mode=str(sr_mode or "single")
                     )
-                except Exception as exc:
-                    logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
-                    en_stats = None
+                    tts_audio = np.asarray(tts_audio, dtype=np.float32).reshape(-1)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning(f"按计划应用语速对齐失败，将回退到原始TTS: {exc}")
 
-                if en_stats:
-                    try:
-                        zh_text = str(seg.get("translation") or "")
-                        zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
+            if target_samples <= 0:
+                continue
 
-                        # ZH voiced duration from TTS itself (VAD).
-                        zh_voiced_duration = float(zh_total_duration)
-                        if tts_audio.size > 0 and sample_rate > 0:
-                            try:
-                                intervals = librosa.effects.split(tts_audio.astype(np.float32, copy=False), top_db=float(zh_vad_top_db))
-                            except Exception:
-                                intervals = np.zeros((0, 2), dtype=np.int64)
-                            voiced_samples = 0
-                            for st, ed in intervals:
-                                st_i = int(st)
-                                ed_i = int(ed)
-                                if ed_i > st_i:
-                                    voiced_samples += (ed_i - st_i)
-                            zh_voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
+            if tts_audio.shape[0] < target_samples:
+                tts_audio = np.pad(tts_audio, (0, target_samples - int(tts_audio.shape[0])), mode="constant")
+            else:
+                tts_audio = tts_audio[:target_samples]
 
-                        zh_voiced_duration = float(max(0.0, min(zh_voiced_duration, zh_total_duration)))
-                        zh_silence_duration = float(max(0.0, zh_total_duration - zh_voiced_duration))
-                        zh_pause_ratio = float(zh_silence_duration / zh_total_duration) if zh_total_duration > 0 else 0.0
+            audio_segments.append(tts_audio.astype(np.float32, copy=False))
 
-                        zh_stats = dict(compute_zh_speech_rate(zh_text, zh_voiced_duration))
-                        zh_stats.update(
-                            {
-                                "total_duration": float(zh_total_duration),
-                                "voiced_duration": float(zh_voiced_duration),
-                                "silence_duration": float(zh_silence_duration),
-                                "pause_ratio": float(zh_pause_ratio),
-                            }
-                        )
-
-                        # Apply global bias by effectively increasing EN reference rate.
-                        en_stats_used = dict(en_stats)
-                        if float(align_global_bias) > 1e-6 and abs(float(align_global_bias) - 1.0) > 1e-6:
-                            en_stats_used["syllable_rate"] = float(en_stats_used.get("syllable_rate", 0.0)) / float(
-                                align_global_bias
-                            )
-
-                        ratio_info = compute_scaling_ratio(
-                            en_stats_used,
-                            zh_stats,
-                            mode=align_mode,
-                            budget_weight=float(budget_weight),
-                            voice_min=voice_min,
-                            voice_max=voice_max,
-                            silence_min=silence_min,
-                            silence_max=silence_max,
-                            overall_min=overall_min,
-                            overall_max=overall_max,
-                        )
-                        if abs(float(ratio_info.get("voice_ratio", 1.0)) - 1.0) > float(align_threshold) or abs(
-                            float(ratio_info.get("silence_ratio", 1.0)) - 1.0
-                        ) > float(align_threshold):
-                            tts_audio, _scale_info = apply_scaling_ratio(
-                                tts_audio, sample_rate, ratio_info, mode=str(ratio_info.get("mode", align_mode))
-                            )
-                            if bool(ratio_info.get("clamped")):
-                                logger.warning(
-                                    f"段落 {i}: 语速比例已触发 clamp "
-                                    f"(voice={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{ratio_info.get('voice_ratio', 1.0):.3f}, "
-                                    f"silence={ratio_info.get('silence_ratio_raw', 1.0):.3f}->{ratio_info.get('silence_ratio', 1.0):.3f})"
-                                )
-                    except Exception as exc:
-                        logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
-                        ratio_info = None
-                        en_stats = None
-                        zh_stats = None
-
-            # Output speech duration is exactly the (trimmed + optionally stretched) TTS segment duration.
-            target_samples = int(tts_audio.shape[0])
-            target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
-
-            if target_samples > 0:
-                audio_chunks.append(tts_audio.astype(np.float32, copy=False))
-
-            # Record adaptive translation (speech segments only).
-            start_s = float(t_cursor_samples) / float(sample_rate)
-            end_s = float(t_cursor_samples + target_samples) / float(sample_rate)
-            out_seg = dict(seg)
-            out_seg["start"] = round(start_s, 3)
-            out_seg["end"] = round(end_s, 3)
-            adaptive_translation.append(out_seg)
-
-            # Record plan for video composition.
-            adaptive_plan.append(
-                {
-                    "kind": "speech",
-                    "index": i,
-                    "src_start": round(orig_start, 6),
-                    "src_end": round(orig_end, 6),
-                    "target_duration": round(target_duration, 6),
-                    "target_samples": int(target_samples),
-                    "speech_rate_mode": (ratio_info.get("mode") if ratio_info else None),
-                    "voice_ratio": (round(float(ratio_info.get("voice_ratio", 1.0)), 6) if ratio_info else None),
-                    "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
-                    "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
-                    "voice_ratio_rate_raw": (
-                        round(float(ratio_info.get("voice_ratio_rate_raw", 1.0)), 6) if ratio_info else None
-                    ),
-                    "voice_ratio_budget_raw": (
-                        round(float(ratio_info.get("voice_ratio_budget_raw", 1.0)), 6) if ratio_info else None
-                    ),
-                    "speech_rate_budget_weight": (
-                        round(float(ratio_info.get("speech_rate_budget_weight", 0.0)), 6) if ratio_info else None
-                    ),
-                    "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
-                    "speech_rate_global_bias": (round(float(align_global_bias), 6) if ratio_info else None),
-                    "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
-                    "speech_rate_zh": (round(float(zh_stats.get("syllable_rate", 0.0)), 6) if zh_stats else None),
-                    "speech_syllables_en": (int(en_stats.get("syllable_count", 0)) if en_stats else None),
-                    "speech_syllables_zh": (int(zh_stats.get("syllable_count", 0)) if zh_stats else None),
-                    "en_total_duration": (round(float(en_stats.get("total_duration", 0.0)), 6) if en_stats else None),
-                    "en_voiced_duration": (round(float(en_stats.get("voiced_duration", 0.0)), 6) if en_stats else None),
-                    "en_silence_duration": (round(float(en_stats.get("silence_duration", 0.0)), 6) if en_stats else None),
-                    "en_pause_ratio": (round(float(en_stats.get("pause_ratio", 0.0)), 6) if en_stats else None),
-                    "zh_total_duration": (round(float(zh_stats.get("total_duration", 0.0)), 6) if zh_stats else None),
-                    "zh_voiced_duration": (round(float(zh_stats.get("voiced_duration", 0.0)), 6) if zh_stats else None),
-                    "zh_silence_duration": (round(float(zh_stats.get("silence_duration", 0.0)), 6) if zh_stats else None),
-                    "zh_pause_ratio": (round(float(zh_stats.get("pause_ratio", 0.0)), 6) if zh_stats else None),
-                    "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
-                }
-            )
-
-            t_cursor_samples += target_samples
-
-            # Insert pause between speech segments (except after last).
-            if i < (len(translation) - 1):
-                try:
-                    next_start = float(translation[i + 1].get("start", orig_end) or orig_end)
-                except Exception:
-                    next_start = orig_end
-                gap = float(next_start - orig_end)
-                if gap > 0:
-                    pause_src_start = orig_end
-                    pause_src_end = next_start
-                else:
-                    # Overlap/adjacent: take a small tail slice from the previous segment as "pause" visuals.
-                    tail = 0.08
-                    pause_src_end = orig_end
-                    pause_src_start = max(0.0, pause_src_end - tail)
-                pause_duration = _gap_seconds_for_text(str(seg.get("translation") or ""))
-
-                # Compute pause samples using the exact same rounding as the audio cursor.
-                n_pause = int(round(float(pause_duration) * float(sample_rate)))
-                _append_silence(pause_duration)
-                adaptive_plan.append(
-                    {
-                        "kind": "pause",
-                        "src_start": round(float(pause_src_start), 6),
-                        "src_end": round(float(pause_src_end), 6),
-                        "target_duration": round(float(pause_duration), 6),
-                        "target_samples": int(max(0, n_pause)),
-                    }
-                )
-
-        if not audio_chunks:
+        if not audio_segments:
             raise ValueError("没有有效的TTS音频片段")
 
-        audio_tts = np.concatenate(audio_chunks).astype(np.float32, copy=False)
+        audio_tts = np.concatenate(audio_segments).astype(np.float32, copy=False)
 
-        # Save translation_adaptive.json (speech-only cues).
-        with open(translation_adaptive_path, "w", encoding="utf-8") as f:
-            json.dump(adaptive_translation, f, ensure_ascii=False, indent=2)
-        logger.info(f"已生成 translation_adaptive.json: {translation_adaptive_path}")
-
-        # Save plan for video composition (speech + pause segments).
-        plan_payload = {"segments": adaptive_plan}
-        with open(adaptive_plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f, ensure_ascii=False, indent=2)
-        logger.info(f"已生成 adaptive_plan.json: {adaptive_plan_path}")
-        
     else:
         # 非自适应模式：按顺序拼接
         audio_segments: list[np.ndarray] = []

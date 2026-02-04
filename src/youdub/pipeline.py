@@ -14,6 +14,7 @@ from .models import ModelCheckError, ModelManager
 from .interrupts import check_cancelled
 from .utils import require_file, valid_file
 from .steps import (
+    adaptive_align,
     download,
     generate_all_info_under_folder,
     optimize_transcript,
@@ -158,6 +159,10 @@ class VideoPipeline:
 
                 require_file(os.path.join(folder, "wavs", ".tts_done.json"), "语音合成标记(wavs/.tts_done.json)", min_bytes=2)
                 require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
+
+                check_cancelled()
+                if bool(tts_adaptive_segment_stretch):
+                    adaptive_align.prepare_all_adaptive_alignment_under_folder(folder, sample_rate=24000)
 
                 check_cancelled()
                 synthesize_all_video_under_folder(
@@ -518,6 +523,10 @@ class VideoPipeline:
                         min_bytes=2,
                     )
                     require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
+
+                    check_cancelled()
+                    if bool(tts_adaptive_segment_stretch):
+                        adaptive_align.prepare_all_adaptive_alignment_under_folder(folder, sample_rate=24000)
 
                     return folder
                 except CorruptedVideoError as exc:

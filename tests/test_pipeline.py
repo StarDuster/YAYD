@@ -242,6 +242,176 @@ def test_pipeline_process_single_happy_path_interface_contracts(tmp_path: Path, 
         assert int(wf.getframerate() or 0) > 0
 
 
+def test_pipeline_process_single_calls_adaptive_align_when_enabled(tmp_path: Path, monkeypatch):
+    import youdub.pipeline as pl
+
+    # Keep the test deterministic and fast.
+    monkeypatch.setattr(pl, "check_cancelled", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.separate_vocals, "unload_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "unload_all_models", lambda *_args, **_kwargs: None)
+
+    job = tmp_path / "job"
+    calls: list[str] = []
+
+    def _stub_get_target_folder(_info: dict[str, Any], _root: str) -> str:
+        return str(job)
+
+    def _stub_download_single_video(_info: dict[str, Any], _root: str, _resolution: str, settings=None) -> str:
+        calls.append("download")
+        _ = settings
+        job.mkdir(parents=True, exist_ok=True)
+        (job / "download.mp4").write_bytes(b"0" * 2048)
+        (job / "download.info.json").write_text(json.dumps(_info, ensure_ascii=False), encoding="utf-8")
+        return str(job)
+
+    def _stub_separate_all(_folder: str, **_kwargs) -> str:
+        calls.append("separate")
+        _write_dummy_wav(job / "audio_vocals.wav", seconds=0.5)
+        _write_dummy_wav(job / "audio_instruments.wav", seconds=0.5)
+        return "ok"
+
+    def _stub_transcribe_all(_folder: str, **_kwargs) -> str:
+        calls.append("transcribe")
+        (job / "transcript.json").write_text(
+            json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_optimize_all(_folder: str, **_kwargs) -> str:
+        calls.append("optimize")
+        assert (job / "transcript.json").exists()
+        return "ok"
+
+    def _stub_translate_all(_folder: str, **_kwargs) -> str:
+        calls.append("translate")
+        (job / "translation.json").write_text(
+            json.dumps(
+                [{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好。"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (job / "summary.json").write_text(
+            json.dumps(
+                {"title": "t", "author": "u", "summary": "s", "tags": [], "translation_model": "dummy"},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_tts_all(_folder: str, **_kwargs) -> str:
+        calls.append("tts")
+        (job / "wavs").mkdir(parents=True, exist_ok=True)
+        _write_dummy_wav(job / "wavs" / "0000.wav", seconds=0.2)
+        (job / "wavs" / ".tts_done.json").write_text(
+            json.dumps({"tts_method": "bytedance"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_prepare_adaptive_all(_folder: str, sample_rate: int = 24000, **_kwargs) -> str:
+        calls.append("adaptive_align")
+        assert int(sample_rate) == 24000
+        assert (job / "translation.json").exists()
+        assert (job / "wavs" / ".tts_done.json").exists()
+        assert (job / "wavs" / "0000.wav").exists()
+
+        # Minimal artifacts that adaptive synthesize_video expects.
+        (job / "translation_adaptive.json").write_text(
+            json.dumps(
+                [{"start": 0.0, "end": 0.2, "text": "x", "speaker": "SPEAKER_00", "translation": "好。"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (job / "adaptive_plan.json").write_text(
+            json.dumps(
+                {
+                    "segments": [
+                        {
+                            "kind": "speech",
+                            "index": 0,
+                            "src_start": 0.0,
+                            "src_end": 1.0,
+                            "target_duration": 0.2,
+                            "target_samples": int(0.2 * 24000),
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_video_all(_folder: str, **_kwargs) -> str:
+        calls.append("video")
+        assert bool(_kwargs.get("adaptive_segment_stretch")) is True
+        assert (job / "translation_adaptive.json").exists()
+        assert (job / "adaptive_plan.json").exists()
+
+        _write_dummy_wav(job / "audio_combined.wav", seconds=0.5)
+        (job / "video.mp4").write_bytes(b"0" * 2048)
+        return "ok"
+
+    def _stub_generate_info_all(_folder: str) -> str:
+        calls.append("info")
+        (job / "video.txt").write_text("ok", encoding="utf-8")
+        return "ok"
+
+    monkeypatch.setattr(pl.download, "get_target_folder", _stub_get_target_folder)
+    monkeypatch.setattr(pl.download, "download_single_video", _stub_download_single_video)
+    monkeypatch.setattr(pl.separate_vocals, "separate_all_audio_under_folder", _stub_separate_all)
+    monkeypatch.setattr(pl.transcribe, "transcribe_all_audio_under_folder", _stub_transcribe_all)
+    monkeypatch.setattr(pl.optimize_transcript, "optimize_all_transcript_under_folder", _stub_optimize_all)
+    monkeypatch.setattr(pl.translate, "translate_all_transcript_under_folder", _stub_translate_all)
+    monkeypatch.setattr(pl.synthesize_speech, "generate_all_wavs_under_folder", _stub_tts_all)
+    monkeypatch.setattr(pl.adaptive_align, "prepare_all_adaptive_alignment_under_folder", _stub_prepare_adaptive_all)
+    monkeypatch.setattr(pl, "synthesize_all_video_under_folder", _stub_video_all)
+    monkeypatch.setattr(pl, "generate_all_info_under_folder", _stub_generate_info_all)
+
+    pipe = pl.VideoPipeline(settings=Settings(root_folder=tmp_path))
+    ok = pipe.process_single(
+        info={"title": "t"},
+        root_folder=str(tmp_path),
+        resolution="360p",
+        demucs_model="htdemucs_ft",
+        device="cpu",
+        shifts=1,
+        whisper_model="/fake/whisper",
+        whisper_batch_size=1,
+        whisper_diarization=False,
+        whisper_min_speakers=None,
+        whisper_max_speakers=None,
+        translation_target_language="简体中文",
+        tts_method="bytedance",
+        qwen_tts_batch_size=1,
+        tts_adaptive_segment_stretch=True,
+        subtitles=False,
+        fps=30,
+        target_resolution="360p",
+        max_retries=1,
+        auto_upload_video=False,
+        use_nvenc=False,
+        whisper_device=None,
+        whisper_cpu_model=None,
+    )
+    assert ok is True
+    assert calls == [
+        "download",
+        "separate",
+        "transcribe",
+        "optimize",
+        "translate",
+        "tts",
+        "adaptive_align",
+        "video",
+        "info",
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline warmup model selection
 # --------------------------------------------------------------------------- #
@@ -404,6 +574,7 @@ def test_pipeline_run_nvenc_multi_offloads_encoding_and_never_calls_process_sing
     monkeypatch.setattr(pl.transcribe, "load_qwen_asr_model", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(pl.separate_vocals, "unload_model", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(pl.transcribe, "unload_all_models", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.optimize_transcript, "optimize_all_transcript_under_folder", lambda *_args, **_kwargs: "ok")
 
     # Pipeline validates Whisper model.bin paths early (outside ModelManager.ensure_ready),
     # so provide a minimal dummy model directory.
@@ -511,6 +682,173 @@ def test_pipeline_run_nvenc_multi_offloads_encoding_and_never_calls_process_sing
     assert "成功: 2" in out
     assert encode_tids and len(encode_tids) == 2
     assert all(tid != main_tid for tid in encode_tids)
+
+
+def test_pipeline_run_nvenc_multi_calls_adaptive_align_before_encode_when_enabled(tmp_path: Path, monkeypatch):
+    import youdub.pipeline as pl
+
+    # Keep the test deterministic and fast.
+    monkeypatch.setattr(pl, "check_cancelled", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.separate_vocals, "init_demucs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.synthesize_speech, "init_TTS", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "init_asr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "load_asr_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "load_qwen_asr_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.separate_vocals, "unload_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.transcribe, "unload_all_models", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pl.optimize_transcript, "optimize_all_transcript_under_folder", lambda *_args, **_kwargs: "ok")
+
+    whisper_dir = tmp_path / "whisper"
+    _touch_model_bin(whisper_dir)
+
+    settings = Settings(root_folder=tmp_path, whisper_model_path=whisper_dir)
+    manager = ModelManager(settings)
+    monkeypatch.setattr(manager, "ensure_ready", lambda *args, **kwargs: None)
+
+    info_list = [
+        {"title": "v1", "uploader": "u", "upload_date": "20260101", "webpage_url": "x1"},
+        {"title": "v2", "uploader": "u", "upload_date": "20260102", "webpage_url": "x2"},
+    ]
+    monkeypatch.setattr(pl.download, "get_info_list_from_url", lambda *_args, **_kwargs: list(info_list))
+
+    def _stub_download_single_video(info: dict[str, Any], _root: str, _resolution: str, settings=None) -> str:
+        _ = settings
+        folder = tmp_path / "jobs" / str(info["title"])
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "download.mp4").write_bytes(b"0" * 2048)
+        (folder / "download.info.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+        return str(folder)
+
+    def _stub_separate_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        _write_dummy_wav(folder / "audio_vocals.wav", seconds=0.2)
+        _write_dummy_wav(folder / "audio_instruments.wav", seconds=0.2)
+        return "ok"
+
+    def _stub_transcribe_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        (folder / "transcript.json").write_text(
+            json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00"}], ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_translate_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        (folder / "translation.json").write_text(
+            json.dumps(
+                [{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好。"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (folder / "summary.json").write_text(
+            json.dumps({"title": "t", "author": "u", "summary": "s", "tags": [], "translation_model": "dummy"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_tts_all(_folder: str, **_kwargs) -> str:
+        folder = Path(_folder)
+        (folder / "wavs").mkdir(parents=True, exist_ok=True)
+        _write_dummy_wav(folder / "wavs" / "0000.wav", seconds=0.1)
+        (folder / "wavs" / ".tts_done.json").write_text(
+            json.dumps({"tts_method": "bytedance"}, ensure_ascii=False), encoding="utf-8"
+        )
+        return "ok"
+
+    main_tid = threading.get_ident()
+    calls: list[str] = []
+    encode_tids: list[int] = []
+
+    def _stub_prepare_adaptive_all(_folder: str, sample_rate: int = 24000, **_kwargs) -> str:
+        # Must run on the main (preprocess) thread before encode submission.
+        assert threading.get_ident() == main_tid
+        title = Path(_folder).name
+        calls.append(f"adaptive:{title}")
+        assert int(sample_rate) == 24000
+
+        folder = Path(_folder)
+        (folder / "translation_adaptive.json").write_text(
+            json.dumps(
+                [{"start": 0.0, "end": 0.1, "text": "x", "speaker": "SPEAKER_00", "translation": "好。"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (folder / "adaptive_plan.json").write_text(
+            json.dumps(
+                {
+                    "segments": [
+                        {
+                            "kind": "speech",
+                            "index": 0,
+                            "src_start": 0.0,
+                            "src_end": 1.0,
+                            "target_duration": 0.1,
+                            "target_samples": int(0.1 * 24000),
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return "ok"
+
+    def _stub_video_all(_folder: str, **_kwargs) -> str:
+        encode_tids.append(threading.get_ident())
+        title = Path(_folder).name
+        calls.append(f"video:{title}")
+        assert bool(_kwargs.get("adaptive_segment_stretch")) is True
+        folder = Path(_folder)
+        _write_dummy_wav(folder / "audio_combined.wav", seconds=0.2)
+        (folder / "video.mp4").write_bytes(b"0" * 2048)
+        return "ok"
+
+    def _stub_generate_info_all(_folder: str) -> str:
+        folder = Path(_folder)
+        (folder / "video.txt").write_text("ok", encoding="utf-8")
+        return "ok"
+
+    monkeypatch.setattr(pl.download, "download_single_video", _stub_download_single_video)
+    monkeypatch.setattr(pl.separate_vocals, "separate_all_audio_under_folder", _stub_separate_all)
+    monkeypatch.setattr(pl.transcribe, "transcribe_all_audio_under_folder", _stub_transcribe_all)
+    monkeypatch.setattr(pl.translate, "translate_all_transcript_under_folder", _stub_translate_all)
+    monkeypatch.setattr(pl.synthesize_speech, "generate_all_wavs_under_folder", _stub_tts_all)
+    monkeypatch.setattr(pl.adaptive_align, "prepare_all_adaptive_alignment_under_folder", _stub_prepare_adaptive_all)
+    monkeypatch.setattr(pl, "synthesize_all_video_under_folder", _stub_video_all)
+    monkeypatch.setattr(pl, "generate_all_info_under_folder", _stub_generate_info_all)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("process_single should not be called in NVENC multi-video mode")
+
+    monkeypatch.setattr(pl.VideoPipeline, "process_single", _boom)
+
+    pipe = pl.VideoPipeline(settings=settings, model_manager=manager)
+    out = pipe.run(
+        url="",
+        num_videos=len(info_list),
+        max_workers=3,
+        use_nvenc=True,
+        whisper_diarization=False,
+        auto_upload_video=False,
+        max_retries=1,
+        whisper_device="cpu",
+        whisper_model=str(whisper_dir),
+        device="cpu",
+        tts_adaptive_segment_stretch=True,
+    )
+
+    assert "成功: 2" in out
+    assert encode_tids and len(encode_tids) == 2
+    assert all(tid != main_tid for tid in encode_tids)
+
+    # For each video, adaptive alignment must happen before its encode is scheduled/executed.
+    for title in ("v1", "v2"):
+        ia = calls.index(f"adaptive:{title}")
+        iv = calls.index(f"video:{title}")
+        assert ia < iv
 
 
 def test_pipeline_run_max_workers_gt1_without_nvenc_is_still_serial(tmp_path: Path, monkeypatch):
