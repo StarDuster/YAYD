@@ -24,7 +24,7 @@
     *   **自适应拉伸**: 可启用"按段自适应拉伸"模式，逐段拉伸原视频以匹配 TTS 音频时长，实现更精确的口型同步。
     *   **双语字幕**: 支持生成中英双语字幕（ASS 格式），英文原文仅保留一句以提高可读性。
 
-更多实现细节请参阅 [TRICKS.MD](./TRICKS.MD)。
+更多实现细节请参阅 [tricks/](./tricks/)。
 
 ## 系统要求
 
@@ -72,10 +72,21 @@ uv sync --extra gpu --extra dev
 
 #### Flash Attention（可选加速）
 
-`flash-attn` 可显著加速 Transformer 推理（如 Qwen3-ASR），但**编译安装时间很长**（参见 https://github.com/QwenLM/Qwen3-ASR?tab=readme-ov-file#environment-setup）。
+`flash-attn` 可显著加速 Transformer 推理（如 Qwen3-ASR），但从源码编译安装时间很长。
+
+**推荐：使用预编译 wheel（无需编译）**
+
+访问 [mjun0812/flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels/releases) 根据你的 Python、PyTorch、CUDA 版本下载对应的 wheel 文件直接安装：
 
 ```bash
-# 需要先安装 gpu extra，然后单独安装 flash-attn
+# 示例：Python 3.10 + PyTorch 2.10 + CUDA 12.8
+uv pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp310-cp310-linux_x86_64.whl
+```
+
+**备选：从源码编译**
+
+```bash
+# 需要先安装 gpu extra，编译时间较长（30+ 分钟）
 uv pip install flash-attn --no-build-isolation
 ```
 

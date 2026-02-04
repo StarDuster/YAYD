@@ -9,14 +9,16 @@ import time
 import uuid
 from typing import Any
 
+from cmudict import dict as cmudict_dict
 import librosa
 import numpy as np
-import pronouncing
 from audiostretchy.stretch import stretch_audio
 from loguru import logger
 from pypinyin import Style, pinyin
 
 from .utils import save_wav
+
+_CMU_DICT = cmudict_dict()
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -36,6 +38,93 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     if not math.isfinite(x):
         return float(default)
     return float(x)
+
+
+def compute_clamp_gap(raw_ratio: Any, applied_ratio: Any) -> float:
+    """
+    Measure how far a ratio was clamped.
+
+    Returns a multiplicative gap >= 1.0:
+      gap = max(raw/applied, applied/raw)
+
+    - gap == 1.0 means no clamping.
+    - larger gap means raw was further from the applied ratio.
+    """
+    raw = _safe_float(raw_ratio, default=1.0)
+    applied = _safe_float(applied_ratio, default=1.0)
+    if raw <= 0.0 or applied <= 0.0:
+        # Degenerate input: treat as extreme.
+        return float("inf") if abs(raw - applied) > 1e-12 else 1.0
+    try:
+        a = float(raw / applied)
+        b = float(applied / raw)
+        gap = float(max(a, b))
+        return gap if math.isfinite(gap) and gap >= 1.0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def is_outlier_by_clamp_gap(
+    raw_ratio: Any,
+    applied_ratio: Any,
+    *,
+    clamp_gap_threshold: float = 1.7,
+) -> bool:
+    """
+    Decide whether a per-segment ratio is unreliable (outlier) based on clamp gap.
+    """
+    th = _safe_float(clamp_gap_threshold, default=1.7)
+    if not (th > 1.0):
+        th = 1.0
+    gap = compute_clamp_gap(raw_ratio, applied_ratio)
+    return bool(gap > float(th) + 1e-9)
+
+
+def compute_global_baseline(
+    *,
+    en_total_duration: Any | None = None,
+    zh_total_duration: Any | None = None,
+    en_total_syllables: Any | None = None,
+    zh_total_syllables: Any | None = None,
+    mode: str = "duration",
+    default: float = 1.0,
+) -> float:
+    """
+    Compute a global baseline scaling ratio for fallback.
+
+    ratio definition:
+        ratio = new_duration / old_duration
+
+    Supported modes:
+    - duration: en_total_duration / zh_total_duration
+    - syllable: en_total_syllables / zh_total_syllables
+    """
+    m = str(mode or "duration").strip().lower()
+    dflt = _safe_float(default, default=1.0)
+    if not (dflt > 0.0):
+        dflt = 1.0
+
+    if m in {"duration", "dur", "time"}:
+        en = _safe_float(en_total_duration, default=0.0)
+        zh = _safe_float(zh_total_duration, default=0.0)
+        if en > 0.0 and zh > 0.0:
+            r = float(en / zh)
+            return r if math.isfinite(r) and r > 0.0 else dflt
+        return dflt
+
+    if m in {"syllable", "syllables", "syl"}:
+        try:
+            en_n = int(en_total_syllables or 0)
+            zh_n = int(zh_total_syllables or 0)
+        except Exception:
+            en_n, zh_n = 0, 0
+        if en_n > 0 and zh_n > 0:
+            r = float(float(en_n) / float(zh_n))
+            return r if math.isfinite(r) and r > 0.0 else dflt
+        return dflt
+
+    return dflt
+
 
 def _fallback_syllable_count(word: str) -> int:
     """
@@ -57,7 +146,7 @@ def _fallback_syllable_count(word: str) -> int:
 
 def count_en_syllables(text: str) -> int:
     """
-    Count English syllables using CMUdict (via `pronouncing`) with a rule-based fallback.
+    Count English syllables using CMUdict (via `cmudict`) with a rule-based fallback.
     """
     # Keep a small amount of normalization for numeric/currency/initialisms.
     # Examples:
@@ -112,13 +201,10 @@ def count_en_syllables(text: str) -> int:
 
         # Alphabetic tokens: try CMUdict first.
         w = t.lower()
-        try:
-            phones = pronouncing.phones_for_word(w)
-        except Exception:
-            phones = []
-        if phones:
+        prons = _CMU_DICT.get(w, [])
+        if prons:
             try:
-                total += int(sum(1 for p in str(phones[0]).split() if p and p[-1].isdigit()))
+                total += int(sum(1 for p in prons[0] if p and p[-1].isdigit()))
                 continue
             except Exception:
                 pass
@@ -190,7 +276,6 @@ def compute_scaling_ratio(
     zh_stats: dict[str, Any],
     *,
     mode: str = "single",
-    budget_weight: float = 0.0,
     voice_min: float = 0.7,
     voice_max: float = 1.3,
     silence_min: float = 0.3,
@@ -206,13 +291,6 @@ def compute_scaling_ratio(
 
     By default, the *voice* ratio is derived from the speech-rate ratio:
         voice_ratio_rate_raw = zh_rate / en_rate
-
-    When both sides provide segment total durations (en_stats["total_duration"], zh_stats["total_duration"]),
-    you can optionally blend in the time-budget ratio:
-        voice_ratio_budget_raw = en_total / zh_total
-
-    This helps avoid cases where speech-rate estimates look similar but the ZH TTS segment is much longer/shorter
-    than the original time budget (common when translations have more/less syllables).
     """
     mode_norm = str(mode or "single").strip().lower()
     if mode_norm in {"two_stage", "two-stage"}:
@@ -237,27 +315,7 @@ def compute_scaling_ratio(
         }
 
     voice_ratio_rate_raw = float(zh_rate / en_rate)
-
-    # Optional: blend in time-budget ratio (en_total / zh_total) when available.
-    bw = _safe_float(budget_weight, default=0.0)
-    bw = float(_clamp(bw, 0.0, 1.0))
-    en_total = _safe_float(en_stats.get("total_duration", 0.0), default=0.0)
-    zh_total = _safe_float(zh_stats.get("total_duration", 0.0), default=0.0)
-    voice_ratio_budget_raw = float(en_total / zh_total) if (en_total > 0.0 and zh_total > 0.0) else float(
-        voice_ratio_rate_raw
-    )
-
     voice_ratio_raw = float(voice_ratio_rate_raw)
-    if bw > 1e-9 and voice_ratio_rate_raw > 0.0 and voice_ratio_budget_raw > 0.0:
-        # Geometric blend (more stable for ratios than linear interpolation).
-        try:
-            voice_ratio_raw = float(
-                math.exp(
-                    (1.0 - bw) * math.log(float(voice_ratio_rate_raw)) + bw * math.log(float(voice_ratio_budget_raw))
-                )
-            )
-        except Exception:
-            voice_ratio_raw = float(voice_ratio_rate_raw)
 
     voice_ratio = _clamp(voice_ratio_raw, float(voice_min), float(voice_max))
 
@@ -329,8 +387,9 @@ def compute_scaling_ratio(
         "overall_ratio": float(overall_ratio),
         "voice_ratio_raw": float(voice_ratio_raw),
         "voice_ratio_rate_raw": float(voice_ratio_rate_raw),
-        "voice_ratio_budget_raw": float(voice_ratio_budget_raw),
-        "speech_rate_budget_weight": float(bw) if (en_total > 0.0 and zh_total > 0.0) else 0.0,
+        # budget is intentionally not used (keep placeholder keys stable for downstream debug tools)
+        "voice_ratio_budget_raw": 1.0,
+        "speech_rate_budget_weight": 0.0,
         "silence_ratio_raw": float(silence_ratio_raw),
         "clamped": bool(clamped),
     }

@@ -1976,20 +1976,80 @@ def generate_wavs(
             except Exception as exc:
                 logger.warning(f"多参考音频生成/选择失败（将继续使用兜底逻辑）: {exc}")
 
-        # 兜底：如果 SPEAKER/*.wav 丢失（常见于旧任务目录或中途清理），从 audio_vocals.wav 取前 N 秒生成
+        # 兜底：如果 SPEAKER/*.wav 丢失/损坏（常见于旧任务目录或中途清理），生成参考音频。
+        # 单说话人：取文件开头前 N 秒即可。
+        # 多说话人：必须按该 speaker 的时间戳切片，否则会把同一段参考音频写给多个 speaker，导致音色错配。
+        missing_speakers: list[str] = []
         for spk in speakers:
             check_cancelled()
-            spk_path = os.path.join(speaker_dir, f"{spk}.wav")
-            if os.path.exists(spk_path):
+            spk_str = str(spk)
+            spk_path = os.path.join(speaker_dir, f"{spk_str}.wav")
+            if os.path.exists(spk_path) and is_valid_wav(spk_path):
                 continue
-            try:
+            missing_speakers.append(spk_str)
+
+        if missing_speakers:
+            sr_ref = 24000
+            max_ref_samples = int(float(max_ref_seconds) * float(sr_ref))
+            delay = 0.05
+            for spk in missing_speakers:
                 check_cancelled()
-                wav, _sr = librosa.load(vocals_path, sr=24000, mono=True, duration=max_ref_seconds)
-                if wav.size > 0:
+                spk_path = os.path.join(speaker_dir, f"{spk}.wav")
+                try:
+                    y = np.zeros((0,), dtype=np.float32)
+                    if len(speakers) <= 1:
+                        wav0, _sr = librosa.load(vocals_path, sr=sr_ref, mono=True, duration=max_ref_seconds)
+                        y = wav0.astype(np.float32, copy=False)
+                    else:
+                        # Stitch together per-segment audio for this speaker (best-effort).
+                        for seg in transcript:
+                            check_cancelled()
+                            if str(seg.get("speaker") or "") != str(spk):
+                                continue
+                            try:
+                                start_s = float(seg.get("start", 0.0) or 0.0)
+                                end_s = float(seg.get("end", 0.0) or 0.0)
+                            except Exception:
+                                continue
+                            if end_s <= start_s:
+                                continue
+
+                            offset = max(0.0, float(start_s) - float(delay))
+                            duration = max(0.0, (float(end_s) - float(start_s)) + 2.0 * float(delay))
+                            if duration <= 0:
+                                continue
+                            try:
+                                chunk, _sr = librosa.load(
+                                    vocals_path, sr=sr_ref, mono=True, offset=float(offset), duration=float(duration)
+                                )
+                            except Exception:
+                                continue
+                            if chunk.size <= 0:
+                                continue
+
+                            remaining = (max_ref_samples - int(y.shape[0])) if max_ref_samples > 0 else int(chunk.shape[0])
+                            if remaining <= 0:
+                                break
+                            if int(chunk.shape[0]) > int(remaining):
+                                chunk = chunk[:remaining]
+                            y = np.concatenate((y, chunk.astype(np.float32, copy=False)))
+                            if max_ref_samples > 0 and int(y.shape[0]) >= int(max_ref_samples):
+                                break
+
+                        if y.size <= 0:
+                            logger.warning(
+                                f"未能从该说话人的时间戳提取参考音频，将回退到文件开头: speaker={spk}"
+                            )
+                            wav0, _sr = librosa.load(vocals_path, sr=sr_ref, mono=True, duration=max_ref_seconds)
+                            y = wav0.astype(np.float32, copy=False)
+
+                    if y.size <= 0:
+                        continue
+
                     # Apply anti-pop processing before saving
                     wav_processed = prepare_speaker_ref_audio(
-                        wav,
-                        sample_rate=24000,
+                        y,
+                        sample_rate=sr_ref,
                         trim_silence=True,
                         trim_top_db=30.0,
                         apply_soft_clip=True,
@@ -1998,16 +2058,43 @@ def generate_wavs(
                         smooth_max_diff=0.25,
                     )
                     if wav_processed.size > 0:
-                        save_wav_norm(wav_processed, spk_path, sample_rate=24000)
+                        save_wav_norm(wav_processed, spk_path, sample_rate=sr_ref)
                     else:
-                        save_wav_norm(wav.astype(np.float32), spk_path, sample_rate=24000)
+                        save_wav_norm(y.astype(np.float32, copy=False), spk_path, sample_rate=sr_ref)
                     logger.info(f"已生成缺失的说话人参考(防爆音处理) ({max_ref_seconds:.1f}秒): {spk_path}")
-            except Exception as exc:
-                logger.warning(f"生成说话人参考音频失败 {spk}: {exc}")
+                except Exception as exc:
+                    logger.warning(f"生成说话人参考音频失败 {spk}: {exc}")
 
     for spk in speakers:
         check_cancelled()
         _ensure_wav_max_duration(os.path.join(speaker_dir, f"{spk}.wav"), max_ref_seconds, sample_rate=24000)
+
+    # 说话人参考音频更新后，必须清理 speaker->voice 的缓存映射，否则容易出现“台词用错音色/克隆声线”的错配。
+    try:
+        speaker_ref_mtime_max = 0.0
+        for spk in speakers:
+            p = os.path.join(speaker_dir, f"{spk}.wav")
+            if not os.path.exists(p):
+                continue
+            try:
+                m = float(os.path.getmtime(p))
+            except Exception:
+                m = 0.0
+            if m > speaker_ref_mtime_max:
+                speaker_ref_mtime_max = m
+        if speaker_ref_mtime_max > 0:
+            for name in ("speaker_to_voice_type.json", "speaker_to_cloned_voice.json"):
+                mp = os.path.join(folder, name)
+                if not os.path.exists(mp):
+                    continue
+                try:
+                    if float(os.path.getmtime(mp)) + 1e-6 < float(speaker_ref_mtime_max):
+                        os.remove(mp)
+                        logger.info(f"检测到说话人参考已更新，已清理缓存映射: {mp}")
+                except Exception:
+                    continue
+    except Exception:
+        pass
     
     qwen_worker: _QwenTtsWorker | None = None
     if tts_method == "qwen":

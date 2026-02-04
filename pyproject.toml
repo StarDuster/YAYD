@@ -33,7 +33,7 @@ dependencies = [
     "audiostretchy>=1.3.5",
     "soundfile",
     "numpy>=2.0.0,<3.0.0",
-    "pronouncing",
+    "cmudict>=1.1.2",
     "pypinyin",
 
     # Vocal separation (offline / GPU-friendly)
