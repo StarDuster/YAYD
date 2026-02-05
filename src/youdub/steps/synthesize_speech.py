@@ -341,190 +341,231 @@ def generate_wavs(
     method = str(tts_method or "bytedance").strip().lower()
     wavs_dir = _tts_dir(job)
 
+    logger.info(f"TTS({method}) 开始: {job}（段数={len(translation)}）")
+
     if method == "qwen":
         bs = int(qwen_tts_batch_size or 1)
         bs = int(max(1, min(bs, 64)))
+        # Build work items (skip cache / silence segments early) BEFORE starting the worker.
+        items_meta: dict[int, dict[str, Any]] = {}
+        for i, seg in enumerate(translation):
+            check_cancelled()
+            out = os.path.join(wavs_dir, f"{i:04d}.wav")
+            seg_dur = _segment_duration_seconds(seg)
 
-        worker = _QwenTtsWorker.from_settings(_DEFAULT_SETTINGS)
-        try:
-            # Build work items (skip cache / silence segments early).
-            items_meta: dict[int, dict[str, Any]] = {}
-            for i, seg in enumerate(translation):
-                check_cancelled()
-                out = os.path.join(wavs_dir, f"{i:04d}.wav")
-                seg_dur = _segment_duration_seconds(seg)
+            if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+                continue
 
-                if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
-                    continue
+            raw_text = str(seg.get("translation") or seg.get("text") or "")
+            if not raw_text.strip():
+                save_wav(np.zeros((0,), dtype=np.float32), out, sample_rate=24000)
+                continue
 
-                raw_text = str(seg.get("translation") or seg.get("text") or "")
-                if not raw_text.strip():
-                    save_wav(np.zeros((0,), dtype=np.float32), out, sample_rate=24000)
-                    continue
+            speaker = str(seg.get("speaker") or "SPEAKER_00")
+            speaker_wav = os.path.join(speaker_dir, f"{speaker}.wav")
+            items_meta[int(i)] = {
+                "out": out,
+                "seg_dur": float(seg_dur),
+                "speaker_wav": speaker_wav,
+                "raw_text": raw_text,
+            }
 
-                speaker = str(seg.get("speaker") or "SPEAKER_00")
-                speaker_wav = os.path.join(speaker_dir, f"{speaker}.wav")
-                items_meta[int(i)] = {
-                    "out": out,
-                    "seg_dur": float(seg_dur),
-                    "speaker_wav": speaker_wav,
-                    "raw_text": raw_text,
-                }
+        pending = sorted(items_meta.keys())
+        if not pending:
+            logger.info(f"TTS(qwen) 已全部命中缓存/无需合成: {job}")
+        else:
+            logger.info(f"TTS(qwen) 待合成 {len(pending)} 段（batch_size={bs} retries={int(retries)}）: {job}")
 
-            pending = sorted(items_meta.keys())
-
-            def _cleanup_invalid(p: str) -> None:
-                if os.path.exists(p) and not is_valid_wav(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-
-            def _mark_failed(i: int, *, why: str) -> None:
-                meta = items_meta.get(int(i)) or {}
-                outp = str(meta.get("out") or "")
-                if outp:
-                    try:
-                        if os.path.exists(outp):
-                            os.remove(outp)
-                    except Exception:
-                        pass
-                logger.warning(f"Qwen TTS失败（段={i}）: {why}")
-
-            if bs <= 1:
-                # Sequential path (keeps behavior simple for debugging).
-                for i in pending:
-                    meta = items_meta[int(i)]
-                    out = str(meta["out"])
-                    seg_dur = float(meta["seg_dur"])
-                    speaker_wav = str(meta["speaker_wav"])
-                    raw_text = str(meta["raw_text"])
-
-                    ok = False
-                    for attempt in range(int(retries)):
-                        check_cancelled()
-                        tts_text = preprocess_text(_tts_text_for_attempt(raw_text, attempt))
-                        _cleanup_invalid(out)
+            worker = _QwenTtsWorker.from_settings(_DEFAULT_SETTINGS)
+            try:
+                def _cleanup_invalid(p: str) -> None:
+                    if os.path.exists(p) and not is_valid_wav(p):
                         try:
-                            resp = worker.synthesize(
-                                tts_text, speaker_wav=speaker_wav, output_path=out, language="Auto"
-                            )
-                        except Exception as exc:
-                            _mark_failed(int(i), why=f"attempt={attempt} {exc}")
-                            sleep_with_cancel(0.2)
-                            continue
+                            os.remove(p)
+                        except Exception:
+                            pass
 
-                        dur = _qwen_resp_duration_seconds(resp if isinstance(resp, dict) else None)
-                        if _qwen_tts_is_degenerate_hit_cap(wav_dur=dur):
-                            cap_sec = _qwen_tts_hit_max_tokens_seconds()
-                            _mark_failed(
-                                int(i),
-                                why=f"qwen_tts_degenerate_hit_max_new_tokens ({_qwen_tts_max_new_tokens()}, ~{cap_sec:.1f}s)",
-                            )
-                            sleep_with_cancel(0.2)
-                            continue
+                def _mark_failed(i: int, *, why: str) -> None:
+                    meta = items_meta.get(int(i)) or {}
+                    outp = str(meta.get("out") or "")
+                    if outp:
+                        try:
+                            if os.path.exists(outp):
+                                os.remove(outp)
+                        except Exception:
+                            pass
+                    logger.warning(f"Qwen TTS失败（段={i}）: {why}")
 
-                        if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
-                            _mark_failed(int(i), why="raw_wav_guard_failed")
-                            sleep_with_cancel(0.2)
-                            continue
+                progress_every_sec = 15.0
 
-                        y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
-                        save_wav(y, out, sample_rate=24000)
-                        if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
-                            ok = True
-                            break
-
-                        _mark_failed(int(i), why="aligned_wav_guard_failed")
-                        sleep_with_cancel(0.2)
-
-                    if not ok:
-                        raise RuntimeError(f"Qwen TTS 段落合成失败: idx={i}")
-            else:
-                # Batch path: retry pending items across attempts.
-                for attempt in range(int(retries)):
-                    check_cancelled()
-                    if not pending:
-                        break
-                    next_pending: list[int] = []
-
-                    for off in range(0, len(pending), int(bs)):
+                if bs <= 1:
+                    # Sequential path (keeps behavior simple for debugging).
+                    total = int(len(pending))
+                    progress_last = time.monotonic()
+                    for done, i in enumerate(pending):
                         check_cancelled()
-                        batch_idx = pending[off : off + int(bs)]
-                        batch_items: list[dict[str, Any]] = []
-                        for i in batch_idx:
-                            meta = items_meta[int(i)]
-                            out = str(meta["out"])
+                        now = time.monotonic()
+                        if done == 0 or (now - progress_last) >= float(progress_every_sec):
+                            progress_last = now
+                            logger.info(f"TTS(qwen) 进度 {done}/{total}: {job}")
+
+                        meta = items_meta[int(i)]
+                        out = str(meta["out"])
+                        seg_dur = float(meta["seg_dur"])
+                        speaker_wav = str(meta["speaker_wav"])
+                        raw_text = str(meta["raw_text"])
+
+                        ok = False
+                        for attempt in range(int(retries)):
+                            check_cancelled()
+                            tts_text = preprocess_text(_tts_text_for_attempt(raw_text, attempt))
                             _cleanup_invalid(out)
-                            batch_items.append(
-                                {
-                                    "text": preprocess_text(_tts_text_for_attempt(str(meta["raw_text"]), attempt)),
-                                    "language": "Auto",
-                                    "speaker_wav": str(meta["speaker_wav"]),
-                                    "output_path": out,
-                                }
-                            )
+                            try:
+                                resp = worker.synthesize(
+                                    tts_text, speaker_wav=speaker_wav, output_path=out, language="Auto"
+                                )
+                            except Exception as exc:
+                                _mark_failed(int(i), why=f"attempt={attempt} {exc}")
+                                sleep_with_cancel(0.2)
+                                continue
 
-                        try:
-                            resp = worker.synthesize_batch(batch_items, timeout_sec=300.0)
-                            results = resp.get("results") if isinstance(resp, dict) else None
-                        except Exception as exc:
-                            results = None
-                            logger.warning(f"Qwen TTS批处理失败（attempt={attempt} batch={batch_idx}）: {exc}")
-
-                        if not isinstance(results, list) or len(results) != len(batch_items):
-                            for i in batch_idx:
-                                _mark_failed(int(i), why=f"batch_invalid_results attempt={attempt}")
-                            next_pending.extend(batch_idx)
-                            continue
-
-                        for i, r in zip(batch_idx, results):
-                            meta = items_meta[int(i)]
-                            out = str(meta["out"])
-                            seg_dur = float(meta["seg_dur"])
-
-                            ok_item = bool(isinstance(r, dict) and r.get("ok"))
-                            if ok_item:
-                                dur = _qwen_resp_duration_seconds(r)
-                                if _qwen_tts_is_degenerate_hit_cap(wav_dur=dur):
-                                    cap_sec = _qwen_tts_hit_max_tokens_seconds()
-                                    _mark_failed(
-                                        int(i),
-                                        why=(
-                                            "qwen_tts_degenerate_hit_max_new_tokens"
-                                            f" ({_qwen_tts_max_new_tokens()}, ~{cap_sec:.1f}s)"
-                                        ),
-                                    )
-                                    next_pending.append(int(i))
-                                    continue
-
-                            if not ok_item:
-                                _mark_failed(int(i), why=f"batch_item_failed attempt={attempt} err={getattr(r, 'get', lambda _k: None)('error')}")
-                                next_pending.append(int(i))
+                            dur = _qwen_resp_duration_seconds(resp if isinstance(resp, dict) else None)
+                            if _qwen_tts_is_degenerate_hit_cap(wav_dur=dur):
+                                cap_sec = _qwen_tts_hit_max_tokens_seconds()
+                                _mark_failed(
+                                    int(i),
+                                    why=f"qwen_tts_degenerate_hit_max_new_tokens ({_qwen_tts_max_new_tokens()}, ~{cap_sec:.1f}s)",
+                                )
+                                sleep_with_cancel(0.2)
                                 continue
 
                             if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
                                 _mark_failed(int(i), why="raw_wav_guard_failed")
-                                next_pending.append(int(i))
+                                sleep_with_cancel(0.2)
                                 continue
 
                             y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
                             save_wav(y, out, sample_rate=24000)
-                            if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
-                                _mark_failed(int(i), why="aligned_wav_guard_failed")
-                                next_pending.append(int(i))
+                            if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+                                ok = True
+                                break
 
-                    pending = next_pending
+                            _mark_failed(int(i), why="aligned_wav_guard_failed")
+                            sleep_with_cancel(0.2)
+
+                        if not ok:
+                            raise RuntimeError(f"Qwen TTS 段落合成失败: idx={i}")
+                else:
+                    # Batch path: retry pending items across attempts.
+                    for attempt in range(int(retries)):
+                        check_cancelled()
+                        if not pending:
+                            break
+
+                        attempt_total = int(len(pending))
+                        total_batches = int((attempt_total + int(bs) - 1) // int(bs))
+                        processed = 0
+                        progress_last = time.monotonic()
+                        next_pending: list[int] = []
+
+                        logger.info(
+                            f"TTS(qwen) attempt {attempt + 1}/{int(retries)} 开始: "
+                            f"pending={attempt_total} batch_size={int(bs)} ({job})"
+                        )
+
+                        batch_no = 0
+                        for off in range(0, len(pending), int(bs)):
+                            check_cancelled()
+                            batch_no += 1
+                            batch_idx = pending[off : off + int(bs)]
+                            batch_items: list[dict[str, Any]] = []
+                            for i in batch_idx:
+                                meta = items_meta[int(i)]
+                                out = str(meta["out"])
+                                _cleanup_invalid(out)
+                                batch_items.append(
+                                    {
+                                        "text": preprocess_text(_tts_text_for_attempt(str(meta["raw_text"]), attempt)),
+                                        "language": "Auto",
+                                        "speaker_wav": str(meta["speaker_wav"]),
+                                        "output_path": out,
+                                    }
+                                )
+
+                            try:
+                                resp = worker.synthesize_batch(batch_items, timeout_sec=300.0)
+                                results = resp.get("results") if isinstance(resp, dict) else None
+                            except Exception as exc:
+                                results = None
+                                logger.warning(f"Qwen TTS批处理失败（attempt={attempt} batch={batch_idx}）: {exc}")
+
+                            if not isinstance(results, list) or len(results) != len(batch_items):
+                                for i in batch_idx:
+                                    _mark_failed(int(i), why=f"batch_invalid_results attempt={attempt}")
+                                next_pending.extend(batch_idx)
+                                processed += int(len(batch_idx))
+                            else:
+                                for i, r in zip(batch_idx, results):
+                                    meta = items_meta[int(i)]
+                                    out = str(meta["out"])
+                                    seg_dur = float(meta["seg_dur"])
+
+                                    ok_item = bool(isinstance(r, dict) and r.get("ok"))
+                                    if ok_item:
+                                        dur = _qwen_resp_duration_seconds(r)
+                                        if _qwen_tts_is_degenerate_hit_cap(wav_dur=dur):
+                                            cap_sec = _qwen_tts_hit_max_tokens_seconds()
+                                            _mark_failed(
+                                                int(i),
+                                                why=(
+                                                    "qwen_tts_degenerate_hit_max_new_tokens"
+                                                    f" ({_qwen_tts_max_new_tokens()}, ~{cap_sec:.1f}s)"
+                                                ),
+                                            )
+                                            next_pending.append(int(i))
+                                            continue
+
+                                    if not ok_item:
+                                        _mark_failed(
+                                            int(i),
+                                            why=f"batch_item_failed attempt={attempt} err={getattr(r, 'get', lambda _k: None)('error')}",
+                                        )
+                                        next_pending.append(int(i))
+                                        continue
+
+                                    if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+                                        _mark_failed(int(i), why="raw_wav_guard_failed")
+                                        next_pending.append(int(i))
+                                        continue
+
+                                    y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
+                                    save_wav(y, out, sample_rate=24000)
+                                    if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+                                        _mark_failed(int(i), why="aligned_wav_guard_failed")
+                                        next_pending.append(int(i))
+
+                                processed += int(len(batch_idx))
+
+                            now = time.monotonic()
+                            if batch_no >= total_batches or (now - progress_last) >= float(progress_every_sec):
+                                progress_last = now
+                                logger.info(
+                                    f"TTS(qwen) attempt {attempt + 1}/{int(retries)} 进度 "
+                                    f"{processed}/{attempt_total} (batch {batch_no}/{total_batches}), "
+                                    f"待重试累计={len(next_pending)} ({job})"
+                                )
+
+                        pending = next_pending
+                        if pending:
+                            sleep_with_cancel(0.2)
+
                     if pending:
-                        sleep_with_cancel(0.2)
-
-                if pending:
-                    raise RuntimeError(f"Qwen TTS 段落合成失败（超出重试次数）: idx={pending[:10]} ...")
-        finally:
-            try:
-                worker.close()
-            except Exception:
-                pass
+                        raise RuntimeError(f"Qwen TTS 段落合成失败（超出重试次数）: idx={pending[:10]} ...")
+            finally:
+                try:
+                    worker.close()
+                except Exception:
+                    pass
 
     elif method == "gemini":
         for i, seg in enumerate(translation):
@@ -652,4 +693,6 @@ def generate_wavs(
             json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception as exc:
         logger.warning(f"写入TTS完成标记失败（忽略）: {marker} ({exc})")
+    else:
+        logger.info(f"TTS({method}) 完成: {job}")
 
