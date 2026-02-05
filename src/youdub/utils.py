@@ -193,7 +193,6 @@ def smooth_transients(wav: np.ndarray, max_diff: float = 0.3, alpha: float = 0.3
 
 def prepare_speaker_ref_audio(
     wav: np.ndarray,
-    sample_rate: int = 24000,
     *,
     trim_silence: bool = True,
     trim_top_db: float = 30.0,
@@ -213,7 +212,6 @@ def prepare_speaker_ref_audio(
 
     Args:
         wav: Input waveform (float, mono)
-        sample_rate: Sample rate
         trim_silence: Whether to trim silence
         trim_top_db: Threshold for silence trimming
         apply_soft_clip: Whether to apply soft clipping

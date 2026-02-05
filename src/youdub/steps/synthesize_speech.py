@@ -316,7 +316,6 @@ def generate_wavs(
     # Try multi-candidate selection first (optional); fallback to simple auto-gen for missing refs.
     try:
         _ensure_speaker_ref_multi(
-            folder=job,
             segments=translation,
             speakers=set(speakers),
             speaker_dir=speaker_dir,

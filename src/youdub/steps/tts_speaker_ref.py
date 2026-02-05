@@ -56,7 +56,6 @@ def _ensure_wav_max_duration(path: str, max_seconds: float, sample_rate: int = 2
         # Apply anti-pop processing
         wav_processed = prepare_speaker_ref_audio(
             wav,
-            sample_rate=sample_rate,
             trim_silence=True,
             trim_top_db=30.0,
             apply_soft_clip=True,
@@ -202,7 +201,6 @@ def _speaker_ref_meta_path(speaker_dir: str, speaker: str) -> str:
 
 def _ensure_speaker_ref_multi(
     *,
-    folder: str,
     segments: list[dict],
     speakers: set[str],
     speaker_dir: str,
@@ -363,7 +361,6 @@ def _ensure_speaker_ref_multi(
                     continue
                 y_proc = prepare_speaker_ref_audio(
                     y,
-                    sample_rate=int(sample_rate),
                     trim_silence=True,
                     trim_top_db=30.0,
                     apply_soft_clip=True,
@@ -509,7 +506,6 @@ def _ensure_missing_speaker_refs(
             # Apply anti-pop processing before saving
             wav_processed = prepare_speaker_ref_audio(
                 y,
-                sample_rate=sr_ref,
                 trim_silence=True,
                 trim_top_db=30.0,
                 apply_soft_clip=True,

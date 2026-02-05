@@ -401,7 +401,6 @@ def _upload_audio_for_cloning(audio_path: str, appid: str, token: str, speaker_i
         # Apply anti-pop processing before uploading
         wav_data = prepare_speaker_ref_audio(
             wav_data,
-            sample_rate=sample_rate,
             trim_silence=True,
             trim_top_db=30.0,
             apply_soft_clip=True,
