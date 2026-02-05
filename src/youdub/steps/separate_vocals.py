@@ -216,11 +216,6 @@ def separate_audio(
 
 
 
-class CorruptedVideoError(RuntimeError):
-    """视频文件损坏，无法提取音频。"""
-    pass
-
-
 def extract_audio_from_video(folder: str) -> bool:
     video_path = os.path.join(folder, 'download.mp4')
     if not os.path.exists(video_path):

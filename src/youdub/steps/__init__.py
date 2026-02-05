@@ -39,10 +39,12 @@ from .synthesize_speech import (
 )
 from .synthesize_video import (
     convert_resolution,
+    synthesize_all_video_under_folder,
+)
+from .synthesize_video_subtitles import (
     format_timestamp,
     generate_srt,
     split_text,
-    synthesize_all_video_under_folder,
 )
 from .generate_info import (
     generate_all_info_under_folder,

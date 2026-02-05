@@ -13,32 +13,16 @@ from ..interrupts import check_cancelled, sleep_with_cancel
 from ..utils import valid_file
 
 from .synthesize_video_audio import (
-    _AUDIO_COMBINED_META_NAME,
-    _AUDIO_COMBINED_MIX_VERSION,
     _audio_combined_needs_rebuild,
     _ensure_audio_combined,
-    _read_audio_combined_meta,
-    _write_audio_combined_meta,
 )
-from .synthesize_video_fs import _is_stale, _mtime
+from .synthesize_video_fs import _is_stale
 from .synthesize_video_subtitles import (
-    _ass_escape_text,
-    _best_text_by_overlap,
-    _bilingual_source_text,
     _calc_subtitle_style_params,
-    _calc_subtitle_wrap_chars,
     _ensure_bilingual_source_text,
-    _is_cjk_char,
-    _read_transcript_segments,
-    _wrap_cjk,
-    _wrap_words,
-    format_timestamp,
-    format_timestamp_ass,
     generate_bilingual_ass,
     generate_monolingual_ass,
     generate_srt,
-    split_text,
-    wrap_text,
 )
 
 
@@ -139,31 +123,31 @@ def _video_up_to_date(
 ) -> bool:
     output_video = os.path.join(folder, "video.mp4")
     if not valid_file(output_video, min_bytes=1024):
-        logger.debug(f"video 过期原因: video.mp4 不存在或过小")
+        logger.debug("video 过期原因: video.mp4 不存在或过小")
         return False
 
     # If audio needs rebuild (e.g. old mixing semantics), video is also stale.
     if _audio_combined_needs_rebuild(
         folder, adaptive_segment_stretch=adaptive_segment_stretch, sample_rate=sample_rate
     ):
-        logger.debug(f"video 过期原因: audio_combined 需要重建")
+        logger.debug("video 过期原因: audio_combined 需要重建")
         return False
 
     meta = _read_video_meta(folder)
     if not meta:
-        logger.debug(f"video 过期原因: 元数据文件不存在")
+        logger.debug("video 过期原因: 元数据文件不存在")
         return False
     if int(meta.get("version") or 0) != int(_VIDEO_META_VERSION):
         logger.debug(f"video 过期原因: 元数据版本不匹配 ({meta.get('version')} != {_VIDEO_META_VERSION})")
         return False
     if bool(meta.get("subtitles")) != bool(subtitles):
-        logger.debug(f"video 过期原因: subtitles 参数不匹配")
+        logger.debug("video 过期原因: subtitles 参数不匹配")
         return False
     if bool(meta.get("bilingual_subtitle")) != bool(bilingual_subtitle):
-        logger.debug(f"video 过期原因: bilingual_subtitle 参数不匹配")
+        logger.debug("video 过期原因: bilingual_subtitle 参数不匹配")
         return False
     if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
-        logger.debug(f"video 过期原因: adaptive_segment_stretch 参数不匹配")
+        logger.debug("video 过期原因: adaptive_segment_stretch 参数不匹配")
         return False
     if int(meta.get("fps") or 0) != int(fps):
         logger.debug(f"video 过期原因: fps 参数不匹配 ({meta.get('fps')} != {fps})")
@@ -172,7 +156,7 @@ def _video_up_to_date(
         logger.debug(f"video 过期原因: resolution 参数不匹配 ({meta.get('resolution')} != {resolution})")
         return False
     if bool(meta.get("use_nvenc")) != bool(use_nvenc):
-        logger.debug(f"video 过期原因: use_nvenc 参数不匹配")
+        logger.debug("video 过期原因: use_nvenc 参数不匹配")
         return False
     if int(meta.get("audio_sample_rate") or 0) != int(_VIDEO_AUDIO_SAMPLE_RATE):
         logger.debug(f"video 过期原因: audio_sample_rate 不匹配 ({meta.get('audio_sample_rate')} != {_VIDEO_AUDIO_SAMPLE_RATE})")
@@ -194,7 +178,7 @@ def _video_up_to_date(
         tr = "translation_adaptive.json" if adaptive_segment_stretch else "translation.json"
         deps.append(os.path.join(folder, tr))
     if _is_stale(output_video, deps):
-        logger.debug(f"video 过期原因: 依赖文件比 video.mp4 更新")
+        logger.debug("video 过期原因: 依赖文件比 video.mp4 更新")
         return False
     return True
 
@@ -583,8 +567,6 @@ def synthesize_video(
     
     def _run_ffmpeg(cmd: list[str]) -> None:
         import sys
-        import select
-        import io
 
         # Capture ffmpeg output and forward to sys.stderr so Gradio can display it
         proc = subprocess.Popen(

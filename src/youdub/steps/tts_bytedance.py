@@ -14,7 +14,7 @@ from scipy.spatial.distance import cosine
 from ..config import Settings
 from ..interrupts import check_cancelled, sleep_with_cancel
 from ..models import ModelManager
-from ..utils import prepare_speaker_ref_audio, save_wav_norm, torch_load_weights_only_compat
+from ..utils import prepare_speaker_ref_audio, torch_load_weights_only_compat
 from .tts_wav_guard import is_valid_wav
 
 

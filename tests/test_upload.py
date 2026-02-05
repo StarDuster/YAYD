@@ -288,6 +288,7 @@ def test_upload_all_videos_skips_already_uploaded_no_wait(monkeypatch, tmp_path:
     monkeypatch.setattr(up, "sleep_with_cancel", lambda secs, **_kw: waits.append(secs))
 
     out = up.upload_all_videos_under_folder(str(tmp_path))
+    assert "成功 2 个" in out
     # job1 和 job3 被上传，job2 跳过
     assert len(uploaded) == 2
     # 只有一次等待（job1 和 job3 之间），跳过 job2 不产生等待

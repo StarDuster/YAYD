@@ -81,12 +81,12 @@ def _audio_combined_needs_rebuild(
 ) -> bool:
     audio_combined_path = os.path.join(folder, "audio_combined.wav")
     if not valid_file(audio_combined_path, min_bytes=44):
-        logger.debug(f"audio_combined 需要重建: 文件不存在或过小")
+        logger.debug("audio_combined 需要重建: 文件不存在或过小")
         return True
 
     meta = _read_audio_combined_meta(folder)
     if not meta:
-        logger.debug(f"audio_combined 需要重建: 元数据文件不存在")
+        logger.debug("audio_combined 需要重建: 元数据文件不存在")
         return True
     if int(meta.get("mix_version") or 0) != int(_AUDIO_COMBINED_MIX_VERSION):
         logger.debug(
@@ -94,7 +94,7 @@ def _audio_combined_needs_rebuild(
         )
         return True
     if bool(meta.get("adaptive_segment_stretch")) != bool(adaptive_segment_stretch):
-        logger.debug(f"audio_combined 需要重建: adaptive_segment_stretch 参数不匹配")
+        logger.debug("audio_combined 需要重建: adaptive_segment_stretch 参数不匹配")
         return True
     if int(meta.get("sample_rate") or 0) != int(sample_rate):
         logger.debug(f"audio_combined 需要重建: sample_rate 不匹配 ({meta.get('sample_rate')} != {sample_rate})")
@@ -109,7 +109,7 @@ def _audio_combined_needs_rebuild(
         os.path.join(folder, "audio_vocals.wav"),
     ]
     if _is_stale(audio_combined_path, deps):
-        logger.debug(f"audio_combined 需要重建: 依赖文件比 audio_combined.wav 更新")
+        logger.debug("audio_combined 需要重建: 依赖文件比 audio_combined.wav 更新")
         return True
     return False
 

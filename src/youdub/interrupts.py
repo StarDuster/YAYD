@@ -125,7 +125,7 @@ def install_signal_handlers() -> None:
 
     def _handler(signum: int, frame) -> None:  # noqa: ARG001
         global _SIGINT_COUNT  # noqa: PLW0603
-        name = "SIGINT" if signum == sigint else "SIGTERM" if signum == sigterm else str(signum)
+        sig_name = "SIGINT" if signum == sigint else "SIGTERM" if signum == sigterm else str(signum)
 
         if signum == sigint:
             _SIGINT_COUNT += 1
@@ -145,6 +145,9 @@ def install_signal_handlers() -> None:
                     pass
                 os._exit(130)
 
+        # Preserve the cancellation reason as signal name.
+        # request_shutdown() calls request_cancel("shutdown"), but request_cancel is idempotent.
+        request_cancel(sig_name)
         request_shutdown()
 
         prev = prev_int if signum == sigint else prev_term
