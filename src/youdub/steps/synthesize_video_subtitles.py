@@ -290,7 +290,31 @@ def _wrap_words(text: str, max_chars: int) -> list[str]:
         cur = w
     if cur:
         lines.append(cur)
-    return lines
+
+    # Rebalance: avoid an overly short tail line by shifting words backward.
+    # This keeps line count unchanged but reduces "ragged" wrapping.
+    if len(lines) >= 2 and max_chars > 0:
+        min_tail = max(8, int(round(float(max_chars) * 0.55)))
+        min_prev = max(8, int(round(float(max_chars) * 0.45)))
+        for i in range(len(lines) - 1, 0, -1):
+            while True:
+                tail = lines[i].strip()
+                if len(tail) >= min_tail:
+                    break
+                prev_words = lines[i - 1].strip().split(" ")
+                if len(prev_words) <= 1:
+                    break
+                w = prev_words[-1]
+                candidate_tail = f"{w} {tail}".strip() if tail else w
+                if len(candidate_tail) > max_chars:
+                    break
+                candidate_prev = " ".join(prev_words[:-1]).strip()
+                if len(candidate_prev) < min_prev:
+                    break
+                lines[i] = candidate_tail
+                lines[i - 1] = candidate_prev
+
+    return [ln for ln in lines if ln and ln.strip()]
 
 
 def wrap_text(text: str, *, max_chars_zh: int = 55, max_chars_en: int = 100) -> str:
@@ -336,7 +360,9 @@ def _calc_subtitle_wrap_chars(width: int, font_size: int, *, en_font_scale: floa
     # - Latin: narrower, plus spaces; tuned to match previous defaults on 16:9
     max_chars_zh = max(1, int(safe_w / (float(fs) * 0.90)))
     en_fs = max(1, int(round(float(fs) * float(en_font_scale))))
-    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.65)))
+    # 0.65 was overly conservative for common English subtitles and caused excessive wrapping.
+    # Use a slightly smaller average glyph width so long English sentences don't explode into 5-6 lines.
+    max_chars_en = max(1, int(safe_w / (float(en_fs) * 0.58)))
     return max_chars_zh, max_chars_en
 
 
@@ -564,11 +590,13 @@ def _bilingual_source_text(
         clauses = [c.strip() for c in _split_source_text_relaxed(sent) if str(c).strip()]
         grouped = _group_clauses_evenly(clauses, target_count)
         if grouped:
-            rendered.append("\n".join(grouped).strip())
+            # Keep as a single paragraph; actual line wrapping is handled later by `wrap_text`.
+            # Injecting newlines here often causes double-wrapping (6+ lines with very short lines).
+            rendered.append(" ".join(grouped).strip())
             continue
 
         # Fallback: word-based even split (guarantees count).
-        rendered.append("\n".join([p for p in _split_words_to_count(sent, target_count) if p.strip()]).strip())
+        rendered.append(" ".join([p for p in _split_words_to_count(sent, target_count) if p.strip()]).strip())
 
     return " ".join([x for x in rendered if x]).strip()
 
