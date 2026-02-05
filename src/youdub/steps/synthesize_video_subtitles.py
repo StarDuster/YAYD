@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from ..interrupts import check_cancelled
+from ..text_split import split_source_text_into_sentences, split_source_text_relaxed
 
 
 def _is_cjk_char(ch: str) -> bool:
@@ -553,13 +554,7 @@ def _bilingual_source_text(
     if not s:
         return ""
 
-    # Lazy import to avoid pulling translation stack unless needed.
-    try:
-        from .translate import _split_source_text_into_sentences, _split_source_text_relaxed
-    except Exception:
-        return s
-
-    sentences = [x.strip() for x in _split_source_text_into_sentences(s) if str(x).strip()]
+    sentences = [x.strip() for x in split_source_text_into_sentences(s) if str(x).strip()]
     if not sentences:
         sentences = [s]
 
@@ -587,7 +582,7 @@ def _bilingual_source_text(
         if max_chars > 0:
             target_count = max(target_count, int(math.ceil(float(len(sent)) / float(max_chars))))
 
-        clauses = [c.strip() for c in _split_source_text_relaxed(sent) if str(c).strip()]
+        clauses = [c.strip() for c in split_source_text_relaxed(sent) if str(c).strip()]
         grouped = _group_clauses_evenly(clauses, target_count)
         if grouped:
             # Inject explicit newlines between clause groups to keep long source sentences readable.

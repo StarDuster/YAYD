@@ -23,6 +23,11 @@ from openai import (
 
 from ..config import Settings
 from ..interrupts import check_cancelled, sleep_with_cancel
+from ..text_split import (
+    normalize_ws as _normalize_ws,
+    split_source_text_into_sentences as _split_source_text_into_sentences,
+    split_source_text_relaxed as _split_source_text_relaxed,
+)
 
 @dataclass(frozen=True)
 class _ChatBackend:
@@ -485,19 +490,6 @@ def split_text_into_sentences(para: str) -> list[str]:
     return para.split("\n")
 
 
-def _split_source_text_into_sentences(text: str) -> list[str]:
-    s = " ".join((text or "").split()).strip()
-    if not s:
-        return []
-    # Chinese punctuation
-    s = re.sub(r"([。！？])([^”’])", r"\1\n\2", s)
-    s = re.sub(r"([。！？][”’])([^，。！？])", r"\1\n\2", s)
-    # English punctuation: split on .!? followed by whitespace
-    s = re.sub(r"([.!?][\"”’']?)\s+(?=\S)", r"\1\n", s)
-    out = [x.strip() for x in s.splitlines() if x.strip()]
-    return out or ([s] if s else [])
-
-
 def _pack_source_text_chunks(
     sentences: list[str],
     *,
@@ -520,33 +512,6 @@ def _pack_source_text_chunks(
     if buf:
         out.append(buf)
     return out
-
-
-def _normalize_ws(text: str) -> str:
-    return " ".join((text or "").split()).strip()
-
-
-def _split_source_text_relaxed(text: str) -> list[str]:
-    """
-    A more aggressive splitter for subtitle alignment.
-
-    Why: ASR sometimes produces very long "sentences" without .!?; in bilingual subtitle mode,
-    we still want the source text to be split into smaller readable chunks rather than
-    repeating the full paragraph on every translated sentence.
-    """
-    s = _normalize_ws(text)
-    if not s:
-        return []
-
-    # English punctuation (comma/semicolon/colon) when followed by whitespace.
-    s = re.sub(r"([,;:])\s+(?=\S)", r"\1\n", s)
-    # Chinese comma/semicolon/colon (often no whitespace after).
-    s = re.sub(r"([，；：])([^，；：])", r"\1\n\2", s)
-    # Long dash variants commonly used as clause separator.
-    s = re.sub(r"([—–])\s+(?=\S)", r"\1\n", s)
-
-    out = [x.strip() for x in s.splitlines() if x.strip()]
-    return out or ([s] if s else [])
 
 
 def _merge_parts_to_count(parts: list[str], target_count: int) -> list[str]:
