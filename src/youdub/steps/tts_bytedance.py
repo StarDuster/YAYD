@@ -23,8 +23,6 @@ _DEFAULT_MODEL_MANAGER = ModelManager(_DEFAULT_SETTINGS)
 
 _BYTEDANCE_HOST = "openspeech.bytedance.com"
 _BYTEDANCE_API_URL = f"https://{_BYTEDANCE_HOST}/api/v1/tts"
-_BYTEDANCE_V3_SUBMIT_URL = f"https://{_BYTEDANCE_HOST}/api/v3/tts/submit"
-_BYTEDANCE_V3_QUERY_URL = f"https://{_BYTEDANCE_HOST}/api/v3/tts/query"
 
 
 _EMBEDDING_MODEL = None
@@ -90,125 +88,6 @@ def generate_embedding(wav_path: str) -> np.ndarray:
         raise RuntimeError("Embedding model is not available.")
     embedding = _EMBEDDING_INFERENCE(wav_path)
     return embedding
-
-
-def bytedance_tts_v3_api(
-    text: str,
-    speaker: str = "BV001_streaming",
-    use_cloned_voice: bool = False,
-) -> bytes | None:
-    """
-    Use the V3 async long-text API for TTS synthesis.
-    This API properly supports ICL 2.0 voice cloning.
-
-    Args:
-        text: Text to synthesize
-        speaker: Speaker/voice ID (e.g., 'BV001_streaming' or 'S_xxx' for cloned)
-        use_cloned_voice: Whether the speaker is a cloned voice (ICL 2.0)
-
-    Returns:
-        Audio bytes (WAV format) or None on failure
-    """
-    appid = _DEFAULT_SETTINGS.bytedance_appid
-    access_token = _DEFAULT_SETTINGS.bytedance_access_token
-
-    if not appid or not access_token:
-        logger.warning("未设置ByteDance APPID或ACCESS_TOKEN")
-        return None
-
-    if use_cloned_voice:
-        resource_id = "seed-icl-2.0"
-    else:
-        resource_id = "volc.service_type.10029"  # Standard TTS
-
-    headers = {
-        "X-Api-App-Id": appid,
-        "X-Api-Access-Key": access_token,
-        "X-Api-Resource-Id": resource_id,
-        "Content-Type": "application/json",
-    }
-
-    unique_id = str(uuid.uuid4())
-
-    submit_payload = {
-        "user": {"uid": "youdub-webui"},
-        "unique_id": unique_id,
-        "namespace": "BidirectionalTTS",
-        "req_params": {
-            "text": text,
-            "speaker": speaker,
-            "audio_params": {
-                "format": "wav",
-                "sample_rate": 24000,
-            },
-        },
-    }
-
-    try:
-        check_cancelled()
-        logger.debug(f"V3 TTS提交: speaker={speaker}, text={text[:30]}...")
-        resp = requests.post(_BYTEDANCE_V3_SUBMIT_URL, json=submit_payload, headers=headers, timeout=30)
-        resp_json = resp.json()
-
-        if resp_json.get("code") != 20000000:
-            logger.warning(f"V3 TTS提交失败: {resp_json}")
-            return None
-
-        task_id = resp_json.get("data", {}).get("task_id")
-        if not task_id:
-            logger.warning(f"V3 TTS提交未返回task_id: {resp_json}")
-            return None
-
-        logger.debug(f"V3 TTS任务已提交: {task_id}")
-
-    except Exception as e:
-        logger.error(f"V3 TTS提交异常: {e}")
-        return None
-
-    query_payload = {"task_id": task_id}
-    max_polls = 60  # Max 60 seconds
-    poll_interval = 1.0
-
-    for _ in range(max_polls):
-        try:
-            check_cancelled()
-            sleep_with_cancel(poll_interval)
-            check_cancelled()
-            resp = requests.post(_BYTEDANCE_V3_QUERY_URL, json=query_payload, headers=headers, timeout=30)
-            resp_json = resp.json()
-
-            if resp_json.get("code") != 20000000:
-                logger.warning(f"V3 TTS查询错误: {resp_json}")
-                return None
-
-            task_status = resp_json.get("data", {}).get("task_status")
-
-            if task_status == 1:  # Running
-                continue
-            if task_status == 2:  # Success
-                audio_url = resp_json.get("data", {}).get("audio_url")
-                if audio_url:
-                    audio_resp = requests.get(audio_url, timeout=60)
-                    if audio_resp.status_code == 200:
-                        logger.info(f"V3 TTS成功: {len(audio_resp.content)} 字节")
-                        return audio_resp.content
-                    logger.warning(f"V3 TTS音频下载失败: {audio_resp.status_code}")
-                    return None
-                logger.warning("V3 TTS成功但无audio_url")
-                return None
-            if task_status == 3:  # Failure
-                logger.warning(f"V3 TTS任务失败: {resp_json}")
-                return None
-
-            logger.warning(f"V3 TTS未知状态: {task_status}")
-            continue
-
-        except Exception as e:
-            logger.error(f"V3 TTS查询异常: {e}")
-            return None
-
-    logger.warning("V3 TTS轮询超时")
-    return None
 
 
 def bytedance_tts_api(

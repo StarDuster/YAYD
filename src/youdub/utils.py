@@ -4,7 +4,6 @@ import wave
 
 import numpy as np
 from scipy.io import wavfile
-from loguru import logger
 
 
 def wav_duration_seconds(path: str) -> float | None:
@@ -261,13 +260,3 @@ def prepare_speaker_ref_audio(
         wav = wav * (0.95 / peak)
 
     return wav.astype(np.float32)
-
-def normalize_wav(wav_path: str) -> None:
-    try:
-        sample_rate, wav = wavfile.read(wav_path)
-        peak = _peak_abs(wav)
-        wav_norm = wav * (32767 / max(0.01, peak))
-        wavfile.write(wav_path, sample_rate, wav_norm.astype(np.int16))
-    except Exception as e:
-        logger.warning(f"标准化音频失败 {wav_path}: {e}")
-

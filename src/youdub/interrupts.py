@@ -38,14 +38,6 @@ def request_cancel(reason: str | None = None) -> None:
         pass
 
 
-def cancel_requested() -> bool:
-    return _CANCEL_EVENT.is_set()
-
-
-def cancel_reason() -> str | None:
-    return _CANCEL_REASON
-
-
 def reset_cancel() -> None:
     """Reset cancellation state for a new task."""
     global _CANCEL_REASON, _SIGINT_COUNT  # noqa: PLW0603
