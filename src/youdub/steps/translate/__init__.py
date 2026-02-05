@@ -218,13 +218,40 @@ def _merge_parts_to_count(parts: list[str], target_count: int) -> list[str]:
     if len(cleaned) < target_count:
         return cleaned + [""] * (target_count - len(cleaned))
 
-    n = len(cleaned)
-    out: list[str] = []
-    for i in range(target_count):
-        a = i * n // target_count
-        b = (i + 1) * n // target_count
-        out.append(" ".join(cleaned[a:b]).strip())
-    return out
+    # When we have MORE parts than needed, we must merge. A naive uniform partition tends to
+    # misalign bilingual subtitles because source/target sentence boundaries don't match.
+    #
+    # Heuristic: merge the SHORTEST piece first (e.g. "Hmm.", "Yeah.", "OK."), attaching it
+    # to a neighbor. This avoids leaving tiny fragments as standalone cues.
+    merged = list(cleaned)
+    while len(merged) > target_count:
+        i = min(range(len(merged)), key=lambda k: len(merged[k]))
+        if len(merged) <= 1:
+            break
+
+        if i <= 0:
+            merged[0] = f"{merged[0]} {merged[1]}".strip()
+            del merged[1]
+            continue
+        if i >= len(merged) - 1:
+            merged[-2] = f"{merged[-2]} {merged[-1]}".strip()
+            del merged[-1]
+            continue
+
+        left_len = len(merged[i - 1])
+        right_len = len(merged[i + 1])
+        if right_len <= left_len:
+            merged[i] = f"{merged[i]} {merged[i + 1]}".strip()
+            del merged[i + 1]
+        else:
+            merged[i - 1] = f"{merged[i - 1]} {merged[i]}".strip()
+            del merged[i]
+
+    if len(merged) == target_count:
+        return merged
+    if len(merged) < target_count:
+        return merged + [""] * (target_count - len(merged))
+    return merged[:target_count]
 
 
 def _split_words_to_count(text: str, target_count: int) -> list[str]:
