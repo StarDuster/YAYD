@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from ..config import Settings
 from ..models import ModelManager
 
 
-def ensure_assets(settings: Settings, model_manager: ModelManager, *, require_diarization: bool) -> None:
+def ensure_assets(model_manager: ModelManager, *, require_diarization: bool) -> None:
     """
     Ensure required model assets exist in offline mode.
 

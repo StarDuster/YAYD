@@ -43,7 +43,7 @@ def _import_demucs_infer() -> tuple[Any, Any]:
     return get_model, apply_model
 
 
-def _ensure_demucs_ready(settings: Settings, model_manager: ModelManager) -> None:
+def _ensure_demucs_ready(model_manager: ModelManager) -> None:
     model_manager.enforce_offline()
     model_manager.ensure_ready(names=[model_manager._demucs_requirement().name])
 
@@ -64,15 +64,13 @@ def init_demucs(settings: Settings | None = None, model_manager: ModelManager | 
     """Pre-load the Demucs model."""
     settings = settings or Settings()
     model_manager = model_manager or ModelManager(settings)
-    _ensure_demucs_ready(settings, model_manager)
+    _ensure_demucs_ready(model_manager)
     load_model(settings.demucs_model_name, settings.demucs_device, settings=settings, model_manager=model_manager)
 
 
 def load_model(
     model_name: str = "htdemucs_ft",
     device: str = "auto",
-    progress: bool = True,  # kept for API compatibility
-    shifts: int = 5,  # kept for API compatibility
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
 ) -> Any:
@@ -147,11 +145,11 @@ def separate_audio(
     
     settings = settings or Settings()
     model_manager = model_manager or ModelManager(settings)
-    _ensure_demucs_ready(settings, model_manager)
+    _ensure_demucs_ready(model_manager)
 
     logger.info(f"开始分离音频: {folder}")
 
-    model = load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
+    model = load_model(model_name, device, settings=settings, model_manager=model_manager)
     _, apply_model = _import_demucs_infer()
 
     target_device = _AUTO_DEVICE if device == "auto" else device
@@ -350,8 +348,8 @@ def separate_all_audio_under_folder(
         logger.info(msg)
         return msg
 
-    _ensure_demucs_ready(settings, model_manager)
-    load_model(model_name, device, progress, shifts, settings=settings, model_manager=model_manager)
+    _ensure_demucs_ready(model_manager)
+    load_model(model_name, device, settings=settings, model_manager=model_manager)
 
     count = 0
     for subdir in pending:

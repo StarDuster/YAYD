@@ -143,7 +143,7 @@ def load_asr_model(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
-    ensure_assets(settings, model_manager, require_diarization=False)
+    ensure_assets(model_manager, require_diarization=False)
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -225,7 +225,7 @@ def load_qwen_asr_model(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
-    ensure_assets(settings, model_manager, require_diarization=False)
+    ensure_assets(model_manager, require_diarization=False)
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -346,7 +346,7 @@ def load_diarize_model(
     settings = settings or _DEFAULT_SETTINGS
     model_manager = model_manager or _DEFAULT_MODEL_MANAGER
 
-    ensure_assets(settings, model_manager, require_diarization=True)
+    ensure_assets(model_manager, require_diarization=True)
 
     _patch_torchaudio_backend_compat()
 

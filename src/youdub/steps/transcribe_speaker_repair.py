@@ -108,7 +108,7 @@ def _load_embedding_inference(
 
     # Ensure diarization assets are ready (offline). Embedding model shares the same cache dir.
     try:
-        ensure_assets(settings, model_manager, require_diarization=True)
+        ensure_assets(model_manager, require_diarization=True)
     except Exception:
         # Best-effort; proceed anyway.
         pass
