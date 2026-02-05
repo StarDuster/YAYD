@@ -590,13 +590,12 @@ def _bilingual_source_text(
         clauses = [c.strip() for c in _split_source_text_relaxed(sent) if str(c).strip()]
         grouped = _group_clauses_evenly(clauses, target_count)
         if grouped:
-            # Keep as a single paragraph; actual line wrapping is handled later by `wrap_text`.
-            # Injecting newlines here often causes double-wrapping (6+ lines with very short lines).
-            rendered.append(" ".join(grouped).strip())
+            # Inject explicit newlines between clause groups to keep long source sentences readable.
+            rendered.append("\n".join(grouped).strip())
             continue
 
         # Fallback: word-based even split (guarantees count).
-        rendered.append(" ".join([p for p in _split_words_to_count(sent, target_count) if p.strip()]).strip())
+        rendered.append("\n".join([p for p in _split_words_to_count(sent, target_count) if p.strip()]).strip())
 
     return " ".join([x for x in rendered if x]).strip()
 
