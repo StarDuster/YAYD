@@ -77,7 +77,7 @@ def load_model(
     global _DEMUCS_MODEL, _DEMUCS_MODEL_NAME, _DEMUCS_DEVICE
 
     if settings and model_manager:
-        _ensure_demucs_ready(settings, model_manager)
+        _ensure_demucs_ready(model_manager)
         _set_torch_hub_dir(settings)
 
     target_device = _AUTO_DEVICE if device == "auto" else device
