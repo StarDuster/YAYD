@@ -1229,50 +1229,80 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
         # If transcript speaker labels were refreshed (e.g. re-diarization),
         # update speaker fields in existing translations without re-translating.
         transcript_path = os.path.join(folder, "transcript.json")
-        if os.path.exists(translation_raw_path) and os.path.exists(transcript_path):
-            try:
-                with open(transcript_path, "r", encoding="utf-8") as f:
-                    src = json.load(f)
-                with open(translation_raw_path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
+        if os.path.exists(transcript_path):
+            if os.path.exists(translation_raw_path):
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as f:
+                        src = json.load(f)
+                    with open(translation_raw_path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
 
-                if not isinstance(src, list) or not isinstance(raw, list):
-                    # Extremely defensive: unexpected types -> retranslate.
-                    translation_ok = False
-                    logger.warning(
-                        f"检测到转录/翻译格式异常，将重新翻译: {folder} "
-                        f"(transcript_type={type(src).__name__}, translation_raw_type={type(raw).__name__})"
-                    )
-                elif len(src) != len(raw):
-                    # When transcript segmentation/text changed, existing translation is invalid.
-                    translation_ok = False
-                    logger.warning(
-                        f"检测到转录与对轴前翻译分段数量不一致，将重新翻译: {folder} "
-                        f"(transcript={len(src)}, translation_raw={len(raw)})"
-                    )
-                else:
-                    # Length matches: only sync speakers when transcript is newer.
-                    try:
-                        tr_mtime = os.path.getmtime(transcript_path)
-                        raw_mtime = os.path.getmtime(translation_raw_path)
-                    except Exception:
-                        tr_mtime = 0.0
-                        raw_mtime = 0.0
+                    if not isinstance(src, list) or not isinstance(raw, list):
+                        # Extremely defensive: unexpected types -> retranslate.
+                        translation_ok = False
+                        logger.warning(
+                            f"检测到转录/翻译格式异常，将重新翻译: {folder} "
+                            f"(transcript_type={type(src).__name__}, translation_raw_type={type(raw).__name__})"
+                        )
+                    elif len(src) != len(raw):
+                        # When transcript segmentation/text changed, existing translation is invalid.
+                        translation_ok = False
+                        logger.warning(
+                            f"检测到转录与对轴前翻译分段数量不一致，将重新翻译: {folder} "
+                            f"(transcript={len(src)}, translation_raw={len(raw)})"
+                        )
+                    else:
+                        # Length matches: only sync speakers when transcript is newer.
+                        try:
+                            tr_mtime = os.path.getmtime(transcript_path)
+                            raw_mtime = os.path.getmtime(translation_raw_path)
+                        except Exception:
+                            tr_mtime = 0.0
+                            raw_mtime = 0.0
 
-                    if tr_mtime > raw_mtime:
-                        for i in range(len(raw)):
-                            if isinstance(raw[i], dict) and isinstance(src[i], dict):
-                                raw[i]["speaker"] = src[i].get("speaker", raw[i].get("speaker", "SPEAKER_00"))
-                        with open(translation_raw_path, "w", encoding="utf-8") as f:
-                            json.dump(raw, f, indent=2, ensure_ascii=False)
-                        # Rebuild split translation.json so downstream TTS/video sees updated speakers.
-                        with open(translation_path, "w", encoding="utf-8") as f:
-                            json.dump(split_sentences(raw), f, indent=2, ensure_ascii=False)
-                        logger.info(f"检测到转录已更新，已同步翻译说话人标签: {folder}")
-            except Exception as exc:  # pylint: disable=broad-except
-                # 如果连文件都读不了，保守起见重翻译
-                translation_ok = False
-                logger.warning(f"读取转录/翻译文件失败，将重新翻译: {folder} ({exc})")
+                        if tr_mtime > raw_mtime:
+                            for i in range(len(raw)):
+                                if isinstance(raw[i], dict) and isinstance(src[i], dict):
+                                    raw[i]["speaker"] = src[i].get("speaker", raw[i].get("speaker", "SPEAKER_00"))
+                            with open(translation_raw_path, "w", encoding="utf-8") as f:
+                                json.dump(raw, f, indent=2, ensure_ascii=False)
+                            # Rebuild split translation.json so downstream TTS/video sees updated speakers.
+                            with open(translation_path, "w", encoding="utf-8") as f:
+                                json.dump(split_sentences(raw), f, indent=2, ensure_ascii=False)
+                            logger.info(f"检测到转录已更新，已同步翻译说话人标签: {folder}")
+                except Exception as exc:  # pylint: disable=broad-except
+                    # 如果连文件都读不了，保守起见重翻译
+                    translation_ok = False
+                    logger.warning(f"读取转录/翻译文件失败，将重新翻译: {folder} ({exc})")
+            else:
+                # translation_raw.json 缺失时，仍可在分段数量一致时同步 translation.json 的 speaker 字段，
+                # 避免仅“刷新说话人标签”也被迫重翻译（且单测场景可能缺少 download.info.json）。
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as f:
+                        src = json.load(f)
+                    if isinstance(src, list) and isinstance(existing, list) and len(src) == len(existing):
+                        try:
+                            tr_mtime = os.path.getmtime(transcript_path)
+                            tl_mtime = os.path.getmtime(translation_path)
+                        except Exception:
+                            tr_mtime = 0.0
+                            tl_mtime = 0.0
+
+                        if tr_mtime > tl_mtime:
+                            changed = False
+                            for i in range(len(existing)):
+                                if isinstance(existing[i], dict) and isinstance(src[i], dict):
+                                    spk = src[i].get("speaker", None)
+                                    if spk is not None and existing[i].get("speaker") != spk:
+                                        existing[i]["speaker"] = spk
+                                        changed = True
+                            if changed:
+                                with open(translation_path, "w", encoding="utf-8") as f:
+                                    json.dump(existing, f, indent=2, ensure_ascii=False)
+                                logger.info(f"检测到转录已更新，已同步 translation.json 说话人标签: {folder}")
+                except Exception:
+                    # Best-effort only; keep the existing translations.
+                    pass
 
         # If transcript changed in a way that invalidates existing translation, re-run translation below.
         if not translation_ok:
