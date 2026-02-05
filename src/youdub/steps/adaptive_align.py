@@ -127,7 +127,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
     align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
     en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
     zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
-    budget_weight = _read_env_float("SPEECH_RATE_BUDGET_WEIGHT", 0.7)
     audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
 
     # Global bias to avoid overall pacing drift.
@@ -316,7 +315,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                         en_stats_used,
                         zh_stats,
                         mode=align_mode,
-                        budget_weight=float(budget_weight),
                         voice_min=voice_min,
                         voice_max=voice_max,
                         silence_min=silence_min,
