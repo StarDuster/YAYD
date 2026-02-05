@@ -368,8 +368,10 @@ def load_diarize_model(
 
     # Optional: allow users to tune diarization hyperparameters without code changes.
     # These names intentionally match pipeline.parameters() keys:
+    # - segmentation.threshold
     # - segmentation.min_duration_off
     # - clustering.threshold
+    seg_thr = _read_float_env("PYANNOTE_SEGMENTATION_THRESHOLD")
     seg_min_off = _read_float_env("PYANNOTE_SEGMENTATION_MIN_DURATION_OFF")
     clust_thr = _read_float_env("PYANNOTE_CLUSTERING_THRESHOLD")
 
@@ -378,6 +380,7 @@ def load_diarize_model(
     cache_dir = diar_dir_str or None
     key = (
         f"{device}|{diar_dir_str}|{_PYANNOTE_DIARIZATION_MODEL_ID}"
+        f"|seg_thr={seg_thr if seg_thr is not None else 'default'}"
         f"|seg_min_off={seg_min_off if seg_min_off is not None else 'default'}"
         f"|clust_thr={clust_thr if clust_thr is not None else 'default'}"
     )
@@ -424,8 +427,10 @@ def load_diarize_model(
 
     pipeline.to(torch.device(device))
     # Apply user-provided hyperparameters (best-effort).
-    if seg_min_off is not None or clust_thr is not None:
+    if seg_thr is not None or seg_min_off is not None or clust_thr is not None:
         params: dict[str, dict[str, float]] = {}
+        if seg_thr is not None:
+            params.setdefault("segmentation", {})["threshold"] = float(seg_thr)
         if seg_min_off is not None:
             params.setdefault("segmentation", {})["min_duration_off"] = float(seg_min_off)
         if clust_thr is not None:

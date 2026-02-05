@@ -432,6 +432,21 @@ def _temp_env(updates: dict[str, str | None]):
                 os.environ[k] = v
 
 
+def _opt_env_str(v: Any) -> str | None:
+    s = str(v or "").strip()
+    return s or None
+
+
+def _opt_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        i = int(v)
+    except Exception:
+        return None
+    return i if i > 0 else None
+
+
 def run_pipeline(
     root_folder,
     url,
@@ -452,6 +467,9 @@ def run_pipeline(
     whisper_diarization,
     whisper_min_speakers,
     whisper_max_speakers,
+    pyannote_segmentation_threshold,
+    pyannote_segmentation_min_duration_off,
+    pyannote_clustering_threshold,
     translation_target_language,
     translation_strategy,
     translation_max_concurrency,
@@ -470,8 +488,16 @@ def run_pipeline(
     auto_upload_video,
 ):
     try:
-        wct = str(whisper_compute_type or "").strip()
-        wct_env = wct or None
+        wct_env = _opt_env_str(whisper_compute_type)
+        seg_thr_env = _opt_env_str(pyannote_segmentation_threshold)
+        seg_min_off_env = _opt_env_str(pyannote_segmentation_min_duration_off)
+        clust_thr_env = _opt_env_str(pyannote_clustering_threshold)
+
+        mn = _opt_int(whisper_min_speakers)
+        mx = _opt_int(whisper_max_speakers)
+        if mn is not None and mx is not None and mx < mn:
+            return f"参数错误：最多说话人数({mx}) 小于最少说话人数({mn})"
+
         with _temp_env(
             {
                 "TRANSLATION_STRATEGY": translation_strategy,
@@ -479,6 +505,9 @@ def run_pipeline(
                 "TRANSLATION_CHUNK_SIZE": str(int(translation_chunk_size)),
                 "TRANSLATION_GUIDE_MAX_CHARS": str(int(translation_guide_max_chars)),
                 "WHISPER_COMPUTE_TYPE": wct_env,
+                "PYANNOTE_SEGMENTATION_THRESHOLD": seg_thr_env,
+                "PYANNOTE_SEGMENTATION_MIN_DURATION_OFF": seg_min_off_env,
+                "PYANNOTE_CLUSTERING_THRESHOLD": clust_thr_env,
             }
         ):
             return pipeline.run(
@@ -498,8 +527,8 @@ def run_pipeline(
                 qwen_asr_num_threads=qwen_asr_num_threads,
                 qwen_asr_vad_segment_threshold=qwen_asr_vad_segment_threshold,
                 whisper_diarization=whisper_diarization,
-                whisper_min_speakers=whisper_min_speakers,
-                whisper_max_speakers=whisper_max_speakers,
+                whisper_min_speakers=mn,
+                whisper_max_speakers=mx,
                 translation_target_language=translation_target_language,
                 tts_method=tts_method,
                 qwen_tts_batch_size=qwen_tts_batch_size,
@@ -721,6 +750,9 @@ def _pipeline_asr_visibility(asr_method):
         gr.update(visible=is_whisper),  # diarization
         gr.update(visible=is_whisper),  # min_speakers
         gr.update(visible=is_whisper),  # max_speakers
+        gr.update(visible=is_whisper),  # pyannote_seg_thr
+        gr.update(visible=is_whisper),  # pyannote_seg_min_off
+        gr.update(visible=is_whisper),  # pyannote_clust_thr
     )
 
 with gr.Blocks(title="全自动") as do_everything_interface:
@@ -815,6 +847,25 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             value=None, step=1, precision=0,
             visible=(settings.asr_method == "whisper"),
         )
+        gr.Markdown("#### 说话人分离（高级参数，可选）")
+        pipeline_pyannote_segmentation_threshold = gr.Textbox(
+            label="segmentation.threshold（可选）",
+            value="",
+            placeholder="留空=默认，例如 0.5",
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_pyannote_segmentation_min_duration_off = gr.Textbox(
+            label="segmentation.min_duration_off（秒，可选）",
+            value="",
+            placeholder="留空=默认，例如 0.5",
+            visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_pyannote_clustering_threshold = gr.Textbox(
+            label="clustering.threshold（可选）",
+            value="",
+            placeholder="留空=默认，例如 0.7",
+            visible=(settings.asr_method == "whisper"),
+        )
 
         # 翻译设置
         gr.Markdown("### 翻译")
@@ -882,6 +933,9 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             pipeline_diarization,
             pipeline_min_speakers,
             pipeline_max_speakers,
+            pipeline_pyannote_segmentation_threshold,
+            pipeline_pyannote_segmentation_min_duration_off,
+            pipeline_pyannote_clustering_threshold,
         ],
     )
 
@@ -908,6 +962,9 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             pipeline_diarization,
             pipeline_min_speakers,
             pipeline_max_speakers,
+            pipeline_pyannote_segmentation_threshold,
+            pipeline_pyannote_segmentation_min_duration_off,
+            pipeline_pyannote_clustering_threshold,
             translation_target_language_input,
             translation_strategy_input,
             translation_max_concurrency_input,
@@ -1000,16 +1057,48 @@ with gr.Blocks(title="人声分离") as demucs_interface:
     )
     demucs_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
-def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device, whisper_compute_type, batch_size, qwen_threads, qwen_vad, diarization, min_speakers, max_speakers):
+def _run_transcribe(
+    folder,
+    asr_method,
+    qwen_model_dir,
+    model,
+    cpu_model,
+    device,
+    whisper_compute_type,
+    batch_size,
+    qwen_threads,
+    qwen_vad,
+    diarization,
+    min_speakers,
+    max_speakers,
+    pyannote_segmentation_threshold,
+    pyannote_segmentation_min_duration_off,
+    pyannote_clustering_threshold,
+):
     # Determine required models based on ASR method
     names = []
     if asr_method == "qwen":
         names.append(model_manager._qwen_asr_requirement().name)  # type: ignore[attr-defined]
     if diarization:
         names.append(model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
-    wct = str(whisper_compute_type or "").strip()
-    wct_env = wct or None
-    with _temp_env({"WHISPER_COMPUTE_TYPE": wct_env}):
+    wct_env = _opt_env_str(whisper_compute_type)
+    seg_thr_env = _opt_env_str(pyannote_segmentation_threshold)
+    seg_min_off_env = _opt_env_str(pyannote_segmentation_min_duration_off)
+    clust_thr_env = _opt_env_str(pyannote_clustering_threshold)
+
+    mn = _opt_int(min_speakers)
+    mx = _opt_int(max_speakers)
+    if mn is not None and mx is not None and mx < mn:
+        return f"参数错误：最多说话人数({mx}) 小于最少说话人数({mn})"
+
+    with _temp_env(
+        {
+            "WHISPER_COMPUTE_TYPE": wct_env,
+            "PYANNOTE_SEGMENTATION_THRESHOLD": seg_thr_env,
+            "PYANNOTE_SEGMENTATION_MIN_DURATION_OFF": seg_min_off_env,
+            "PYANNOTE_CLUSTERING_THRESHOLD": clust_thr_env,
+        }
+    ):
         return _safe_run(
             names,
             transcribe_all_audio_under_folder,
@@ -1019,8 +1108,8 @@ def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device
             device=device,
             batch_size=batch_size,
             diarization=diarization,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
+            min_speakers=mn,
+            max_speakers=mx,
             settings=settings,
             model_manager=model_manager,
             asr_method=asr_method,
@@ -1045,6 +1134,9 @@ def _asr_visibility(asr_method):
         gr.update(visible=is_whisper),  # diarization
         gr.update(visible=is_whisper),  # min_speakers
         gr.update(visible=is_whisper),  # max_speakers
+        gr.update(visible=is_whisper),  # pyannote_seg_thr
+        gr.update(visible=is_whisper),  # pyannote_seg_min_off
+        gr.update(visible=is_whisper),  # pyannote_clust_thr
     )
 
 with gr.Blocks(title="语音识别") as whisper_inference:
@@ -1117,6 +1209,25 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             value=None, step=1, precision=0,
             visible=(settings.asr_method == "whisper"),
         )
+        gr.Markdown("#### 说话人分离（高级参数，可选）")
+        pyannote_segmentation_threshold_input = gr.Textbox(
+            label="segmentation.threshold（可选）",
+            value="",
+            placeholder="留空=默认，例如 0.5",
+            visible=(settings.asr_method == "whisper"),
+        )
+        pyannote_segmentation_min_duration_off_input = gr.Textbox(
+            label="segmentation.min_duration_off（秒，可选）",
+            value="",
+            placeholder="留空=默认，例如 0.5",
+            visible=(settings.asr_method == "whisper"),
+        )
+        pyannote_clustering_threshold_input = gr.Textbox(
+            label="clustering.threshold（可选）",
+            value="",
+            placeholder="留空=默认，例如 0.7",
+            visible=(settings.asr_method == "whisper"),
+        )
 
         output_box = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
 
@@ -1141,6 +1252,9 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             diarization_input,
             min_speakers_input,
             max_speakers_input,
+            pyannote_segmentation_threshold_input,
+            pyannote_segmentation_min_duration_off_input,
+            pyannote_clustering_threshold_input,
         ],
     )
 
@@ -1161,6 +1275,9 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             diarization_input,
             min_speakers_input,
             max_speakers_input,
+            pyannote_segmentation_threshold_input,
+            pyannote_segmentation_min_duration_off_input,
+            pyannote_clustering_threshold_input,
         ],
         outputs=output_box,
         **_INTERFACE_STREAM_KWARGS,
