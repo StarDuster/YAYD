@@ -7,6 +7,7 @@ import time
 import queue
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
 import gradio as gr
@@ -734,19 +735,19 @@ def download_models(selected_models: list[str], hf_token: str):
                 os.environ.pop(var, None)
 
 
-def _pipeline_asr_visibility(asr_method):
-    """全自动页面：根据 ASR 方法返回各组件的可见性。"""
+def _asr_visibility(asr_method):
+    """根据 ASR 方法返回各组件的可见性（全自动页 / 语音识别页共用）。"""
     is_whisper = asr_method == "whisper"
     is_qwen = asr_method == "qwen"
     return (
-        gr.update(visible=is_qwen),   # qwen_asr_model_dir
+        gr.update(visible=is_qwen),  # qwen_asr_model_dir
         gr.update(visible=is_whisper),  # whisper_model
         gr.update(visible=is_whisper),  # whisper_device
         gr.update(visible=is_whisper),  # whisper_cpu_model
         gr.update(visible=is_whisper),  # whisper_compute_type
         gr.update(visible=is_whisper),  # whisper_batch_size
-        gr.update(visible=is_qwen),   # qwen_threads
-        gr.update(visible=is_qwen),   # qwen_vad
+        gr.update(visible=is_qwen),  # qwen_threads
+        gr.update(visible=is_qwen),  # qwen_vad
         gr.update(visible=True),  # diarization (independent of ASR engine)
         gr.update(visible=True),  # min_speakers
         gr.update(visible=True),  # max_speakers
@@ -754,6 +755,178 @@ def _pipeline_asr_visibility(asr_method):
         gr.update(visible=True),  # pyannote_seg_min_off
         gr.update(visible=True),  # pyannote_clust_thr
     )
+
+
+@dataclass
+class _AsrUi:
+    """Reusable ASR/diarization UI controls (avoid parameter drift across pages)."""
+
+    method: Any
+    qwen_model_dir: Any
+    whisper_model: Any
+    whisper_device: Any
+    whisper_cpu_model: Any
+    whisper_compute_type: Any
+    whisper_batch_size: Any
+    qwen_threads: Any
+    qwen_vad: Any
+    diarization: Any
+    min_speakers: Any
+    max_speakers: Any
+    pyannote_segmentation_threshold: Any
+    pyannote_segmentation_min_duration_off: Any
+    pyannote_clustering_threshold: Any
+
+    def visibility_outputs(self) -> list[Any]:
+        # Must match `_asr_visibility()` return order.
+        return [
+            self.qwen_model_dir,
+            self.whisper_model,
+            self.whisper_device,
+            self.whisper_cpu_model,
+            self.whisper_compute_type,
+            self.whisper_batch_size,
+            self.qwen_threads,
+            self.qwen_vad,
+            self.diarization,
+            self.min_speakers,
+            self.max_speakers,
+            self.pyannote_segmentation_threshold,
+            self.pyannote_segmentation_min_duration_off,
+            self.pyannote_clustering_threshold,
+        ]
+
+    def inputs(self) -> list[Any]:
+        """Inputs order shared by `run_pipeline` and `_run_transcribe`."""
+        return [
+            self.method,
+            self.qwen_model_dir,
+            self.whisper_model,
+            self.whisper_device,
+            self.whisper_cpu_model,
+            self.whisper_compute_type,
+            self.whisper_batch_size,
+            self.qwen_threads,
+            self.qwen_vad,
+            self.diarization,
+            self.min_speakers,
+            self.max_speakers,
+            self.pyannote_segmentation_threshold,
+            self.pyannote_segmentation_min_duration_off,
+            self.pyannote_clustering_threshold,
+        ]
+
+
+def _build_asr_ui(*, settings: Settings, value: str | None = None) -> _AsrUi:
+    """Create ASR controls used by multiple pages."""
+    method_value = (value or getattr(settings, "asr_method", None) or "whisper").strip().lower()
+    if method_value not in {"whisper", "qwen"}:
+        method_value = "whisper"
+
+    is_whisper = method_value == "whisper"
+    is_qwen = method_value == "qwen"
+
+    method = gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=method_value)
+
+    # Qwen ASR
+    qwen_model_dir = gr.Textbox(
+        label="Qwen3-ASR 模型路径",
+        value=str(settings.qwen_asr_model_path or ""),
+        visible=is_qwen,
+    )
+    qwen_threads = gr.Slider(
+        minimum=1,
+        maximum=16,
+        step=1,
+        label="Qwen3-ASR 并发线程数",
+        value=settings.qwen_asr_num_threads,
+        visible=is_qwen,
+    )
+    qwen_vad = gr.Slider(
+        minimum=30,
+        maximum=180,
+        step=10,
+        label="Qwen3-ASR VAD分段时长(秒)",
+        value=settings.qwen_asr_vad_segment_threshold,
+        visible=is_qwen,
+    )
+
+    # Whisper
+    whisper_model = gr.Textbox(
+        label="Whisper 模型路径",
+        value=str(settings.whisper_model_path),
+        visible=is_whisper,
+    )
+    whisper_device = gr.Radio(
+        _DEVICE_CHOICES,
+        label="Whisper 运行设备",
+        value=settings.whisper_device,
+        visible=is_whisper,
+    )
+    whisper_cpu_model = gr.Textbox(
+        label="Whisper CPU 模型路径（可选）",
+        value=str(settings.whisper_cpu_model_path or ""),
+        visible=is_whisper,
+    )
+    whisper_compute_type = gr.Dropdown(
+        choices=[("默认(自动)", ""), "float16", "int8", "int8_float16", "float32"],
+        label="Whisper compute_type（可选）",
+        value="",
+        visible=is_whisper,
+        info="留空=自动：CUDA 默认 float16，CPU 默认 int8。",
+    )
+    whisper_batch_size = gr.Slider(
+        minimum=1,
+        maximum=128,
+        step=1,
+        label="Whisper 批大小",
+        value=settings.whisper_batch_size,
+        visible=is_whisper,
+    )
+
+    # Diarization (independent of ASR engine)
+    diarization = gr.Checkbox(label="说话人分离", value=False, visible=True)
+    min_speakers = gr.Number(label="最少说话人数（可选）", value=None, step=1, precision=0, visible=True)
+    max_speakers = gr.Number(label="最多说话人数（可选）", value=None, step=1, precision=0, visible=True)
+
+    gr.Markdown("#### 说话人分离（高级参数，可选）")
+    pyannote_segmentation_threshold = gr.Textbox(
+        label="segmentation.threshold（可选）",
+        value="",
+        placeholder="留空=默认，例如 0.5",
+        visible=True,
+    )
+    pyannote_segmentation_min_duration_off = gr.Textbox(
+        label="segmentation.min_duration_off（秒，可选）",
+        value="",
+        placeholder="留空=默认，例如 0.5",
+        visible=True,
+    )
+    pyannote_clustering_threshold = gr.Textbox(
+        label="clustering.threshold（可选）",
+        value="",
+        placeholder="留空=默认，例如 0.7",
+        visible=True,
+    )
+
+    return _AsrUi(
+        method=method,
+        qwen_model_dir=qwen_model_dir,
+        whisper_model=whisper_model,
+        whisper_device=whisper_device,
+        whisper_cpu_model=whisper_cpu_model,
+        whisper_compute_type=whisper_compute_type,
+        whisper_batch_size=whisper_batch_size,
+        qwen_threads=qwen_threads,
+        qwen_vad=qwen_vad,
+        diarization=diarization,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        pyannote_segmentation_threshold=pyannote_segmentation_threshold,
+        pyannote_segmentation_min_duration_off=pyannote_segmentation_min_duration_off,
+        pyannote_clustering_threshold=pyannote_clustering_threshold,
+    )
+
 
 with gr.Blocks(title="全自动") as do_everything_interface:
     gr.Markdown("## 全自动")
@@ -781,91 +954,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
 
         # ASR 设置
         gr.Markdown("### 语音识别")
-        pipeline_asr_method_input = gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method)
-
-        # Qwen ASR 设置
-        pipeline_qwen_asr_model_dir = gr.Textbox(
-            label="Qwen3-ASR 模型路径",
-            value=str(settings.qwen_asr_model_path or ""),
-            visible=(settings.asr_method == "qwen"),
-        )
-        pipeline_qwen_asr_threads = gr.Slider(
-            minimum=1, maximum=16, step=1,
-            label="Qwen3-ASR 并发线程数",
-            value=settings.qwen_asr_num_threads,
-            visible=(settings.asr_method == "qwen"),
-        )
-        pipeline_qwen_asr_vad = gr.Slider(
-            minimum=30, maximum=180, step=10,
-            label="Qwen3-ASR VAD分段时长(秒)",
-            value=settings.qwen_asr_vad_segment_threshold,
-            visible=(settings.asr_method == "qwen"),
-        )
-
-        # Whisper 设置
-        pipeline_whisper_model = gr.Textbox(
-            label="Whisper 模型路径",
-            value=str(settings.whisper_model_path),
-            visible=(settings.asr_method == "whisper"),
-        )
-        pipeline_whisper_device = gr.Radio(
-            _DEVICE_CHOICES,
-            label="Whisper 运行设备",
-            value=settings.whisper_device,
-            visible=(settings.asr_method == "whisper"),
-        )
-        pipeline_whisper_cpu_model = gr.Textbox(
-            label="Whisper CPU 模型路径（可选）",
-            value=str(settings.whisper_cpu_model_path or ""),
-            visible=(settings.asr_method == "whisper"),
-        )
-        pipeline_whisper_compute_type = gr.Dropdown(
-            choices=[("默认(自动)", ""), "float16", "int8", "int8_float16", "float32"],
-            label="Whisper compute_type（可选）",
-            value="",
-            visible=(settings.asr_method == "whisper"),
-            info="留空=自动：CUDA 默认 float16，CPU 默认 int8。",
-        )
-        pipeline_whisper_batch_size = gr.Slider(
-            minimum=1, maximum=128, step=1,
-            label="Whisper 批大小",
-            value=settings.whisper_batch_size,
-            visible=(settings.asr_method == "whisper"),
-        )
-        pipeline_diarization = gr.Checkbox(
-            label="说话人分离",
-            value=False,
-            visible=True,
-        )
-        pipeline_min_speakers = gr.Number(
-            label="最少说话人数（可选）",
-            value=None, step=1, precision=0,
-            visible=True,
-        )
-        pipeline_max_speakers = gr.Number(
-            label="最多说话人数（可选）",
-            value=None, step=1, precision=0,
-            visible=True,
-        )
-        gr.Markdown("#### 说话人分离（高级参数，可选）")
-        pipeline_pyannote_segmentation_threshold = gr.Textbox(
-            label="segmentation.threshold（可选）",
-            value="",
-            placeholder="留空=默认，例如 0.5",
-            visible=True,
-        )
-        pipeline_pyannote_segmentation_min_duration_off = gr.Textbox(
-            label="segmentation.min_duration_off（秒，可选）",
-            value="",
-            placeholder="留空=默认，例如 0.5",
-            visible=True,
-        )
-        pipeline_pyannote_clustering_threshold = gr.Textbox(
-            label="clustering.threshold（可选）",
-            value="",
-            placeholder="留空=默认，例如 0.7",
-            visible=True,
-        )
+        pipeline_asr_ui = _build_asr_ui(settings=settings, value=settings.asr_method)
 
         # 翻译设置
         gr.Markdown("### 翻译")
@@ -918,25 +1007,10 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             gr.ClearButton([pipeline_output], value="清空")
 
     # 动态切换 ASR 设置可见性
-    pipeline_asr_method_input.change(
-        fn=_pipeline_asr_visibility,
-        inputs=[pipeline_asr_method_input],
-        outputs=[
-            pipeline_qwen_asr_model_dir,
-            pipeline_whisper_model,
-            pipeline_whisper_device,
-            pipeline_whisper_cpu_model,
-            pipeline_whisper_compute_type,
-            pipeline_whisper_batch_size,
-            pipeline_qwen_asr_threads,
-            pipeline_qwen_asr_vad,
-            pipeline_diarization,
-            pipeline_min_speakers,
-            pipeline_max_speakers,
-            pipeline_pyannote_segmentation_threshold,
-            pipeline_pyannote_segmentation_min_duration_off,
-            pipeline_pyannote_clustering_threshold,
-        ],
+    pipeline_asr_ui.method.change(
+        fn=_asr_visibility,
+        inputs=[pipeline_asr_ui.method],
+        outputs=pipeline_asr_ui.visibility_outputs(),
     )
 
     # 提交按钮
@@ -950,21 +1024,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             demucs_model_input,
             demucs_device_input,
             demucs_shifts_input,
-            pipeline_asr_method_input,
-            pipeline_qwen_asr_model_dir,
-            pipeline_whisper_model,
-            pipeline_whisper_device,
-            pipeline_whisper_cpu_model,
-            pipeline_whisper_compute_type,
-            pipeline_whisper_batch_size,
-            pipeline_qwen_asr_threads,
-            pipeline_qwen_asr_vad,
-            pipeline_diarization,
-            pipeline_min_speakers,
-            pipeline_max_speakers,
-            pipeline_pyannote_segmentation_threshold,
-            pipeline_pyannote_segmentation_min_duration_off,
-            pipeline_pyannote_clustering_threshold,
+            *pipeline_asr_ui.inputs(),
             translation_target_language_input,
             translation_strategy_input,
             translation_max_concurrency_input,
@@ -1061,11 +1121,11 @@ def _run_transcribe(
     folder,
     asr_method,
     qwen_model_dir,
-    model,
-    cpu_model,
-    device,
+    whisper_model,
+    whisper_device,
+    whisper_cpu_model,
     whisper_compute_type,
-    batch_size,
+    whisper_batch_size,
     qwen_threads,
     qwen_vad,
     diarization,
@@ -1103,10 +1163,10 @@ def _run_transcribe(
             names,
             transcribe_all_audio_under_folder,
             folder,
-            model_name=model,
-            cpu_model_name=cpu_model,
-            device=device,
-            batch_size=batch_size,
+            model_name=whisper_model,
+            cpu_model_name=whisper_cpu_model,
+            device=whisper_device,
+            batch_size=whisper_batch_size,
             diarization=diarization,
             min_speakers=mn,
             max_speakers=mx,
@@ -1118,116 +1178,11 @@ def _run_transcribe(
             qwen_asr_vad_segment_threshold=qwen_vad,
         )
 
-def _asr_visibility(asr_method):
-    """根据 ASR 方法返回各组件的可见性。"""
-    is_whisper = asr_method == "whisper"
-    is_qwen = asr_method == "qwen"
-    return (
-        gr.update(visible=is_qwen),   # qwen_model_dir
-        gr.update(visible=is_whisper),  # whisper_model
-        gr.update(visible=is_whisper),  # whisper_cpu_model
-        gr.update(visible=is_whisper),  # whisper_device
-        gr.update(visible=is_whisper),  # whisper_compute_type
-        gr.update(visible=is_whisper),  # whisper_batch_size
-        gr.update(visible=is_qwen),   # qwen_threads
-        gr.update(visible=is_qwen),   # qwen_vad
-        gr.update(visible=True),  # diarization (independent of ASR engine)
-        gr.update(visible=True),  # min_speakers
-        gr.update(visible=True),  # max_speakers
-        gr.update(visible=True),  # pyannote_seg_thr
-        gr.update(visible=True),  # pyannote_seg_min_off
-        gr.update(visible=True),  # pyannote_clust_thr
-    )
-
 with gr.Blocks(title="语音识别") as whisper_inference:
     gr.Markdown("## 语音识别")
     with gr.Column():
         folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
-        asr_method_input = gr.Dropdown(_ASR_METHOD_CHOICES, label="语音识别方式", value=settings.asr_method)
-
-        # Qwen ASR 设置
-        qwen_model_dir_input = gr.Textbox(
-            label="Qwen3-ASR 模型路径",
-            value=str(settings.qwen_asr_model_path or ""),
-            visible=(settings.asr_method == "qwen"),
-        )
-        qwen_threads_input = gr.Slider(
-            minimum=1, maximum=16, step=1,
-            label="Qwen3-ASR 并发线程数",
-            value=settings.qwen_asr_num_threads,
-            visible=(settings.asr_method == "qwen"),
-        )
-        qwen_vad_input = gr.Slider(
-            minimum=30, maximum=180, step=10,
-            label="Qwen3-ASR VAD分段时长(秒)",
-            value=settings.qwen_asr_vad_segment_threshold,
-            visible=(settings.asr_method == "qwen"),
-        )
-
-        # Whisper 设置
-        whisper_model_input = gr.Textbox(
-            label="Whisper 模型路径",
-            value=str(settings.whisper_model_path),
-            visible=(settings.asr_method == "whisper"),
-        )
-        whisper_cpu_model_input = gr.Textbox(
-            label="Whisper CPU 模型路径（可选）",
-            value=str(settings.whisper_cpu_model_path or ""),
-            visible=(settings.asr_method == "whisper"),
-        )
-        whisper_device_input = gr.Radio(
-            _DEVICE_CHOICES,
-            label="Whisper 运行设备",
-            value=settings.whisper_device,
-            visible=(settings.asr_method == "whisper"),
-        )
-        whisper_compute_type_input = gr.Dropdown(
-            choices=[("默认(自动)", ""), "float16", "int8", "int8_float16", "float32"],
-            label="Whisper compute_type（可选）",
-            value="",
-            visible=(settings.asr_method == "whisper"),
-            info="留空=自动：CUDA 默认 float16，CPU 默认 int8。",
-        )
-        whisper_batch_size_input = gr.Slider(
-            minimum=1, maximum=128, step=1,
-            label="Whisper 批大小",
-            value=settings.whisper_batch_size,
-            visible=(settings.asr_method == "whisper"),
-        )
-        diarization_input = gr.Checkbox(
-            label="说话人分离",
-            value=False,
-            visible=True,
-        )
-        min_speakers_input = gr.Number(
-            label="最少说话人数（可选）",
-            value=None, step=1, precision=0,
-            visible=True,
-        )
-        max_speakers_input = gr.Number(
-            label="最多说话人数（可选）",
-            value=None, step=1, precision=0,
-            visible=True,
-        )
-        gr.Markdown("#### 说话人分离（高级参数，可选）")
-        pyannote_segmentation_threshold_input = gr.Textbox(
-            label="segmentation.threshold（可选）",
-            value="",
-            placeholder="留空=默认，例如 0.5",
-            visible=True,
-        )
-        pyannote_segmentation_min_duration_off_input = gr.Textbox(
-            label="segmentation.min_duration_off（秒，可选）",
-            value="",
-            placeholder="留空=默认，例如 0.5",
-            visible=True,
-        )
-        pyannote_clustering_threshold_input = gr.Textbox(
-            label="clustering.threshold（可选）",
-            value="",
-            placeholder="留空=默认，例如 0.7",
-            visible=True,
-        )
+        asr_ui = _build_asr_ui(settings=settings, value=settings.asr_method)
 
         output_box = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
 
@@ -1237,25 +1192,10 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             gr.ClearButton([output_box], value="清空")
 
     # 动态切换可见性
-    asr_method_input.change(
+    asr_ui.method.change(
         fn=_asr_visibility,
-        inputs=[asr_method_input],
-        outputs=[
-            qwen_model_dir_input,
-            whisper_model_input,
-            whisper_cpu_model_input,
-            whisper_device_input,
-            whisper_compute_type_input,
-            whisper_batch_size_input,
-            qwen_threads_input,
-            qwen_vad_input,
-            diarization_input,
-            min_speakers_input,
-            max_speakers_input,
-            pyannote_segmentation_threshold_input,
-            pyannote_segmentation_min_duration_off_input,
-            pyannote_clustering_threshold_input,
-        ],
+        inputs=[asr_ui.method],
+        outputs=asr_ui.visibility_outputs(),
     )
 
     # 提交按钮
@@ -1263,21 +1203,7 @@ with gr.Blocks(title="语音识别") as whisper_inference:
         fn=_streamify(_run_transcribe),
         inputs=[
             folder_input,
-            asr_method_input,
-            qwen_model_dir_input,
-            whisper_model_input,
-            whisper_cpu_model_input,
-            whisper_device_input,
-            whisper_compute_type_input,
-            whisper_batch_size_input,
-            qwen_threads_input,
-            qwen_vad_input,
-            diarization_input,
-            min_speakers_input,
-            max_speakers_input,
-            pyannote_segmentation_threshold_input,
-            pyannote_segmentation_min_duration_off_input,
-            pyannote_clustering_threshold_input,
+            *asr_ui.inputs(),
         ],
         outputs=output_box,
         **_INTERFACE_STREAM_KWARGS,
