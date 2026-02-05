@@ -1,13 +1,15 @@
 """Synthesize speech (TTS) step.
 
 This file is intentionally a small facade to keep the public interface stable.
-Backend-specific details are split into:
-  - `tts_bytedance.py`
-  - `tts_gemini.py`
-  - `tts_qwen_worker.py`
-  - `tts_speaker_ref.py`
-  - `tts_prompt.py`
-  - `tts_wav_guard.py`
+Backend-specific details live under `steps/tts/`:
+  - `bytedance.py`
+  - `gemini.py`
+  - `qwen_worker.py`
+  - `speaker_ref.py`
+  - `prompt.py`
+  - `wav_guard.py`
+
+Compatibility shims keep the old import paths working (e.g. `youdub.steps.tts_gemini`).
 """
 
 from __future__ import annotations
@@ -31,17 +33,17 @@ from ..models import ModelManager
 from ..text_norm_zh import normalize_zh_nsw, should_normalize_zh_nsw
 from ..utils import read_speaker_ref_seconds, save_wav
 
-from . import tts_bytedance as _tts_bytedance
-from . import tts_gemini as _tts_gemini
-from .tts_prompt import _tts_text_for_attempt
-from .tts_qwen_worker import _QwenTtsWorker
-from .tts_speaker_ref import (
+from .tts import bytedance as _tts_bytedance
+from .tts import gemini as _tts_gemini
+from .tts.prompt import _tts_text_for_attempt
+from .tts.qwen_worker import _QwenTtsWorker
+from .tts.speaker_ref import (
     _cap_all_speaker_refs,
     _clear_speaker_voice_mappings_if_refs_updated,
     _ensure_missing_speaker_refs,
     _ensure_speaker_ref_multi,
 )
-from .tts_wav_guard import (
+from .tts.wav_guard import (
     _qwen_resp_duration_seconds,
     _qwen_tts_hit_max_tokens_seconds,
     _qwen_tts_is_degenerate_hit_cap,
