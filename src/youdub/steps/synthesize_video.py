@@ -12,12 +12,12 @@ from loguru import logger
 from ..interrupts import check_cancelled, sleep_with_cancel
 from ..utils import valid_file
 
-from .synthesize_video_audio import (
+from .video.audio import (
     _audio_combined_needs_rebuild,
     _ensure_audio_combined,
 )
-from .synthesize_video_fs import _is_stale
-from .synthesize_video_subtitles import (
+from .video.fs import _is_stale
+from .video.subtitles import (
     _calc_subtitle_style_params,
     _ensure_bilingual_source_text,
     generate_bilingual_ass,
