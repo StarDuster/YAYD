@@ -228,7 +228,13 @@ def _read_translation(folder: str) -> list[dict[str, Any]]:
     return [x for x in obj if isinstance(x, dict)]
 
 
-def _tts_cache_ok(folder: str, translation: list[dict[str, Any]], *, tts_method: str) -> bool:
+def _tts_cache_ok(
+    folder: str,
+    translation: list[dict[str, Any]],
+    *,
+    tts_method: str,
+    align_to_segment_duration: bool,
+) -> bool:
     marker = _tts_done_marker_path(folder)
     if not os.path.exists(marker):
         return False
@@ -239,6 +245,11 @@ def _tts_cache_ok(folder: str, translation: list[dict[str, Any]], *, tts_method:
     except Exception:
         return False
     if not (isinstance(state, dict) and str(state.get("tts_method", "")).strip().lower() == str(tts_method).lower()):
+        return False
+    # Backward compatible:
+    # - old markers didn't include this key, and they always aligned to segment duration.
+    marker_align = state.get("align_to_segment_duration", True)
+    if bool(marker_align) != bool(align_to_segment_duration):
         return False
 
     tr_path = _translation_path(folder)
@@ -263,6 +274,7 @@ def generate_all_wavs_under_folder(
     *,
     tts_method: str = "bytedance",
     qwen_tts_batch_size: int | None = None,
+    align_to_segment_duration: bool = True,
 ) -> None:
     """Generate TTS wavs for root folder (or its immediate subfolders)."""
     root = str(root_folder)
@@ -292,9 +304,14 @@ def generate_all_wavs_under_folder(
             continue
         if not translation:
             continue
-        if _tts_cache_ok(folder, translation, tts_method=tts_method):
+        if _tts_cache_ok(folder, translation, tts_method=tts_method, align_to_segment_duration=bool(align_to_segment_duration)):
             continue
-        generate_wavs(folder, tts_method=tts_method, qwen_tts_batch_size=qwen_tts_batch_size)
+        generate_wavs(
+            folder,
+            tts_method=tts_method,
+            qwen_tts_batch_size=qwen_tts_batch_size,
+            align_to_segment_duration=bool(align_to_segment_duration),
+        )
 
 
 def generate_wavs(
@@ -302,6 +319,7 @@ def generate_wavs(
     *,
     tts_method: str = "bytedance",
     qwen_tts_batch_size: int | None = None,
+    align_to_segment_duration: bool = True,
 ) -> None:
     """
     Generate per-segment WAVs under `<folder>/wavs/` and write `<folder>/wavs/.tts_done.json`.
@@ -314,6 +332,7 @@ def generate_wavs(
     init_TTS(_DEFAULT_SETTINGS, _DEFAULT_MODEL_MANAGER)
 
     job = str(folder)
+    align_to_segment_duration = bool(align_to_segment_duration)
     translation = _read_translation(job)
     if not translation:
         raise ValueError(f"翻译文件为空: {_translation_path(job)}")
@@ -360,7 +379,26 @@ def generate_wavs(
     method = str(tts_method or "bytedance").strip().lower()
     wavs_dir = _tts_dir(job)
 
-    logger.info(f"TTS({method}) 开始: {job}（段数={len(translation)}）")
+    # If marker exists and its mode differs, we should NOT treat existing wavs as a cache hit.
+    # This avoids silently reusing "aligned/trimmed" wavs when switching to adaptive stretch mode.
+    cache_align: bool | None = None
+    try:
+        marker_path = _tts_done_marker_path(job)
+        if os.path.exists(marker_path):
+            with open(marker_path, "r", encoding="utf-8") as f:
+                st = json.load(f) or {}
+            if isinstance(st, dict):
+                # Backward compatible: missing key implies aligned outputs.
+                cache_align = bool(st.get("align_to_segment_duration", True))
+    except Exception:
+        cache_align = None
+    cache_mismatch = bool(cache_align is not None and bool(cache_align) != bool(align_to_segment_duration))
+
+    logger.info(
+        f"TTS({method}) 开始: {job}（段数={len(translation)} align_to_segment_duration={align_to_segment_duration}）"
+    )
+    if cache_mismatch:
+        logger.info(f"TTS缓存模式变更，将重新生成 wavs: {job} (was_align={cache_align} now_align={align_to_segment_duration})")
 
     if method == "qwen":
         bs = int(qwen_tts_batch_size or 1)
@@ -372,7 +410,7 @@ def generate_wavs(
             out = os.path.join(wavs_dir, f"{i:04d}.wav")
             seg_dur = _segment_duration_seconds(seg)
 
-            if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+            if (not cache_mismatch) and _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
                 continue
 
             raw_text = str(seg.get("translation") or seg.get("text") or "")
@@ -462,6 +500,10 @@ def generate_wavs(
                                 _mark_failed(int(i), why="raw_wav_guard_failed")
                                 sleep_with_cancel(0.2)
                                 continue
+
+                            if not align_to_segment_duration:
+                                ok = True
+                                break
 
                             y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
                             save_wav(y, out, sample_rate=24000)
@@ -557,11 +599,12 @@ def generate_wavs(
                                         next_pending.append(int(i))
                                         continue
 
-                                    y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
-                                    save_wav(y, out, sample_rate=24000)
-                                    if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
-                                        _mark_failed(int(i), why="aligned_wav_guard_failed")
-                                        next_pending.append(int(i))
+                                    if align_to_segment_duration:
+                                        y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
+                                        save_wav(y, out, sample_rate=24000)
+                                        if not _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+                                            _mark_failed(int(i), why="aligned_wav_guard_failed")
+                                            next_pending.append(int(i))
 
                                 processed += int(len(batch_idx))
 
@@ -591,7 +634,7 @@ def generate_wavs(
             check_cancelled()
             out = os.path.join(wavs_dir, f"{i:04d}.wav")
             seg_dur = _segment_duration_seconds(seg)
-            if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+            if (not cache_mismatch) and _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
                 continue
 
             raw_text = str(seg.get("translation") or seg.get("text") or "")
@@ -624,6 +667,10 @@ def generate_wavs(
                     sleep_with_cancel(0.2)
                     continue
 
+                if not align_to_segment_duration:
+                    ok = True
+                    break
+
                 y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
                 save_wav(y, out, sample_rate=24000)
                 if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
@@ -639,7 +686,7 @@ def generate_wavs(
             check_cancelled()
             out = os.path.join(wavs_dir, f"{i:04d}.wav")
             seg_dur = _segment_duration_seconds(seg)
-            if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
+            if (not cache_mismatch) and _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
                 continue
 
             speaker = str(seg.get("speaker") or "SPEAKER_00")
@@ -677,6 +724,10 @@ def generate_wavs(
                     sleep_with_cancel(0.2)
                     continue
 
+                if not align_to_segment_duration:
+                    ok = True
+                    break
+
                 y, _dur2 = adjust_audio_length(out, seg_dur, sample_rate=24000)
                 save_wav(y, out, sample_rate=24000)
                 if _tts_wav_ok_for_segment(out, seg_dur, ratio, extra, abs_cap):
@@ -697,6 +748,7 @@ def generate_wavs(
     marker = _tts_done_marker_path(job)
     payload = {
         "tts_method": method,
+        "align_to_segment_duration": bool(align_to_segment_duration),
         "segments": int(len(translation)),
         "generated_at": float(time.time()),
         "max_ref_seconds": float(max_ref_seconds),

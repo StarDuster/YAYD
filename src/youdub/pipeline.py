@@ -155,6 +155,9 @@ class VideoPipeline:
                     folder, 
                     tts_method=tts_method,
                     qwen_tts_batch_size=qwen_tts_batch_size,
+                    # In adaptive mode, we must keep raw (unclipped) TTS durations.
+                    # Otherwise we will permanently lose speech content before adaptive alignment.
+                    align_to_segment_duration=not bool(tts_adaptive_segment_stretch),
                 )
 
                 require_file(os.path.join(folder, "wavs", ".tts_done.json"), "语音合成标记(wavs/.tts_done.json)", min_bytes=2)
@@ -515,6 +518,7 @@ class VideoPipeline:
                         folder,
                         tts_method=tts_method,
                         qwen_tts_batch_size=qwen_tts_batch_size,
+                        align_to_segment_duration=not bool(tts_adaptive_segment_stretch),
                     )
 
                     require_file(

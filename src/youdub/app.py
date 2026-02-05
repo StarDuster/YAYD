@@ -1267,7 +1267,7 @@ with gr.Blocks(title="字幕翻译") as translation_interface:
     translation_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
 
-def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
+def _tts_wrapper(folder, tts_method, qwen_tts_batch_size, align_to_segment_duration):
     names = (
         [model_manager._bytedance_requirement().name]  # type: ignore[attr-defined]
         if tts_method == "bytedance"
@@ -1286,6 +1286,7 @@ def _tts_wrapper(folder, tts_method, qwen_tts_batch_size):
         folder,
         tts_method=tts_method,
         qwen_tts_batch_size=qwen_tts_batch_size,
+        align_to_segment_duration=bool(align_to_segment_duration),
     )
 
 
@@ -1295,6 +1296,11 @@ with gr.Blocks(title="语音合成") as tts_interface:
         tts_folder_input = gr.Textbox(label="目录", value=str(settings.root_folder))
         tts_method_dropdown = gr.Dropdown(_TTS_METHOD_CHOICES, label="配音方式", value=settings.tts_method)
         tts_batch_size_input = gr.Slider(minimum=1, maximum=64, step=1, label="Qwen TTS 批大小", value=settings.qwen_tts_batch_size)
+        tts_align_input = gr.Checkbox(
+            label="按段对齐到原字幕时长（可能截尾）",
+            value=False,
+            info="如果后续要启用“按段自适应拉伸语音”，建议关闭该选项（保留完整 TTS 时长）。",
+        )
 
         tts_output = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
 
@@ -1305,7 +1311,7 @@ with gr.Blocks(title="语音合成") as tts_interface:
 
     _tts_event = tts_submit_btn.click(
         fn=_streamify(_tts_wrapper),
-        inputs=[tts_folder_input, tts_method_dropdown, tts_batch_size_input],
+        inputs=[tts_folder_input, tts_method_dropdown, tts_batch_size_input, tts_align_input],
         outputs=tts_output,
         **_INTERFACE_STREAM_KWARGS,
     )
