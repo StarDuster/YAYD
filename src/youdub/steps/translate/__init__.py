@@ -21,9 +21,9 @@ from openai import (
     RateLimitError,
 )
 
-from ..config import Settings
-from ..interrupts import check_cancelled, sleep_with_cancel
-from ..text_split import (
+from ...config import Settings
+from ...interrupts import check_cancelled, sleep_with_cancel
+from ...text_split import (
     normalize_ws as _normalize_ws,
     split_source_text_into_sentences as _split_source_text_into_sentences,
     split_source_text_relaxed as _split_source_text_relaxed,
@@ -350,7 +350,7 @@ def _load_or_create_punctuated_transcript(
     *,
     settings: Settings,
 ) -> list[dict[str, Any]]:
-    from . import optimize_transcript as ot
+    from .. import optimize_transcript as ot
 
     return ot.load_or_create_punctuated_transcript(folder, transcript, settings=settings)
 
