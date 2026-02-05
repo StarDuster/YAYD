@@ -189,6 +189,18 @@ def test_generate_all_wavs_reruns_when_marker_exists_but_wav_too_long(tmp_path: 
     assert called["n"] == 1
 
 
+def test_preprocess_text_applies_zh_nsw_normalize_by_default(monkeypatch):
+    import youdub.steps.synthesize_speech as ss
+
+    # Default is enabled; make it explicit and ensure force is off.
+    monkeypatch.delenv("TTS_TEXT_ZH_NSW_NORMALIZE", raising=False)
+    monkeypatch.delenv("TTS_TEXT_ZH_NSW_NORMALIZE_FORCE", raising=False)
+
+    out = ss.preprocess_text("今天是2026年2月5日，完成率12.5%。")
+    assert "二零二六年二月五日" in out
+    assert "百分之十二点五" in out
+
+
 # --------------------------------------------------------------------------- #
 # ByteDance TTS integration
 # --------------------------------------------------------------------------- #

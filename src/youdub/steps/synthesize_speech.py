@@ -28,6 +28,7 @@ from loguru import logger
 from ..config import Settings
 from ..interrupts import check_cancelled, sleep_with_cancel
 from ..models import ModelManager
+from ..text_norm_zh import normalize_zh_nsw, should_normalize_zh_nsw
 from ..utils import read_speaker_ref_seconds, save_wav
 
 from . import tts_bytedance as _tts_bytedance
@@ -93,8 +94,27 @@ def init_TTS(settings: Settings | None = None, model_manager: ModelManager | Non
 
 def preprocess_text(text: str) -> str:
     """Lightweight text cleanup for TTS backends."""
+    def _env_flag(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        s = str(raw).strip().lower()
+        if not s:
+            return bool(default)
+        return s not in {"0", "false", "no", "off"}
+
     t = str(text or "")
     t = re.sub(r"\s+", " ", t).strip()
+    if _env_flag("TTS_TEXT_ZH_NSW_NORMALIZE", True) and t:
+        force = _env_flag("TTS_TEXT_ZH_NSW_NORMALIZE_FORCE", False)
+        target_lang = getattr(_DEFAULT_SETTINGS, "translation_target_language", None)
+        if force or should_normalize_zh_nsw(t, target_language=target_lang):
+            try:
+                t = normalize_zh_nsw(t)
+            except Exception:
+                # TTS text normalization must never break synthesis.
+                pass
+            t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
