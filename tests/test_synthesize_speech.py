@@ -189,6 +189,18 @@ def test_generate_all_wavs_reruns_when_marker_exists_but_wav_too_long(tmp_path: 
     assert called["n"] == 1
 
 
+def test_preprocess_text_applies_zh_nsw_normalize_by_default(monkeypatch):
+    import youdub.steps.synthesize_speech as ss
+
+    # Default is enabled; make it explicit and ensure force is off.
+    monkeypatch.delenv("TTS_TEXT_ZH_NSW_NORMALIZE", raising=False)
+    monkeypatch.delenv("TTS_TEXT_ZH_NSW_NORMALIZE_FORCE", raising=False)
+
+    out = ss.preprocess_text("今天是2026年2月5日，完成率12.5%。")
+    assert "二零二六年二月五日" in out
+    assert "百分之十二点五" in out
+
+
 # --------------------------------------------------------------------------- #
 # ByteDance TTS integration
 # --------------------------------------------------------------------------- #
@@ -475,7 +487,9 @@ if __name__ == "__main__":
     )
 
     # Use our worker script for this test only.
-    monkeypatch.setattr(ss, "_get_qwen_worker_script_path", lambda: worker_path)
+    import youdub.steps.tts.qwen_worker as qw
+
+    monkeypatch.setattr(qw, "_get_qwen_worker_script_path", lambda: worker_path)
 
     # Minimal settings: python exists; model dir exists (worker ignores it but arg is required).
     model_dir = tmp_path / "dummy_model"

@@ -4,7 +4,6 @@ import wave
 
 import numpy as np
 from scipy.io import wavfile
-from loguru import logger
 
 
 def wav_duration_seconds(path: str) -> float | None:
@@ -193,7 +192,6 @@ def smooth_transients(wav: np.ndarray, max_diff: float = 0.3, alpha: float = 0.3
 
 def prepare_speaker_ref_audio(
     wav: np.ndarray,
-    sample_rate: int = 24000,
     *,
     trim_silence: bool = True,
     trim_top_db: float = 30.0,
@@ -213,7 +211,6 @@ def prepare_speaker_ref_audio(
 
     Args:
         wav: Input waveform (float, mono)
-        sample_rate: Sample rate
         trim_silence: Whether to trim silence
         trim_top_db: Threshold for silence trimming
         apply_soft_clip: Whether to apply soft clipping
@@ -263,13 +260,3 @@ def prepare_speaker_ref_audio(
         wav = wav * (0.95 / peak)
 
     return wav.astype(np.float32)
-
-def normalize_wav(wav_path: str) -> None:
-    try:
-        sample_rate, wav = wavfile.read(wav_path)
-        peak = _peak_abs(wav)
-        wav_norm = wav * (32767 / max(0.01, peak))
-        wavfile.write(wav_path, sample_rate, wav_norm.astype(np.int16))
-    except Exception as e:
-        logger.warning(f"标准化音频失败 {wav_path}: {e}")
-

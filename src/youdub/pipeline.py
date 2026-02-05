@@ -14,8 +14,10 @@ from .models import ModelCheckError, ModelManager
 from .interrupts import check_cancelled
 from .utils import require_file, valid_file
 from .steps import (
+    adaptive_align,
     download,
     generate_all_info_under_folder,
+    optimize_transcript,
     separate_vocals,
     synthesize_all_video_under_folder,
     synthesize_speech,
@@ -77,7 +79,7 @@ class VideoPipeline:
         qwen_asr_num_threads: int = 1,
         qwen_asr_vad_segment_threshold: int = 60,
     ) -> bool:
-        for retry in range(max_retries):
+        for attempt in range(max_retries):
             check_cancelled()
             try:
                 check_cancelled()
@@ -139,6 +141,9 @@ class VideoPipeline:
                 require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
 
                 check_cancelled()
+                optimize_transcript.optimize_all_transcript_under_folder(folder, settings=self.settings)
+
+                check_cancelled()
                 translate.translate_all_transcript_under_folder(
                     folder, target_language=translation_target_language, settings=self.settings
                 )
@@ -154,6 +159,10 @@ class VideoPipeline:
 
                 require_file(os.path.join(folder, "wavs", ".tts_done.json"), "语音合成标记(wavs/.tts_done.json)", min_bytes=2)
                 require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
+
+                check_cancelled()
+                if bool(tts_adaptive_segment_stretch):
+                    adaptive_align.prepare_all_adaptive_alignment_under_folder(folder, sample_rate=24000)
 
                 check_cancelled()
                 synthesize_all_video_under_folder(
@@ -178,7 +187,7 @@ class VideoPipeline:
                         upload_video_async(folder)
                 return True
             except Exception as exc:  # pylint: disable=broad-except
-                logger.exception(f"处理失败: {info.get('title')} ({exc})")
+                logger.exception(f"处理失败({attempt + 1}/{max_retries}): {info.get('title')} ({exc})")
         return False
 
     def run(
@@ -493,6 +502,9 @@ class VideoPipeline:
                     require_file(os.path.join(folder, "transcript.json"), "转写结果(transcript.json)", min_bytes=2)
 
                     check_cancelled()
+                    optimize_transcript.optimize_all_transcript_under_folder(folder, settings=self.settings)
+
+                    check_cancelled()
                     translate.translate_all_transcript_under_folder(
                         folder, target_language=translation_target_language, settings=self.settings
                     )
@@ -511,6 +523,10 @@ class VideoPipeline:
                         min_bytes=2,
                     )
                     require_file(os.path.join(folder, "wavs", "0000.wav"), "TTS分段音频(wavs/0000.wav)", min_bytes=44)
+
+                    check_cancelled()
+                    if bool(tts_adaptive_segment_stretch):
+                        adaptive_align.prepare_all_adaptive_alignment_under_folder(folder, sample_rate=24000)
 
                     return folder
                 except CorruptedVideoError as exc:

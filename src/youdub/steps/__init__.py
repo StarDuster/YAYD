@@ -23,6 +23,14 @@ from .translate import (
     translation_postprocess,
     translate_all_transcript_under_folder,
 )
+from .optimize_transcript import (
+    optimize_all_transcript_under_folder,
+    optimize_transcript_folder,
+)
+from .adaptive_align import (
+    prepare_adaptive_alignment,
+    prepare_all_adaptive_alignment_under_folder,
+)
 from .synthesize_speech import (
     adjust_audio_length,
     generate_all_wavs_under_folder,
@@ -31,10 +39,12 @@ from .synthesize_speech import (
 )
 from .synthesize_video import (
     convert_resolution,
+    synthesize_all_video_under_folder,
+)
+from .video.subtitles import (
     format_timestamp,
     generate_srt,
     split_text,
-    synthesize_all_video_under_folder,
 )
 from .generate_info import (
     generate_all_info_under_folder,
@@ -62,6 +72,10 @@ __all__ = [
     "transcribe_all_audio_under_folder",
     "transcribe_audio",
     "translation_postprocess",
+    "optimize_transcript_folder",
+    "optimize_all_transcript_under_folder",
+    "prepare_adaptive_alignment",
+    "prepare_all_adaptive_alignment_under_folder",
     "translate_all_transcript_under_folder",
     "adjust_audio_length",
     "generate_all_wavs_under_folder",
