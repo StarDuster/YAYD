@@ -101,6 +101,61 @@ def test_assign_speakers_by_overlap_defaults_when_no_turns_or_bad_segment():
 
 
 # --------------------------------------------------------------------------- #
+# Whisper VAD fallback (onnxruntime optional)
+# --------------------------------------------------------------------------- #
+
+
+def test_run_whisper_asr_disables_vad_when_onnxruntime_missing(monkeypatch):
+    import youdub.steps.transcribe_asr_run as ar
+
+    # Simulate onnxruntime not installed.
+    monkeypatch.setattr(ar.importlib.util, "find_spec", lambda name: None if name == "onnxruntime" else object())
+    ar._VAD_ONNXRUNTIME_WARNED = False  # noqa: SLF001
+
+    calls: list[bool] = []
+
+    class _DummyPipeline:
+        def transcribe(self, _wav_path: str, **kwargs):
+            calls.append(bool(kwargs.get("vad_filter")))
+            seg = types.SimpleNamespace(
+                start=0.0,
+                end=1.0,
+                text="hi",
+                words=[types.SimpleNamespace(start=0.0, end=0.5, word="hi", probability=1.0)],
+            )
+            info = types.SimpleNamespace(language="en")
+            return [seg], info
+
+    out, lang = ar.run_whisper_asr("dummy.wav", asr_model=object(), asr_pipeline=_DummyPipeline(), batch_size=1)
+    assert calls == [False]
+    assert lang == "en"
+    assert isinstance(out, list) and out and out[0]["text"] == "hi"
+
+
+def test_run_whisper_asr_retries_without_vad_when_vad_init_fails(monkeypatch):
+    import youdub.steps.transcribe_asr_run as ar
+
+    # Simulate onnxruntime available, but VAD init still fails at runtime.
+    monkeypatch.setattr(ar.importlib.util, "find_spec", lambda name: object())
+
+    calls: list[bool] = []
+
+    class _DummyModel:
+        def transcribe(self, _wav_path: str, **kwargs):
+            calls.append(bool(kwargs.get("vad_filter")))
+            if bool(kwargs.get("vad_filter")):
+                raise RuntimeError("Applying the VAD filter requires the onnxruntime package")
+            seg = types.SimpleNamespace(start=0.0, end=1.0, text="ok", words=None)
+            info = types.SimpleNamespace(language="en")
+            return [seg], info
+
+    out, lang = ar.run_whisper_asr("dummy.wav", asr_model=_DummyModel(), asr_pipeline=None, batch_size=1)
+    assert calls == [True, False]
+    assert lang == "en"
+    assert isinstance(out, list) and out and out[0]["text"] == "ok"
+
+
+# --------------------------------------------------------------------------- #
 # Short-circuit behavior
 # --------------------------------------------------------------------------- #
 

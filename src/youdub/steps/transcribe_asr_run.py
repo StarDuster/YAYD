@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -11,6 +12,16 @@ from loguru import logger
 from ..interrupts import check_cancelled
 from ..utils import wav_duration_seconds
 from .transcribe_segments import _split_text_with_timing
+
+
+_VAD_ONNXRUNTIME_WARNED = False
+
+
+def _onnxruntime_available() -> bool:
+    try:
+        return importlib.util.find_spec("onnxruntime") is not None
+    except Exception:
+        return False
 
 
 def run_qwen_asr(
@@ -106,29 +117,48 @@ def run_whisper_asr(
     logger.info(f"转录中 {wav_path}")
     t0 = time.time()
 
-    # VAD: 使用 faster-whisper 默认参数（避免过度切分导致重复/幻觉）
-    # Prefer batched pipeline if available (much higher throughput on GPU).
-    if asr_pipeline is not None:
+    # VAD:
+    # - faster-whisper VAD requires `onnxruntime` (cpu or gpu). Our default install keeps it optional.
+    # - When `onnxruntime` is missing (or VAD init fails), gracefully fall back to `vad_filter=False`.
+    global _VAD_ONNXRUNTIME_WARNED  # noqa: PLW0603
+    vad_filter = bool(_onnxruntime_available())
+    if not vad_filter and not _VAD_ONNXRUNTIME_WARNED:
+        _VAD_ONNXRUNTIME_WARNED = True
+        logger.warning(
+            "未安装 onnxruntime，已自动关闭 faster-whisper VAD 过滤（语音切分可能变差）。"
+            "如需启用 VAD，请安装 CPU/GPU 依赖：uv sync --extra cpu 或 uv sync --extra gpu。"
+        )
+
+    def _do_transcribe(*, vad: bool):
         check_cancelled()
-        segments_iter, info = asr_pipeline.transcribe(  # type: ignore[attr-defined]
+        if asr_pipeline is not None:
+            return asr_pipeline.transcribe(  # type: ignore[attr-defined]
+                wav_path,
+                batch_size=batch_size,
+                beam_size=5,
+                vad_filter=bool(vad),
+                condition_on_previous_text=False,
+                word_timestamps=True,  # 开启词级时间戳
+                no_speech_threshold=0.8,  # 提高阈值，防止漏句
+            )
+        return asr_model.transcribe(  # type: ignore[attr-defined]
             wav_path,
-            batch_size=batch_size,
             beam_size=5,
-            vad_filter=True,
+            vad_filter=bool(vad),
             condition_on_previous_text=False,
             word_timestamps=True,  # 开启词级时间戳
             no_speech_threshold=0.8,  # 提高阈值，防止漏句
         )
-    else:
-        check_cancelled()
-        segments_iter, info = asr_model.transcribe(  # type: ignore[attr-defined]
-            wav_path,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            word_timestamps=True,  # 开启词级时间戳
-            no_speech_threshold=0.8,  # 提高阈值，防止漏句
-        )
+
+    try:
+        segments_iter, info = _do_transcribe(vad=vad_filter)
+    except RuntimeError as exc:
+        # Typical upstream error: "Applying the VAD filter requires the onnxruntime package"
+        if vad_filter and "onnxruntime" in str(exc).lower():
+            logger.warning(f"faster-whisper VAD 初始化失败，将关闭 VAD 重试: {exc}")
+            segments_iter, info = _do_transcribe(vad=False)
+        else:
+            raise
 
     segments_list = []
     for seg in segments_iter:
