@@ -119,12 +119,17 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
     align_enabled = _read_env_bool("SPEECH_RATE_ALIGN_ENABLED", True)
     align_mode = str(os.getenv("SPEECH_RATE_ALIGN_MODE", "single") or "single").strip().lower()
     voice_min = _read_env_float("SPEECH_RATE_VOICE_MIN_RATIO", 0.7)
-    voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.3)
+    # Default: only speed up, never slow down (avoid “拖音/橡皮筋”感)
+    voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.0)
     silence_min = _read_env_float("SPEECH_RATE_SILENCE_MIN_RATIO", 0.3)
     silence_max = _read_env_float("SPEECH_RATE_SILENCE_MAX_RATIO", 3.0)
     overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
     overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
     align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
+    # Stabilize per-segment scaling to avoid audible jitter between adjacent sentences.
+    # Max allowed delta of voice_ratio between consecutive speech segments.
+    ratio_max_jump = _read_env_float("SPEECH_RATE_MAX_RATIO_JUMP", 0.15)
+    ratio_max_jump = float(max(0.0, min(ratio_max_jump, 0.5)))
     en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
     zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
     audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
@@ -189,6 +194,7 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
     adaptive_plan: list[dict[str, Any]] = []
 
     t_cursor_samples = 0  # output timeline cursor (samples)
+    prev_voice_ratio = 1.0
 
     for i, seg in enumerate(translation):
         check_cancelled()
@@ -322,6 +328,31 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                         overall_min=overall_min,
                         overall_max=overall_max,
                     )
+
+                    # Per-segment smoothing: limit ratio jump vs previous segment.
+                    if ratio_info and float(ratio_max_jump) > 1e-9:
+                        try:
+                            vr0 = float(ratio_info.get("voice_ratio", 1.0) or 1.0)
+                            lo = float(prev_voice_ratio) - float(ratio_max_jump)
+                            hi = float(prev_voice_ratio) + float(ratio_max_jump)
+                            vr1 = float(max(lo, min(hi, vr0)))
+                            vr1 = float(max(float(voice_min), min(float(voice_max), vr1)))
+                            if abs(vr1 - vr0) > 1e-9:
+                                ratio_info["voice_ratio"] = float(vr1)
+                                # Keep silence ratio consistent in single mode (or when it's effectively the same).
+                                m = str(ratio_info.get("mode") or align_mode).strip().lower()
+                                sr0 = float(ratio_info.get("silence_ratio", vr0) or vr0)
+                                if m == "single" or abs(float(sr0) - float(vr0)) <= 1e-6:
+                                    ratio_info["silence_ratio"] = float(vr1)
+                            prev_voice_ratio = float(ratio_info.get("voice_ratio", vr1) or vr1)
+                        except Exception:
+                            # Best-effort: never fail alignment due to smoothing.
+                            prev_voice_ratio = float(ratio_info.get("voice_ratio", prev_voice_ratio) or prev_voice_ratio)
+                    elif ratio_info:
+                        try:
+                            prev_voice_ratio = float(ratio_info.get("voice_ratio", prev_voice_ratio) or prev_voice_ratio)
+                        except Exception:
+                            pass
                     if abs(float(ratio_info.get("voice_ratio", 1.0)) - 1.0) > float(align_threshold) or abs(
                         float(ratio_info.get("silence_ratio", 1.0)) - 1.0
                     ) > float(align_threshold):
@@ -339,6 +370,10 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                     ratio_info = None
                     en_stats = None
                     zh_stats = None
+
+        # If alignment wasn't applied, reset the smoothing anchor.
+        if ratio_info is None:
+            prev_voice_ratio = 1.0
 
         target_samples = int(tts_audio.shape[0])
         target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
