@@ -185,16 +185,11 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
             return float(gap_clause_s)
         return float(gap_default_s)
 
-    adaptive_translation: list[dict[str, Any]] = []
-    adaptive_plan: list[dict[str, Any]] = []
-
-    t_cursor_samples = 0  # output timeline cursor (samples)
-    prev_voice_ratio = 1.0
-
+    # ---- Phase 1: collect per-segment data & raw voice_ratios ----------------
+    seg_records: list[dict[str, Any]] = []
     for i, seg in enumerate(translation):
         check_cancelled()
 
-        # Load per-segment TTS audio.
         wav_path = os.path.join(wavs_folder, wav_files[i])
         if not os.path.exists(wav_path):
             raise FileNotFoundError(f"TTS音频文件不存在: {wav_path}")
@@ -202,7 +197,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
         tts_audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
         tts_audio = tts_audio.astype(np.float32, copy=False)
 
-        # Trim leading/trailing silence to reduce dead air from TTS.
         if tts_audio.size > 0:
             try:
                 trimmed, _idx = librosa.effects.trim(tts_audio, top_db=float(trim_top_db))
@@ -211,7 +205,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
             except Exception:
                 pass
 
-        # Original segment duration from ASR timestamps.
         orig_start = float(seg.get("start", 0.0) or 0.0)
         orig_end = float(seg.get("end", 0.0) or 0.0)
         if orig_end < orig_start:
@@ -220,13 +213,11 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
         ratio_info: dict[str, Any] | None = None
         en_stats: dict[str, Any] | None = None
 
-        # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
         if align_enabled and tts_audio.size > 0:
             try:
                 en_text = str(seg.get("text") or "")
                 en_total_duration = float(max(0.0, orig_end - orig_start))
 
-                # Estimate EN voiced duration from the original vocal stem (VAD).
                 en_voiced_duration = float(en_total_duration)
                 if en_total_duration > 0 and os.path.exists(audio_vocals_path):
                     try:
@@ -252,10 +243,8 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                         en_voiced_duration = float(en_total_duration)
 
                 en_voiced_duration = float(max(0.0, min(en_voiced_duration, en_total_duration)))
-
                 en_stats = dict(compute_en_speech_rate(en_text, en_voiced_duration))
 
-                # Apply global bias by effectively increasing EN reference rate.
                 en_stats_used = dict(en_stats)
                 if float(align_global_bias) > 1e-6 and abs(float(align_global_bias) - 1.0) > 1e-6:
                     en_stats_used["syllable_rate"] = float(en_stats_used.get("syllable_rate", 0.0)) / float(
@@ -264,57 +253,106 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
 
                 zh_text = str(seg.get("translation") or "")
                 zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
-                zh_syllables_count = 0
                 zh_syllable_rate = 0.0
                 if zh_total_duration > 0:
                     from ..speech_rate import count_zh_syllables
 
-                    zh_syllables_count = count_zh_syllables(zh_text)
-                    zh_syllable_rate = float(zh_syllables_count) / zh_total_duration
-                zh_stats_for_ratio: dict[str, Any] = {"syllable_rate": zh_syllable_rate}
+                    zh_syllable_rate = float(count_zh_syllables(zh_text)) / zh_total_duration
 
                 ratio_info = compute_scaling_ratio(
                     en_stats_used,
-                    zh_stats_for_ratio,
+                    {"syllable_rate": zh_syllable_rate},
                     voice_min=voice_min,
                     voice_max=voice_max,
                 )
-
-                # Per-segment smoothing: limit ratio jump vs previous segment.
-                if ratio_info and float(ratio_max_jump) > 1e-9:
-                    vr0 = float(ratio_info.get("voice_ratio", 1.0) or 1.0)
-                    lo = float(prev_voice_ratio) - float(ratio_max_jump)
-                    hi = float(prev_voice_ratio) + float(ratio_max_jump)
-                    vr1 = float(max(lo, min(hi, vr0)))
-                    vr1 = float(max(float(voice_min), min(float(voice_max), vr1)))
-                    if abs(vr1 - vr0) > 1e-9:
-                        ratio_info["voice_ratio"] = float(vr1)
-                    prev_voice_ratio = float(ratio_info.get("voice_ratio", vr1) or vr1)
-                elif ratio_info:
-                    prev_voice_ratio = float(ratio_info.get("voice_ratio", prev_voice_ratio) or prev_voice_ratio)
-
-                vr = float(ratio_info.get("voice_ratio", 1.0))
-                if abs(vr - 1.0) > float(align_threshold):
-                    tts_audio, _scale_info = apply_scaling_ratio(tts_audio, sample_rate, ratio_info)
-                    if bool(ratio_info.get("clamped")):
-                        logger.warning(
-                            f"段落 {i}: 语速比例已触发 clamp "
-                            f"(raw={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{vr:.3f})"
-                        )
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
                 ratio_info = None
                 en_stats = None
 
-        # If alignment wasn't applied, reset the smoothing anchor.
-        if ratio_info is None:
-            prev_voice_ratio = 1.0
+        seg_records.append({
+            "seg": seg,
+            "tts_audio": tts_audio,
+            "orig_start": orig_start,
+            "orig_end": orig_end,
+            "ratio_info": ratio_info,
+            "en_stats": en_stats,
+        })
+
+    # ---- Phase 2: bidirectional voice_ratio smoothing ----------------------
+    # Forward-only smoothing causes abrupt rate jumps when early segments are
+    # clamped to voice_max and a later segment needs a much lower ratio.
+    # Running a backward pass as well and averaging the two spreads the
+    # transition more evenly, reducing perceived speed discontinuities.
+    if align_enabled and float(ratio_max_jump) > 1e-9:
+        anchor = float(max(float(voice_min), min(float(voice_max), float(align_global_bias))))
+        clamped_vrs: list[float | None] = [
+            float(r["ratio_info"]["voice_ratio"]) if r["ratio_info"] is not None else None
+            for r in seg_records
+        ]
+
+        # Forward pass
+        fwd_vrs: list[float | None] = []
+        prev = anchor
+        for vr in clamped_vrs:
+            if vr is None:
+                fwd_vrs.append(None)
+                prev = anchor
+                continue
+            s = float(max(prev - float(ratio_max_jump), min(prev + float(ratio_max_jump), vr)))
+            s = float(max(float(voice_min), min(float(voice_max), s)))
+            fwd_vrs.append(s)
+            prev = s
+
+        # Backward pass
+        bwd_vrs: list[float | None] = [None] * len(clamped_vrs)
+        prev = anchor
+        for idx in reversed(range(len(clamped_vrs))):
+            vr = clamped_vrs[idx]
+            if vr is None:
+                prev = anchor
+                continue
+            s = float(max(prev - float(ratio_max_jump), min(prev + float(ratio_max_jump), vr)))
+            s = float(max(float(voice_min), min(float(voice_max), s)))
+            bwd_vrs[idx] = s
+            prev = s
+
+        # Average forward + backward and write back
+        for idx, rec in enumerate(seg_records):
+            if rec["ratio_info"] is None:
+                continue
+            f = fwd_vrs[idx]
+            b = bwd_vrs[idx]
+            if f is not None and b is not None:
+                final_vr = float(max(float(voice_min), min(float(voice_max), (f + b) / 2.0)))
+                rec["ratio_info"]["voice_ratio"] = final_vr
+
+    # ---- Phase 3: apply TSM, padding, and build the plan -------------------
+    adaptive_translation: list[dict[str, Any]] = []
+    adaptive_plan: list[dict[str, Any]] = []
+    t_cursor_samples = 0
+
+    for i, rec in enumerate(seg_records):
+        seg = rec["seg"]
+        tts_audio = rec["tts_audio"]
+        ratio_info = rec["ratio_info"]
+        en_stats = rec["en_stats"]
+        orig_start = rec["orig_start"]
+        orig_end = rec["orig_end"]
+
+        if ratio_info is not None:
+            vr = float(ratio_info.get("voice_ratio", 1.0))
+            if abs(vr - 1.0) > float(align_threshold):
+                tts_audio, _scale_info = apply_scaling_ratio(tts_audio, sample_rate, ratio_info)
+                if bool(ratio_info.get("clamped")):
+                    logger.warning(
+                        f"段落 {i}: 语速比例已触发 clamp "
+                        f"(raw={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{vr:.3f})"
+                    )
 
         target_samples = int(tts_audio.shape[0])
         target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
 
-        # Tail padding: if speech is shorter than the original segment, pad silence
-        # so the corresponding video segment doesn't need to be fast-forwarded as much.
         orig_seg_duration = float(max(0.0, orig_end - orig_start))
         if target_duration > 0 and target_duration < orig_seg_duration and float(tail_pad_max) > 0:
             shortfall = float(orig_seg_duration - target_duration)
@@ -324,7 +362,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                 target_samples += pad_samples
                 target_duration = float(target_samples) / float(sample_rate)
 
-        # Record adaptive translation (speech segments only).
         start_s = float(t_cursor_samples) / float(sample_rate)
         end_s = float(t_cursor_samples + target_samples) / float(sample_rate)
         out_seg = dict(seg)
@@ -349,7 +386,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
 
         t_cursor_samples += int(max(0, target_samples))
 
-        # Insert pause between speech segments (except after last).
         if i < (len(translation) - 1):
             try:
                 next_start = float(translation[i + 1].get("start", orig_end) or orig_end)
@@ -360,13 +396,11 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                 pause_src_start = orig_end
                 pause_src_end = next_start
             else:
-                # Overlap/adjacent: take a small tail slice from the previous segment as "pause" visuals.
                 tail = 0.08
                 pause_src_end = orig_end
                 pause_src_start = max(0.0, pause_src_end - tail)
             pause_duration = _gap_seconds_for_text(str(seg.get("translation") or ""))
 
-            # Compute pause samples using the exact same rounding as the audio cursor.
             n_pause = int(round(float(pause_duration) * float(sample_rate)))
             t_cursor_samples += int(max(0, n_pause))
             adaptive_plan.append(
