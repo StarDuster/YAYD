@@ -445,6 +445,7 @@ def run_pipeline(
     whisper_model,
     whisper_device,
     whisper_cpu_model,
+    whisper_compute_type,
     whisper_batch_size,
     qwen_asr_num_threads,
     qwen_asr_vad_segment_threshold,
@@ -469,12 +470,15 @@ def run_pipeline(
     auto_upload_video,
 ):
     try:
+        wct = str(whisper_compute_type or "").strip()
+        wct_env = wct or None
         with _temp_env(
             {
                 "TRANSLATION_STRATEGY": translation_strategy,
                 "TRANSLATION_MAX_CONCURRENCY": str(int(translation_max_concurrency)),
                 "TRANSLATION_CHUNK_SIZE": str(int(translation_chunk_size)),
                 "TRANSLATION_GUIDE_MAX_CHARS": str(int(translation_guide_max_chars)),
+                "WHISPER_COMPUTE_TYPE": wct_env,
             }
         ):
             return pipeline.run(
@@ -710,6 +714,7 @@ def _pipeline_asr_visibility(asr_method):
         gr.update(visible=is_whisper),  # whisper_model
         gr.update(visible=is_whisper),  # whisper_device
         gr.update(visible=is_whisper),  # whisper_cpu_model
+        gr.update(visible=is_whisper),  # whisper_compute_type
         gr.update(visible=is_whisper),  # whisper_batch_size
         gr.update(visible=is_qwen),   # qwen_threads
         gr.update(visible=is_qwen),   # qwen_vad
@@ -781,6 +786,13 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             label="Whisper CPU 模型路径（可选）",
             value=str(settings.whisper_cpu_model_path or ""),
             visible=(settings.asr_method == "whisper"),
+        )
+        pipeline_whisper_compute_type = gr.Dropdown(
+            choices=[("默认(自动)", ""), "float16", "int8", "int8_float16", "float32"],
+            label="Whisper compute_type（可选）",
+            value="",
+            visible=(settings.asr_method == "whisper"),
+            info="留空=自动：CUDA 默认 float16，CPU 默认 int8。",
         )
         pipeline_whisper_batch_size = gr.Slider(
             minimum=1, maximum=128, step=1,
@@ -863,6 +875,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             pipeline_whisper_model,
             pipeline_whisper_device,
             pipeline_whisper_cpu_model,
+            pipeline_whisper_compute_type,
             pipeline_whisper_batch_size,
             pipeline_qwen_asr_threads,
             pipeline_qwen_asr_vad,
@@ -888,6 +901,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
             pipeline_whisper_model,
             pipeline_whisper_device,
             pipeline_whisper_cpu_model,
+            pipeline_whisper_compute_type,
             pipeline_whisper_batch_size,
             pipeline_qwen_asr_threads,
             pipeline_qwen_asr_vad,
@@ -986,31 +1000,34 @@ with gr.Blocks(title="人声分离") as demucs_interface:
     )
     demucs_stop_btn.click(fn=_request_stop, inputs=None, outputs=None)
 
-def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device, batch_size, qwen_threads, qwen_vad, diarization, min_speakers, max_speakers):
+def _run_transcribe(folder, asr_method, qwen_model_dir, model, cpu_model, device, whisper_compute_type, batch_size, qwen_threads, qwen_vad, diarization, min_speakers, max_speakers):
     # Determine required models based on ASR method
     names = []
     if asr_method == "qwen":
         names.append(model_manager._qwen_asr_requirement().name)  # type: ignore[attr-defined]
     if diarization:
         names.append(model_manager._whisper_diarization_requirement().name)  # type: ignore[attr-defined]
-    return _safe_run(
-        names,
-        transcribe_all_audio_under_folder,
-        folder,
-        model_name=model,
-        cpu_model_name=cpu_model,
-        device=device,
-        batch_size=batch_size,
-        diarization=diarization,
-        min_speakers=min_speakers,
-        max_speakers=max_speakers,
-        settings=settings,
-        model_manager=model_manager,
-        asr_method=asr_method,
-        qwen_asr_model_dir=qwen_model_dir,
-        qwen_asr_num_threads=qwen_threads,
-        qwen_asr_vad_segment_threshold=qwen_vad,
-    )
+    wct = str(whisper_compute_type or "").strip()
+    wct_env = wct or None
+    with _temp_env({"WHISPER_COMPUTE_TYPE": wct_env}):
+        return _safe_run(
+            names,
+            transcribe_all_audio_under_folder,
+            folder,
+            model_name=model,
+            cpu_model_name=cpu_model,
+            device=device,
+            batch_size=batch_size,
+            diarization=diarization,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            settings=settings,
+            model_manager=model_manager,
+            asr_method=asr_method,
+            qwen_asr_model_dir=qwen_model_dir,
+            qwen_asr_num_threads=qwen_threads,
+            qwen_asr_vad_segment_threshold=qwen_vad,
+        )
 
 def _asr_visibility(asr_method):
     """根据 ASR 方法返回各组件的可见性。"""
@@ -1021,6 +1038,7 @@ def _asr_visibility(asr_method):
         gr.update(visible=is_whisper),  # whisper_model
         gr.update(visible=is_whisper),  # whisper_cpu_model
         gr.update(visible=is_whisper),  # whisper_device
+        gr.update(visible=is_whisper),  # whisper_compute_type
         gr.update(visible=is_whisper),  # whisper_batch_size
         gr.update(visible=is_qwen),   # qwen_threads
         gr.update(visible=is_qwen),   # qwen_vad
@@ -1071,6 +1089,13 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             value=settings.whisper_device,
             visible=(settings.asr_method == "whisper"),
         )
+        whisper_compute_type_input = gr.Dropdown(
+            choices=[("默认(自动)", ""), "float16", "int8", "int8_float16", "float32"],
+            label="Whisper compute_type（可选）",
+            value="",
+            visible=(settings.asr_method == "whisper"),
+            info="留空=自动：CUDA 默认 float16，CPU 默认 int8。",
+        )
         whisper_batch_size_input = gr.Slider(
             minimum=1, maximum=128, step=1,
             label="Whisper 批大小",
@@ -1109,6 +1134,7 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             whisper_model_input,
             whisper_cpu_model_input,
             whisper_device_input,
+            whisper_compute_type_input,
             whisper_batch_size_input,
             qwen_threads_input,
             qwen_vad_input,
@@ -1128,6 +1154,7 @@ with gr.Blocks(title="语音识别") as whisper_inference:
             whisper_model_input,
             whisper_cpu_model_input,
             whisper_device_input,
+            whisper_compute_type_input,
             whisper_batch_size_input,
             qwen_threads_input,
             qwen_vad_input,
