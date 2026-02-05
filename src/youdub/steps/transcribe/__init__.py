@@ -9,23 +9,23 @@ from typing import Any
 import torch
 from loguru import logger
 
-from ..config import Settings
-from ..interrupts import check_cancelled
-from ..models import ModelCheckError, ModelManager
-from ..utils import torch_load_weights_only_compat
-from .transcribe_asr_run import run_qwen_asr, run_whisper_asr
-from .transcribe_assets import ensure_assets
-from .transcribe_compat import (
+from ...config import Settings
+from ...interrupts import check_cancelled
+from ...models import ModelCheckError, ModelManager
+from ...utils import torch_load_weights_only_compat
+from .asr_run import run_qwen_asr, run_whisper_asr
+from .assets import ensure_assets
+from .compat import (
     patch_torchaudio_backend_compat as _patch_torchaudio_backend_compat,
     preload_cudnn_for_onnxruntime_gpu as _preload_cudnn_for_onnxruntime_gpu,
 )
-from .transcribe_segments import _assign_speakers_by_overlap, generate_speaker_audio, merge_segments
-from .transcribe_speaker_repair import (
+from .segments import _assign_speakers_by_overlap, generate_speaker_audio, merge_segments
+from .speaker_repair import (
     _repair_speakers_by_embedding,
     _speaker_repair_enabled,
     _update_translation_speakers_from_transcript,
 )
-from .transcribe_subtitles import (
+from .subtitles import (
     _find_subtitle_file,
     _invalidate_downstream_cache_for_new_transcript,
     _is_youtube_subtitle_transcript,
