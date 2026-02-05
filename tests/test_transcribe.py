@@ -300,3 +300,114 @@ def test_transcribe_audio_prefers_cpu_model_when_device_cpu(tmp_path: Path, monk
     assert captured["device"] == "cpu"
     assert captured["model_dir"] == "/fake/cpu/model"
     assert (folder / "transcript.json").exists()
+
+
+def test_transcribe_audio_uses_youtube_manual_subtitles_when_available(tmp_path: Path, monkeypatch):
+    import youdub.steps.transcribe as tr
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    # yt-dlp infojson: manual subtitles are under "subtitles" (NOT "automatic_captions")
+    (folder / "download.info.json").write_text(
+        json.dumps(
+            {
+                "language": "en",
+                "original_language": "en",
+                "subtitles": {"en": [{"ext": "vtt"}]},
+                "automatic_captions": {"en": [{"ext": "vtt"}]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (folder / "download.en.vtt").write_text(
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:00.500\n"
+        "Hello.\n\n"
+        "00:00:00.500 --> 00:00:01.000\n"
+        "World.\n",
+        encoding="utf-8",
+    )
+
+    # ASR should not be invoked when manual subtitles exist.
+    monkeypatch.setattr(tr, "load_asr_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ASR should not run")))
+    monkeypatch.setattr(
+        tr, "load_qwen_asr_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ASR should not run"))
+    )
+    monkeypatch.setattr(tr, "generate_speaker_audio", lambda *_args, **_kwargs: None)
+
+    ok = tr.transcribe_audio(str(folder), diarization=False)
+    assert ok is True
+
+    out = json.loads((folder / "transcript.json").read_text(encoding="utf-8"))
+    assert isinstance(out, list) and out
+    assert out[0]["source"] == "youtube_subtitles"
+    assert out[0]["subtitle_lang"] == "en"
+    assert out[0]["speaker"] == "SPEAKER_00"
+
+
+def test_transcribe_audio_overwrites_asr_transcript_and_clears_downstream_cache_when_manual_subs_present(
+    tmp_path: Path, monkeypatch
+):
+    import youdub.steps.transcribe as tr
+
+    folder = tmp_path / "job"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    # Existing ASR transcript + downstream artifacts
+    (folder / "transcript.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "text": "asr", "speaker": "SPEAKER_00"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "translation.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "translation_raw.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "summary.json").write_text(json.dumps({"summary": "s"}, ensure_ascii=False), encoding="utf-8")
+    (folder / "transcript_punctuated.json").write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "text": "asr.", "speaker": "SPEAKER_00"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    wavs = folder / "wavs"
+    wavs.mkdir(parents=True, exist_ok=True)
+    (wavs / ".tts_done.json").write_text(json.dumps({"tts_method": "bytedance"}, ensure_ascii=False), encoding="utf-8")
+    (wavs / "0000.wav").write_bytes(b"RIFFxxxxWAVE")  # dummy header bytes
+
+    # Manual subtitles available
+    (folder / "download.info.json").write_text(
+        json.dumps(
+            {"language": "en", "original_language": "en", "subtitles": {"en": [{"ext": "vtt"}]}}, ensure_ascii=False
+        ),
+        encoding="utf-8",
+    )
+    (folder / "download.en.vtt").write_text(
+        "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello.\n",
+        encoding="utf-8",
+    )
+
+    # ASR should not run; cache should be cleared.
+    monkeypatch.setattr(tr, "load_asr_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ASR should not run")))
+    monkeypatch.setattr(
+        tr, "load_qwen_asr_model", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ASR should not run"))
+    )
+    monkeypatch.setattr(tr, "generate_speaker_audio", lambda *_args, **_kwargs: None)
+
+    ok = tr.transcribe_audio(str(folder), diarization=False)
+    assert ok is True
+
+    # Downstream artifacts should be removed.
+    assert not (folder / "translation.json").exists()
+    assert not (folder / "translation_raw.json").exists()
+    assert not (folder / "summary.json").exists()
+    assert not (folder / "transcript_punctuated.json").exists()
+    assert not (wavs / ".tts_done.json").exists()
+    assert not (wavs / "0000.wav").exists()
+
+    out = json.loads((folder / "transcript.json").read_text(encoding="utf-8"))
+    assert isinstance(out, list) and out
+    assert out[0]["source"] == "youtube_subtitles"

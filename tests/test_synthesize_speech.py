@@ -475,7 +475,9 @@ if __name__ == "__main__":
     )
 
     # Use our worker script for this test only.
-    monkeypatch.setattr(ss, "_get_qwen_worker_script_path", lambda: worker_path)
+    import youdub.steps.tts_qwen_worker as qw
+
+    monkeypatch.setattr(qw, "_get_qwen_worker_script_path", lambda: worker_path)
 
     # Minimal settings: python exists; model dir exists (worker ignores it but arg is required).
     model_dir = tmp_path / "dummy_model"

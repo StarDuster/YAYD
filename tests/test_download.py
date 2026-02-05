@@ -25,6 +25,9 @@ def test_download_single_video_short_circuits_when_cached_mp4_exists(tmp_path: P
     out_dir = Path(folder)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "download.mp4").write_bytes(b"0" * 2048)
+    # Avoid best-effort backfill calls on cache hit.
+    (out_dir / "download.jpg").write_bytes(b"0")
+    (out_dir / "download.en.vtt").write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nx\n", encoding="utf-8")
 
     out = dl.download_single_video(info, str(tmp_path), resolution="360p")
     assert out == folder

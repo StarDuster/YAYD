@@ -491,6 +491,58 @@ def test_translate_folder_skips_when_translation_and_summary_exist(tmp_path: Pat
     assert not (folder / "translation_raw.json").exists()
 
 
+def test_translate_folder_refreshes_speaker_when_transcript_updated_and_raw_missing(
+    tmp_path: Path, monkeypatch
+):
+    import os
+
+    import youdub.steps.translate as tr
+
+    folder = tmp_path / "job_refresh_speaker"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    # Existing translation + summary (translation_raw.json intentionally missing).
+    translation_path = folder / "translation.json"
+    translation_path.write_text(
+        json.dumps(
+            [{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00", "translation": "好"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    summary_path = folder / "summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {"title": "t", "author": "u", "summary": "s", "tags": [], "translation_model": "dummy"},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # transcript.json is updated (speaker label changed) after translation.json.
+    transcript_path = folder / "transcript.json"
+    transcript_path.write_text(
+        json.dumps([{"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_01"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    # Ensure mtime is newer even on coarse filesystems.
+    t_mtime = translation_path.stat().st_mtime
+    os.utime(str(transcript_path), (t_mtime + 10.0, t_mtime + 10.0))
+
+    def _should_not_call(*_args, **_kwargs):
+        raise AssertionError("should not be called when refreshing speakers only")
+
+    monkeypatch.setattr(tr, "summarize", _should_not_call)
+    monkeypatch.setattr(tr, "_translate_content", _should_not_call)
+
+    ok = tr.translate_folder(str(folder), target_language="简体中文")
+    assert ok is True
+
+    updated = json.loads(translation_path.read_text(encoding="utf-8"))
+    assert isinstance(updated, list)
+    assert updated[0]["speaker"] == "SPEAKER_01"
+
+
 def test_translate_folder_retranslates_when_transcript_length_changes(tmp_path: Path, monkeypatch):
     import youdub.steps.translate as tr
 
