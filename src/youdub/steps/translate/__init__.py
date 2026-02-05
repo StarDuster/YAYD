@@ -3,23 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import threading
 import time  # noqa: F401 - tests monkeypatch translate.time.sleep
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any, cast
 
 from loguru import logger
-from openai import (
-    APIConnectionError,
-    APITimeoutError,
-    APIStatusError,
-    AuthenticationError,
-    BadRequestError,
-    OpenAI,
-    RateLimitError,
-)
 
 from ...config import Settings
 from ...interrupts import check_cancelled, sleep_with_cancel
@@ -29,316 +18,20 @@ from ...text_split import (
     split_source_text_relaxed as _split_source_text_relaxed,
 )
 
-@dataclass(frozen=True)
-class _ChatBackend:
-    client: OpenAI
-    model: str
-    timeout_s: float
-
-
-class _TranslationValidationError(ValueError):
-    pass
+from .backend import (
+    _ChatBackend,
+    _build_chat_backend,
+    _chat_completion_text,
+    _extract_first_json_object,
+    _get_thread_backend,
+    _handle_sdk_exception,
+    _read_int_env,
+)
+from .quality import _TranslationValidationError, translation_postprocess, valid_translation
+from .summary import ensure_transcript_length, get_necessary_info, summarize
 
 
 _DEFAULT_SETTINGS = Settings()
-
-def get_necessary_info(info: dict[str, Any]) -> dict[str, Any]:
-    return {
-        'title': info.get('title'),
-        'uploader': info.get('uploader'),
-        'description': info.get('description'),
-        'upload_date': info.get('upload_date'),
-        'categories': info.get('categories'),
-        'tags': info.get('tags'),
-    }
-
-
-def ensure_transcript_length(transcript: str, max_length: int = 4000) -> str:
-    if len(transcript) <= max_length:
-        return transcript
-        
-    mid = len(transcript) // 2
-    length = max_length // 2
-    before = transcript[:mid]
-    after = transcript[mid:]
-    return before[:length] + after[-length:]
-
-
-def _build_chat_backend(settings: Settings) -> _ChatBackend:
-    timeout_s = 240.0
-    api_key = settings.openai_api_key
-    if not api_key:
-        raise RuntimeError("缺少 OPENAI_API_KEY：请在 .env 中配置 OpenAI 兼容的 API Key。")
-    base_url = settings.openai_api_base or "https://api.openai.com/v1"
-    client = OpenAI(base_url=base_url, api_key=api_key)
-    return _ChatBackend(client=client, model=settings.model_name, timeout_s=timeout_s)
-
-
-_THREAD_LOCAL = threading.local()
-
-
-def _get_thread_backend(settings: Settings) -> _ChatBackend:
-    """Get a per-thread OpenAI client to avoid thread-safety issues."""
-    backend = getattr(_THREAD_LOCAL, "backend", None)
-    if isinstance(backend, _ChatBackend):
-        return backend
-    backend = _build_chat_backend(settings)
-    _THREAD_LOCAL.backend = backend
-    return backend
-
-
-def _extract_first_json_object(text: str) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    for idx, ch in enumerate(text):
-        if ch != "{":
-            continue
-        try:
-            obj, _ = decoder.raw_decode(text[idx:])
-        except JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            return cast(dict[str, Any], obj)
-    raise ValueError("No JSON object found (模型输出中未找到 JSON 对象)。")
-
-
-def _chat_completion_text(backend: _ChatBackend, messages: list[dict[str, str]]) -> str:
-    response = backend.client.chat.completions.create(
-        model=backend.model,
-        messages=messages,
-        timeout=backend.timeout_s,
-    )
-    content = response.choices[0].message.content
-    return (content or "").strip()
-
-
-def _handle_sdk_exception(exc: Exception, attempt: int) -> float | None:
-    """Return sleep seconds for retry, or None to stop retrying."""
-    # --- OpenAI compatible SDK exceptions ---
-    if isinstance(exc, (AuthenticationError,)):
-        logger.error(f"LLM认证失败: {exc}")
-        return None
-    if isinstance(exc, (BadRequestError,)):
-        logger.error(f"LLM请求参数错误: {exc}")
-        return None
-    if isinstance(exc, (RateLimitError,)):
-        delay = min(2 ** attempt, 30)
-        logger.warning(f"LLM速率限制，{delay}秒后重试: {exc}")
-        return float(delay)
-    if isinstance(exc, (APITimeoutError, APIConnectionError)):
-        delay = min(2 ** attempt, 20)
-        logger.warning(f"LLM连接/超时，{delay}秒后重试: {exc}")
-        return float(delay)
-    if isinstance(exc, APIStatusError):
-        status = getattr(exc, "status_code", None)
-        if status in {500, 502, 503, 504}:
-            delay = min(2 ** attempt, 20)
-            logger.warning(f"LLM服务器错误 ({status})，{delay}秒后重试: {exc}")
-            return float(delay)
-        logger.error(f"LLM请求失败 ({status}): {exc}")
-        return None
-
-    return None
-
-
-def summarize(
-    info: dict[str, Any],
-    transcript: list[dict[str, Any]],
-    target_language: str = "简体中文",
-    settings: Settings | None = None,
-) -> dict[str, Any]:
-    check_cancelled()
-    cfg = settings or _DEFAULT_SETTINGS
-    backend = _build_chat_backend(cfg)
-
-    transcript_text = " ".join(cast(str, line.get("text", "")) for line in transcript)
-    transcript_text = ensure_transcript_length(transcript_text, max_length=2000)
-    info_message = f'Title: "{info.get("title", "")}" Author: "{info.get("uploader", "")}". '
-
-    full_description = (
-        f"The following is the full content of the video:\n{info_message}\n{transcript_text}\n{info_message}\n"
-        "Summarize the video content as JSON only.\n"
-        'Return JSON in the format: {"title": "...", "summary": "..."}'
-    )
-
-    summary_data: dict[str, str] | None = None
-    for attempt in range(5):
-        check_cancelled()
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": 'You are an expert video analyst. Respond with JSON only: {"title": "...", "summary": "..."}',
-                },
-                {"role": "user", "content": full_description},
-            ]
-            content = _chat_completion_text(backend, messages).replace("\n", " ")
-            logger.info(content)
-
-            summary_json = _extract_first_json_object(content)
-            title = str(summary_json.get("title", "")).replace("title:", "").strip()
-            summary_text = str(summary_json.get("summary", "")).replace("summary:", "").strip()
-            if not title or not summary_text:
-                raise ValueError("Missing title/summary fields in JSON.")
-            if "title" in title.lower():
-                raise ValueError("Invalid title field.")
-            summary_data = {"title": title, "summary": summary_text}
-            break
-        except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"摘要解析失败 (尝试={attempt + 1}/5): {exc}")
-            sleep_with_cancel(1)
-        except Exception as exc:  # SDK/network errors handled explicitly below
-            delay = _handle_sdk_exception(exc, attempt)
-            if delay is None:
-                raise
-            sleep_with_cancel(delay)
-
-    if not summary_data:
-        raise RuntimeError("Summary generation failed: Unable to parse JSON from model output.")
-
-    title = summary_data["title"]
-    summary_text = summary_data["summary"]
-    tags = info.get("tags", [])
-
-    translate_messages = [
-        {
-            "role": "system",
-            "content": (
-                f'You are a native speaker of {target_language}. Translate title/summary/tags into {target_language}. '
-                'Respond with JSON only: {"title": "...", "summary": "...", "tags": ["..."]}'
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f'Title: "{title}"\nSummary: "{summary_text}"\nTags: {tags}\n'
-                f"Translate into {target_language} and return JSON only."
-            ),
-        },
-    ]
-
-    for attempt in range(5):
-        check_cancelled()
-        try:
-            content = _chat_completion_text(backend, translate_messages).replace("\n", " ")
-            logger.info(content)
-            translated_json = _extract_first_json_object(content)
-            translated_title = str(translated_json.get("title", "")).strip()
-            translated_summary = str(translated_json.get("summary", "")).strip()
-            translated_tags = translated_json.get("tags", [])
-            if not translated_title or not translated_summary:
-                raise ValueError("Missing title/summary fields in translated JSON.")
-            if target_language in translated_title or target_language in translated_summary:
-                raise ValueError("Model echoed language name instead of translation.")
-
-            for quote in ['"', "“", "‘", "'", "《"]:
-                if translated_title.startswith(quote):
-                    translated_title = translated_title.strip(quote + "”’》")
-
-            return {
-                "title": translated_title,
-                "author": info.get("uploader", ""),
-                "summary": translated_summary,
-                "tags": translated_tags if isinstance(translated_tags, list) else [],
-                "language": target_language,
-            }
-        except (ValueError, JSONDecodeError) as exc:
-            logger.warning(f"摘要翻译解析失败 (尝试={attempt + 1}/5): {exc}")
-            sleep_with_cancel(1)
-        except Exception as exc:
-            delay = _handle_sdk_exception(exc, attempt)
-            if delay is None:
-                raise
-            sleep_with_cancel(delay)
-
-    raise RuntimeError("Summary translation failed: Unable to parse JSON from model output.")
-
-
-def translation_postprocess(result: str) -> str:
-    result = re.sub(r'\（[^）]*\）', '', result)
-    result = result.replace('...', '，')
-    result = re.sub(r'(?<=\d),(?=\d)', '', result)
-    result = result.replace('²', '的平方').replace(
-        '————', '：').replace('——', '：').replace('°', '度')
-    result = result.replace("AI", '人工智能')
-    result = result.replace('变压器', "Transformer")
-    return result
-
-
-def valid_translation(text: str, translation: str) -> tuple[bool, str]:
-    if (translation.startswith('```') and translation.endswith('```')):
-        translation = translation[3:-3]
-        return True, translation_postprocess(translation)
-
-    if (translation.startswith('“') and translation.endswith('”')) or (translation.startswith('"') and translation.endswith('"')):
-        translation = translation[1:-1]
-        return True, translation_postprocess(translation)
-
-    # Heuristics to remove prefixes like "翻译：“..."
-    if '翻译' in translation and '：“' in translation and '”' in translation:
-        translation = translation.split('：“')[-1].split('”')[0]
-        return True, translation_postprocess(translation)
-
-    if '翻译' in translation and ':"' in translation and '"' in translation:
-        translation = translation.split(':"')[-1].split('"')[0]
-        return True, translation_postprocess(translation)
-
-    if len(text) <= 10:
-        if len(translation) > 15:
-            return False, 'Only translate the following sentence and give me the result.'
-    elif len(translation) > len(text) * 0.75:
-        # Check if translation is suspiciously long compared to source
-        # Note: Original logic: len(translation) > len(text)*0.75 means translation is > 75% of text length? 
-        # Actually usually Chinese is shorter than English. If translation is > 75% of text, it might be okay?
-        # Original logic seems to forbid translation if it is NOT significantly shorter?
-        # Wait: "len(translation) > len(text)*0.75" -> if translation is longer than 0.75 * text.
-        # This seems aggressive for short texts.
-        # But I will keep original logic for parity.
-        return False, 'The translation is too long. Only translate the following sentence and give me the result.'
-    
-    # Check if translation is too short (content lost during translation)
-    # For longer texts (>100 chars), translation should be at least 15% of original length
-    # Chinese is typically shorter than English, but <15% indicates significant content loss
-    if len(text) > 100 and len(translation) < len(text) * 0.15:
-        return False, 'The translation is too short, content may be lost. Please translate the complete sentence.'
-
-    translation = translation.strip()
-    
-    # Newline is always forbidden in translation output
-    if '\n' in translation:
-        return False, "Don't include newlines in the translation. Only translate the following sentence and give me the result."
-    
-    # Check for explanation patterns that indicate LLM is explaining rather than translating
-    # Use precise patterns instead of simple substring matching to avoid false positives
-    # when the source text discusses translation, Chinese language, etc.
-    
-    explanation_patterns = [
-        # "翻译" patterns - reject when used as meta-explanation, allow when part of content
-        # e.g. reject "翻译：你好" or "翻译结果是你好", allow "机器翻译技术"
-        (r'^翻译[：:]\s*', '翻译：'),
-        (r'翻译(结果|如下|为|成)[：:]?\s*', '翻译结果/如下/为'),
-        (r'(以下|下面)是?.{0,2}翻译', '以下是翻译'),
-        
-        # "中文/简体中文" patterns - reject meta-explanation, allow content discussion
-        # e.g. reject "中文：你好" or "简体中文翻译：", allow "学习中文" or "中文版本"
-        (r'^(简体)?中文[：:]\s*', '中文：'),
-        (r'(简体)?中文翻译[：:]?\s*', '中文翻译：'),
-        (r'翻译成?(简体)?中文[：:]?\s*', '翻译成中文：'),
-        
-        # "这句" patterns - reject explanation, allow normal translation of "this statement"
-        (r'这句.{0,3}(的翻译|的意思|翻译成|意思是)', '这句的翻译/意思'),
-        
-        # English patterns - in Chinese translation, these usually indicate LLM explaining
-        # e.g. "Translation: ..." or "Translate to Chinese: ..."
-        (r'[Tt]ranslat(e|ion)[：:]\s*', 'Translation:'),
-        (r'[Tt]ranslat(e|ion)\s+(to|into)\s+', 'Translate to'),
-    ]
-    
-    for pattern, desc in explanation_patterns:
-        if re.search(pattern, translation):
-            return False, f"Don't include explanation patterns ({desc}) in the translation. Only give the translated result."
-
-    return True, translation_postprocess(translation)
-
 
 # --------------------------------------------------------------------------- #
 # Whisper punctuation fix (before translation)
@@ -635,19 +328,6 @@ def split_sentences(translation: list[dict[str, Any]]) -> list[dict[str, Any]]:
             start = sentence_end
             
     return output_data
-
-
-def _read_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
 
 
 def _normalize_translation_strategy(raw: str | None) -> str:
@@ -1310,12 +990,12 @@ def translate_folder(folder: str, target_language: str = '简体中文', setting
                 with open(summary_path, 'w', encoding='utf-8') as f:
                     json.dump(summary, f, indent=2, ensure_ascii=False)
         except Exception:
-            summary = summarize(info, transcript, target_language, settings=settings)
+            summary = summarize(info, transcript, target_language, settings=cfg)
             summary["translation_model"] = translation_model
             with open(summary_path, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
     else:
-        summary = summarize(info, transcript, target_language, settings=settings)
+        summary = summarize(info, transcript, target_language, settings=cfg)
         summary["translation_model"] = translation_model
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
