@@ -41,7 +41,7 @@ from .synthesize_video import (
     convert_resolution,
     synthesize_all_video_under_folder,
 )
-from .synthesize_video_subtitles import (
+from .video.subtitles import (
     format_timestamp,
     generate_srt,
     split_text,

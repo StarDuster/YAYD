@@ -487,7 +487,7 @@ if __name__ == "__main__":
     )
 
     # Use our worker script for this test only.
-    import youdub.steps.tts_qwen_worker as qw
+    import youdub.steps.tts.qwen_worker as qw
 
     monkeypatch.setattr(qw, "_get_qwen_worker_script_path", lambda: worker_path)
 

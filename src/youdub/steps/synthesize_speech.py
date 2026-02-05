@@ -8,8 +8,6 @@ Backend-specific details live under `steps/tts/`:
   - `speaker_ref.py`
   - `prompt.py`
   - `wav_guard.py`
-
-Compatibility shims keep the old import paths working (e.g. `youdub.steps.tts_gemini`).
 """
 
 from __future__ import annotations

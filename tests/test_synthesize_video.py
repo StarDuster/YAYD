@@ -104,7 +104,7 @@ def test_subtitle_style_params_4k_not_huge():
 
 
 def test_bilingual_source_text_keeps_multiple_sentences():
-    import youdub.steps.synthesize_video_subtitles as subs
+    import youdub.steps.video.subtitles as subs
 
     src = "Hello world. How are you? I'm fine!"
     out = subs._bilingual_source_text(src)
@@ -115,7 +115,7 @@ def test_bilingual_source_text_keeps_multiple_sentences():
 
 
 def test_bilingual_source_text_splits_overlong_sentence_by_clauses():
-    import youdub.steps.synthesize_video_subtitles as subs
+    import youdub.steps.video.subtitles as subs
 
     src = (
         "This is clause one, this is clause two, this is clause three, "
