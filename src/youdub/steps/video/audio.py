@@ -431,8 +431,6 @@ def _ensure_audio_combined(
 
             # Re-apply speech-rate scaling only when it actually affected output length.
             vr = pseg.get("voice_ratio", None)
-            sr_mode = pseg.get("speech_rate_mode", None)
-            sil = pseg.get("silence_ratio", None)
             if (
                 vr is not None
                 and target_samples > 0
@@ -440,12 +438,8 @@ def _ensure_audio_combined(
                 and int(tts_audio.shape[0]) != int(target_samples)
             ):
                 try:
-                    voice_ratio = float(vr)
-                    silence_ratio = float(sil) if sil is not None else float(voice_ratio)
-                    ratio_info = {"voice_ratio": float(voice_ratio), "silence_ratio": float(silence_ratio)}
-                    tts_audio, _scale_info = apply_scaling_ratio(
-                        tts_audio, sample_rate, ratio_info, mode=str(sr_mode or "single")
-                    )
+                    ratio_info = {"voice_ratio": float(vr)}
+                    tts_audio, _scale_info = apply_scaling_ratio(tts_audio, sample_rate, ratio_info)
                     tts_audio = np.asarray(tts_audio, dtype=np.float32).reshape(-1)
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.warning(f"按计划应用语速对齐失败，将回退到原始TTS: {exc}")

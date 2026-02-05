@@ -11,7 +11,7 @@ import numpy as np
 from loguru import logger
 
 from ..interrupts import check_cancelled
-from ..speech_rate import apply_scaling_ratio, compute_en_speech_rate, compute_scaling_ratio, compute_zh_speech_rate
+from ..speech_rate import apply_scaling_ratio, compute_en_speech_rate, compute_scaling_ratio
 
 
 def _read_env_bool(name: str, default: bool) -> bool:
@@ -115,19 +115,12 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
     gap_clause_s = 0.18
     gap_sentence_s = 0.25
 
-    # Optional: speech-rate based TTS time-scale modification (TSM) to match EN pacing.
+    # Speech-rate based TTS time-scale modification (TSM) settings.
     align_enabled = _read_env_bool("SPEECH_RATE_ALIGN_ENABLED", True)
-    align_mode = str(os.getenv("SPEECH_RATE_ALIGN_MODE", "single") or "single").strip().lower()
     voice_min = _read_env_float("SPEECH_RATE_VOICE_MIN_RATIO", 0.7)
-    # Default: only speed up, never slow down (avoid “拖音/橡皮筋”感)
     voice_max = _read_env_float("SPEECH_RATE_VOICE_MAX_RATIO", 1.0)
-    silence_min = _read_env_float("SPEECH_RATE_SILENCE_MIN_RATIO", 0.3)
-    silence_max = _read_env_float("SPEECH_RATE_SILENCE_MAX_RATIO", 3.0)
-    overall_min = _read_env_float("SPEECH_RATE_OVERALL_MIN_RATIO", 0.5)
-    overall_max = _read_env_float("SPEECH_RATE_OVERALL_MAX_RATIO", 2.0)
     align_threshold = _read_env_float("SPEECH_RATE_ALIGN_THRESHOLD", 0.05)
-    # Stabilize per-segment scaling to avoid audible jitter between adjacent sentences.
-    # Max allowed delta of voice_ratio between consecutive speech segments.
+    # Max allowed voice_ratio delta between consecutive speech segments.
     ratio_max_jump = _read_env_float("SPEECH_RATE_MAX_RATIO_JUMP", 0.15)
     ratio_max_jump = float(max(0.0, min(ratio_max_jump, 0.5)))
     # When TTS is shorter than the original segment, pad up to this many seconds of
@@ -135,7 +128,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
     tail_pad_max = _read_env_float("SPEECH_RATE_TAIL_PAD_MAX_SEC", 1.0)
     tail_pad_max = float(max(0.0, tail_pad_max))
     en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
-    zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
     audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
 
     # Global bias to avoid overall pacing drift.
@@ -176,7 +168,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
 
             if total_en > 0.0 and total_zh > 0.0:
                 align_global_bias = float(total_en / total_zh)
-                # We only use this to speed up overall pacing (cap at 1.0).
                 align_global_bias = float(max(0.3, min(align_global_bias, 1.0)))
                 logger.info(f"语速对齐: 全局bias={align_global_bias:.3f} (en={total_en:.1f}s, zh={total_zh:.1f}s)")
         except Exception as exc:  # pylint: disable=broad-except
@@ -228,7 +219,6 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
 
         ratio_info: dict[str, Any] | None = None
         en_stats: dict[str, Any] | None = None
-        zh_stats: dict[str, Any] | None = None
 
         # Optional: time-scale modify TTS to match EN pacing (speech rate) for this segment.
         if align_enabled and tts_audio.size > 0:
@@ -255,125 +245,66 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                                 intervals = np.zeros((0, 2), dtype=np.int64)
                             voiced_samples = 0
                             for st, ed in intervals:
-                                st_i = int(st)
-                                ed_i = int(ed)
-                                if ed_i > st_i:
-                                    voiced_samples += (ed_i - st_i)
+                                if int(ed) > int(st):
+                                    voiced_samples += int(ed) - int(st)
                             en_voiced_duration = float(voiced_samples) / float(en_sr) if voiced_samples > 0 else 0.0
                     except Exception:
                         en_voiced_duration = float(en_total_duration)
 
                 en_voiced_duration = float(max(0.0, min(en_voiced_duration, en_total_duration)))
-                en_silence_duration = float(max(0.0, en_total_duration - en_voiced_duration))
-                en_pause_ratio = float(en_silence_duration / en_total_duration) if en_total_duration > 0 else 0.0
 
                 en_stats = dict(compute_en_speech_rate(en_text, en_voiced_duration))
-                en_stats.update(
-                    {
-                        "total_duration": float(en_total_duration),
-                        "voiced_duration": float(en_voiced_duration),
-                        "silence_duration": float(en_silence_duration),
-                        "pause_ratio": float(en_pause_ratio),
-                    }
+
+                # Apply global bias by effectively increasing EN reference rate.
+                en_stats_used = dict(en_stats)
+                if float(align_global_bias) > 1e-6 and abs(float(align_global_bias) - 1.0) > 1e-6:
+                    en_stats_used["syllable_rate"] = float(en_stats_used.get("syllable_rate", 0.0)) / float(
+                        align_global_bias
+                    )
+
+                zh_text = str(seg.get("translation") or "")
+                zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
+                zh_syllables_count = 0
+                zh_syllable_rate = 0.0
+                if zh_total_duration > 0:
+                    from ..speech_rate import count_zh_syllables
+
+                    zh_syllables_count = count_zh_syllables(zh_text)
+                    zh_syllable_rate = float(zh_syllables_count) / zh_total_duration
+                zh_stats_for_ratio: dict[str, Any] = {"syllable_rate": zh_syllable_rate}
+
+                ratio_info = compute_scaling_ratio(
+                    en_stats_used,
+                    zh_stats_for_ratio,
+                    voice_min=voice_min,
+                    voice_max=voice_max,
                 )
+
+                # Per-segment smoothing: limit ratio jump vs previous segment.
+                if ratio_info and float(ratio_max_jump) > 1e-9:
+                    vr0 = float(ratio_info.get("voice_ratio", 1.0) or 1.0)
+                    lo = float(prev_voice_ratio) - float(ratio_max_jump)
+                    hi = float(prev_voice_ratio) + float(ratio_max_jump)
+                    vr1 = float(max(lo, min(hi, vr0)))
+                    vr1 = float(max(float(voice_min), min(float(voice_max), vr1)))
+                    if abs(vr1 - vr0) > 1e-9:
+                        ratio_info["voice_ratio"] = float(vr1)
+                    prev_voice_ratio = float(ratio_info.get("voice_ratio", vr1) or vr1)
+                elif ratio_info:
+                    prev_voice_ratio = float(ratio_info.get("voice_ratio", prev_voice_ratio) or prev_voice_ratio)
+
+                vr = float(ratio_info.get("voice_ratio", 1.0))
+                if abs(vr - 1.0) > float(align_threshold):
+                    tts_audio, _scale_info = apply_scaling_ratio(tts_audio, sample_rate, ratio_info)
+                    if bool(ratio_info.get("clamped")):
+                        logger.warning(
+                            f"段落 {i}: 语速比例已触发 clamp "
+                            f"(raw={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{vr:.3f})"
+                        )
             except Exception as exc:  # pylint: disable=broad-except
-                logger.warning(f"段落 {i}: 计算英文语速失败，将跳过语速对齐: {exc}")
+                logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
+                ratio_info = None
                 en_stats = None
-
-            if en_stats:
-                try:
-                    zh_text = str(seg.get("translation") or "")
-                    zh_total_duration = float(tts_audio.shape[0]) / float(sample_rate) if tts_audio.shape[0] > 0 else 0.0
-
-                    # ZH voiced duration from TTS itself (VAD).
-                    zh_voiced_duration = float(zh_total_duration)
-                    if tts_audio.size > 0 and sample_rate > 0:
-                        try:
-                            intervals = librosa.effects.split(tts_audio.astype(np.float32, copy=False), top_db=float(zh_vad_top_db))
-                        except Exception:
-                            intervals = np.zeros((0, 2), dtype=np.int64)
-                        voiced_samples = 0
-                        for st, ed in intervals:
-                            st_i = int(st)
-                            ed_i = int(ed)
-                            if ed_i > st_i:
-                                voiced_samples += (ed_i - st_i)
-                        zh_voiced_duration = float(voiced_samples) / float(sample_rate) if voiced_samples > 0 else 0.0
-
-                    zh_voiced_duration = float(max(0.0, min(zh_voiced_duration, zh_total_duration)))
-                    zh_silence_duration = float(max(0.0, zh_total_duration - zh_voiced_duration))
-                    zh_pause_ratio = float(zh_silence_duration / zh_total_duration) if zh_total_duration > 0 else 0.0
-
-                    zh_stats = dict(compute_zh_speech_rate(zh_text, zh_voiced_duration))
-                    zh_stats.update(
-                        {
-                            "total_duration": float(zh_total_duration),
-                            "voiced_duration": float(zh_voiced_duration),
-                            "silence_duration": float(zh_silence_duration),
-                            "pause_ratio": float(zh_pause_ratio),
-                        }
-                    )
-
-                    # Apply global bias by effectively increasing EN reference rate.
-                    en_stats_used = dict(en_stats)
-                    if float(align_global_bias) > 1e-6 and abs(float(align_global_bias) - 1.0) > 1e-6:
-                        en_stats_used["syllable_rate"] = float(en_stats_used.get("syllable_rate", 0.0)) / float(
-                            align_global_bias
-                        )
-
-                    ratio_info = compute_scaling_ratio(
-                        en_stats_used,
-                        zh_stats,
-                        mode=align_mode,
-                        voice_min=voice_min,
-                        voice_max=voice_max,
-                        silence_min=silence_min,
-                        silence_max=silence_max,
-                        overall_min=overall_min,
-                        overall_max=overall_max,
-                    )
-
-                    # Per-segment smoothing: limit ratio jump vs previous segment.
-                    if ratio_info and float(ratio_max_jump) > 1e-9:
-                        try:
-                            vr0 = float(ratio_info.get("voice_ratio", 1.0) or 1.0)
-                            lo = float(prev_voice_ratio) - float(ratio_max_jump)
-                            hi = float(prev_voice_ratio) + float(ratio_max_jump)
-                            vr1 = float(max(lo, min(hi, vr0)))
-                            vr1 = float(max(float(voice_min), min(float(voice_max), vr1)))
-                            if abs(vr1 - vr0) > 1e-9:
-                                ratio_info["voice_ratio"] = float(vr1)
-                                # Keep silence ratio consistent in single mode (or when it's effectively the same).
-                                m = str(ratio_info.get("mode") or align_mode).strip().lower()
-                                sr0 = float(ratio_info.get("silence_ratio", vr0) or vr0)
-                                if m == "single" or abs(float(sr0) - float(vr0)) <= 1e-6:
-                                    ratio_info["silence_ratio"] = float(vr1)
-                            prev_voice_ratio = float(ratio_info.get("voice_ratio", vr1) or vr1)
-                        except Exception:
-                            # Best-effort: never fail alignment due to smoothing.
-                            prev_voice_ratio = float(ratio_info.get("voice_ratio", prev_voice_ratio) or prev_voice_ratio)
-                    elif ratio_info:
-                        try:
-                            prev_voice_ratio = float(ratio_info.get("voice_ratio", prev_voice_ratio) or prev_voice_ratio)
-                        except Exception:
-                            pass
-                    if abs(float(ratio_info.get("voice_ratio", 1.0)) - 1.0) > float(align_threshold) or abs(
-                        float(ratio_info.get("silence_ratio", 1.0)) - 1.0
-                    ) > float(align_threshold):
-                        tts_audio, _scale_info = apply_scaling_ratio(
-                            tts_audio, sample_rate, ratio_info, mode=str(ratio_info.get("mode", align_mode))
-                        )
-                        if bool(ratio_info.get("clamped")):
-                            logger.warning(
-                                f"段落 {i}: 语速比例已触发 clamp "
-                                f"(voice={ratio_info.get('voice_ratio_raw', 1.0):.3f}->{ratio_info.get('voice_ratio', 1.0):.3f}, "
-                                f"silence={ratio_info.get('silence_ratio_raw', 1.0):.3f}->{ratio_info.get('silence_ratio', 1.0):.3f})"
-                            )
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.warning(f"段落 {i}: 语速对齐失败，将使用原始TTS: {exc}")
-                    ratio_info = None
-                    en_stats = None
-                    zh_stats = None
 
         # If alignment wasn't applied, reset the smoothing anchor.
         if ratio_info is None:
@@ -409,32 +340,10 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
                 "src_end": round(orig_end, 6),
                 "target_duration": round(target_duration, 6),
                 "target_samples": int(target_samples),
-                "speech_rate_mode": (ratio_info.get("mode") if ratio_info else None),
                 "voice_ratio": (round(float(ratio_info.get("voice_ratio", 1.0)), 6) if ratio_info else None),
-                "silence_ratio": (round(float(ratio_info.get("silence_ratio", 1.0)), 6) if ratio_info else None),
                 "voice_ratio_raw": (round(float(ratio_info.get("voice_ratio_raw", 1.0)), 6) if ratio_info else None),
-                "voice_ratio_rate_raw": (round(float(ratio_info.get("voice_ratio_rate_raw", 1.0)), 6) if ratio_info else None),
-                "voice_ratio_budget_raw": (
-                    round(float(ratio_info.get("voice_ratio_budget_raw", 1.0)), 6) if ratio_info else None
-                ),
-                "speech_rate_budget_weight": (
-                    round(float(ratio_info.get("speech_rate_budget_weight", 0.0)), 6) if ratio_info else None
-                ),
-                "silence_ratio_raw": (round(float(ratio_info.get("silence_ratio_raw", 1.0)), 6) if ratio_info else None),
-                "speech_rate_global_bias": (round(float(align_global_bias), 6) if ratio_info else None),
-                "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
-                "speech_rate_zh": (round(float(zh_stats.get("syllable_rate", 0.0)), 6) if zh_stats else None),
-                "speech_syllables_en": (int(en_stats.get("syllable_count", 0)) if en_stats else None),
-                "speech_syllables_zh": (int(zh_stats.get("syllable_count", 0)) if zh_stats else None),
-                "en_total_duration": (round(float(en_stats.get("total_duration", 0.0)), 6) if en_stats else None),
-                "en_voiced_duration": (round(float(en_stats.get("voiced_duration", 0.0)), 6) if en_stats else None),
-                "en_silence_duration": (round(float(en_stats.get("silence_duration", 0.0)), 6) if en_stats else None),
-                "en_pause_ratio": (round(float(en_stats.get("pause_ratio", 0.0)), 6) if en_stats else None),
-                "zh_total_duration": (round(float(zh_stats.get("total_duration", 0.0)), 6) if zh_stats else None),
-                "zh_voiced_duration": (round(float(zh_stats.get("voiced_duration", 0.0)), 6) if zh_stats else None),
-                "zh_silence_duration": (round(float(zh_stats.get("silence_duration", 0.0)), 6) if zh_stats else None),
-                "zh_pause_ratio": (round(float(zh_stats.get("pause_ratio", 0.0)), 6) if zh_stats else None),
                 "speech_rate_clamped": (bool(ratio_info.get("clamped")) if ratio_info else None),
+                "speech_rate_en": (round(float(en_stats.get("syllable_rate", 0.0)), 6) if en_stats else None),
             }
         )
 
@@ -518,4 +427,3 @@ def prepare_all_adaptive_alignment_under_folder(folder: str, sample_rate: int = 
     msg = f"自适应对轴准备完成: {folder}" + (f"（{', '.join(parts)}）" if parts else "")
     logger.info(msg)
     return msg
-
