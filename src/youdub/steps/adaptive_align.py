@@ -130,6 +130,10 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
     # Max allowed delta of voice_ratio between consecutive speech segments.
     ratio_max_jump = _read_env_float("SPEECH_RATE_MAX_RATIO_JUMP", 0.15)
     ratio_max_jump = float(max(0.0, min(ratio_max_jump, 0.5)))
+    # When TTS is shorter than the original segment, pad up to this many seconds of
+    # silence so the video doesn't have to be sped up as aggressively.
+    tail_pad_max = _read_env_float("SPEECH_RATE_TAIL_PAD_MAX_SEC", 1.0)
+    tail_pad_max = float(max(0.0, tail_pad_max))
     en_vad_top_db = _read_env_float("SPEECH_RATE_EN_VAD_TOP_DB", 30.0)
     zh_vad_top_db = _read_env_float("SPEECH_RATE_ZH_VAD_TOP_DB", 30.0)
     audio_vocals_path = os.path.join(folder, "audio_vocals.wav")
@@ -377,6 +381,17 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
 
         target_samples = int(tts_audio.shape[0])
         target_duration = float(target_samples) / float(sample_rate) if target_samples > 0 else 0.0
+
+        # Tail padding: if speech is shorter than the original segment, pad silence
+        # so the corresponding video segment doesn't need to be fast-forwarded as much.
+        orig_seg_duration = float(max(0.0, orig_end - orig_start))
+        if target_duration > 0 and target_duration < orig_seg_duration and float(tail_pad_max) > 0:
+            shortfall = float(orig_seg_duration - target_duration)
+            pad_sec = float(min(shortfall, float(tail_pad_max)))
+            if pad_sec > 0.01:
+                pad_samples = int(round(pad_sec * float(sample_rate)))
+                target_samples += pad_samples
+                target_duration = float(target_samples) / float(sample_rate)
 
         # Record adaptive translation (speech segments only).
         start_s = float(t_cursor_samples) / float(sample_rate)
