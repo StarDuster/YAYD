@@ -649,7 +649,11 @@ def num2chn(number_string, numbering_type=NUMBERING_TYPES[1], big=False,
             result_unit = next(u for u in reversed(
                 system.units) if u.power < len(striped_string))
             result_string = value_string[:-result_unit.power]
-            return get_value(result_string) + [result_unit] + get_value(striped_string[-result_unit.power:])
+            return (
+                get_value(result_string, use_zeros=use_zeros)
+                + [result_unit]
+                + get_value(striped_string[-result_unit.power:], use_zeros=use_zeros)
+            )
 
     system = create_system(numbering_type)
 
@@ -665,7 +669,7 @@ def num2chn(number_string, numbering_type=NUMBERING_TYPES[1], big=False,
             "invalid input num string with more than one dot: {}".format(number_string))
 
     if use_units and len(int_string) > 1:
-        result_symbols = get_value(int_string)
+        result_symbols = get_value(int_string, use_zeros=use_zeros)
     else:
         result_symbols = [system.digits[int(c)] for c in int_string]
     dec_symbols = [system.digits[int(c)] for c in dec_string]
