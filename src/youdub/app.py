@@ -747,12 +747,12 @@ def _pipeline_asr_visibility(asr_method):
         gr.update(visible=is_whisper),  # whisper_batch_size
         gr.update(visible=is_qwen),   # qwen_threads
         gr.update(visible=is_qwen),   # qwen_vad
-        gr.update(visible=is_whisper),  # diarization
-        gr.update(visible=is_whisper),  # min_speakers
-        gr.update(visible=is_whisper),  # max_speakers
-        gr.update(visible=is_whisper),  # pyannote_seg_thr
-        gr.update(visible=is_whisper),  # pyannote_seg_min_off
-        gr.update(visible=is_whisper),  # pyannote_clust_thr
+        gr.update(visible=True),  # diarization (independent of ASR engine)
+        gr.update(visible=True),  # min_speakers
+        gr.update(visible=True),  # max_speakers
+        gr.update(visible=True),  # pyannote_seg_thr
+        gr.update(visible=True),  # pyannote_seg_min_off
+        gr.update(visible=True),  # pyannote_clust_thr
     )
 
 with gr.Blocks(title="全自动") as do_everything_interface:
@@ -835,36 +835,36 @@ with gr.Blocks(title="全自动") as do_everything_interface:
         pipeline_diarization = gr.Checkbox(
             label="说话人分离",
             value=False,
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         pipeline_min_speakers = gr.Number(
             label="最少说话人数（可选）",
             value=None, step=1, precision=0,
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         pipeline_max_speakers = gr.Number(
             label="最多说话人数（可选）",
             value=None, step=1, precision=0,
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         gr.Markdown("#### 说话人分离（高级参数，可选）")
         pipeline_pyannote_segmentation_threshold = gr.Textbox(
             label="segmentation.threshold（可选）",
             value="",
             placeholder="留空=默认，例如 0.5",
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         pipeline_pyannote_segmentation_min_duration_off = gr.Textbox(
             label="segmentation.min_duration_off（秒，可选）",
             value="",
             placeholder="留空=默认，例如 0.5",
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         pipeline_pyannote_clustering_threshold = gr.Textbox(
             label="clustering.threshold（可选）",
             value="",
             placeholder="留空=默认，例如 0.7",
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
 
         # 翻译设置
@@ -1131,12 +1131,12 @@ def _asr_visibility(asr_method):
         gr.update(visible=is_whisper),  # whisper_batch_size
         gr.update(visible=is_qwen),   # qwen_threads
         gr.update(visible=is_qwen),   # qwen_vad
-        gr.update(visible=is_whisper),  # diarization
-        gr.update(visible=is_whisper),  # min_speakers
-        gr.update(visible=is_whisper),  # max_speakers
-        gr.update(visible=is_whisper),  # pyannote_seg_thr
-        gr.update(visible=is_whisper),  # pyannote_seg_min_off
-        gr.update(visible=is_whisper),  # pyannote_clust_thr
+        gr.update(visible=True),  # diarization (independent of ASR engine)
+        gr.update(visible=True),  # min_speakers
+        gr.update(visible=True),  # max_speakers
+        gr.update(visible=True),  # pyannote_seg_thr
+        gr.update(visible=True),  # pyannote_seg_min_off
+        gr.update(visible=True),  # pyannote_clust_thr
     )
 
 with gr.Blocks(title="语音识别") as whisper_inference:
@@ -1197,36 +1197,36 @@ with gr.Blocks(title="语音识别") as whisper_inference:
         diarization_input = gr.Checkbox(
             label="说话人分离",
             value=False,
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         min_speakers_input = gr.Number(
             label="最少说话人数（可选）",
             value=None, step=1, precision=0,
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         max_speakers_input = gr.Number(
             label="最多说话人数（可选）",
             value=None, step=1, precision=0,
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         gr.Markdown("#### 说话人分离（高级参数，可选）")
         pyannote_segmentation_threshold_input = gr.Textbox(
             label="segmentation.threshold（可选）",
             value="",
             placeholder="留空=默认，例如 0.5",
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         pyannote_segmentation_min_duration_off_input = gr.Textbox(
             label="segmentation.min_duration_off（秒，可选）",
             value="",
             placeholder="留空=默认，例如 0.5",
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
         pyannote_clustering_threshold_input = gr.Textbox(
             label="clustering.threshold（可选）",
             value="",
             placeholder="留空=默认，例如 0.7",
-            visible=(settings.asr_method == "whisper"),
+            visible=True,
         )
 
         output_box = gr.Textbox(label="输出", lines=20, max_lines=20, autoscroll=False, elem_classes=["youdub-output"])
