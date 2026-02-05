@@ -915,7 +915,7 @@ with gr.Blocks(title="全自动") as do_everything_interface:
         with gr.Row():
             pipeline_submit_btn = gr.Button("开始全流程", variant="primary")
             pipeline_stop_btn = gr.Button("停止", variant="stop")
-            pipeline_clear_btn = gr.ClearButton([pipeline_output], value="清空")
+            gr.ClearButton([pipeline_output], value="清空")
 
     # 动态切换 ASR 设置可见性
     pipeline_asr_method_input.change(
@@ -1005,7 +1005,7 @@ with gr.Blocks(title="下载视频") as youtube_interface:
         with gr.Row():
             youtube_submit_btn = gr.Button("开始下载", variant="primary")
             youtube_stop_btn = gr.Button("停止", variant="stop")
-            youtube_clear_btn = gr.ClearButton([youtube_output], value="清空")
+            gr.ClearButton([youtube_output], value="清空")
 
     _youtube_event = youtube_submit_btn.click(
         fn=_streamify(download_from_url),
@@ -1047,7 +1047,7 @@ with gr.Blocks(title="人声分离") as demucs_interface:
         with gr.Row():
             demucs_submit_btn = gr.Button("开始分离", variant="primary")
             demucs_stop_btn = gr.Button("停止", variant="stop")
-            demucs_clear_btn = gr.ClearButton([demucs_output], value="清空")
+            gr.ClearButton([demucs_output], value="清空")
 
     _demucs_event = demucs_submit_btn.click(
         fn=_streamify(_demucs_wrapper),
@@ -1234,7 +1234,7 @@ with gr.Blocks(title="语音识别") as whisper_inference:
         with gr.Row():
             submit_btn = gr.Button("开始识别", variant="primary")
             stop_btn = gr.Button("停止", variant="stop")
-            clear_btn = gr.ClearButton([output_box], value="清空")
+            gr.ClearButton([output_box], value="清空")
 
     # 动态切换可见性
     asr_method_input.change(
@@ -1323,7 +1323,7 @@ with gr.Blocks(title="字幕翻译") as translation_interface:
         with gr.Row():
             translation_submit_btn = gr.Button("开始翻译", variant="primary")
             translation_stop_btn = gr.Button("停止", variant="stop")
-            translation_clear_btn = gr.ClearButton([translation_output], value="清空")
+            gr.ClearButton([translation_output], value="清空")
 
     _translation_event = translation_submit_btn.click(
         fn=_streamify(run_translation),
@@ -1375,7 +1375,7 @@ with gr.Blocks(title="语音合成") as tts_interface:
         with gr.Row():
             tts_submit_btn = gr.Button("开始配音", variant="primary")
             tts_stop_btn = gr.Button("停止", variant="stop")
-            tts_clear_btn = gr.ClearButton([tts_output], value="清空")
+            gr.ClearButton([tts_output], value="清空")
 
     _tts_event = tts_submit_btn.click(
         fn=_streamify(_tts_wrapper),
@@ -1438,7 +1438,7 @@ with gr.Blocks(title="视频合成") as synthesize_video_interface:
         with gr.Row():
             synth_submit_btn = gr.Button("开始合成", variant="primary")
             synth_stop_btn = gr.Button("停止", variant="stop")
-            synth_clear_btn = gr.ClearButton([synth_output], value="清空")
+            gr.ClearButton([synth_output], value="清空")
 
     _synth_event = synth_submit_btn.click(
         fn=_streamify(_synthesize_video_wrapper),
@@ -1468,7 +1468,7 @@ with gr.Blocks(title="生成信息") as generate_info_interface:
         with gr.Row():
             info_submit_btn = gr.Button("开始生成", variant="primary")
             info_stop_btn = gr.Button("停止", variant="stop")
-            info_clear_btn = gr.ClearButton([info_output], value="清空")
+            gr.ClearButton([info_output], value="清空")
 
     _info_event = info_submit_btn.click(
         fn=generate_all_info_under_folder_stream,
@@ -1488,7 +1488,7 @@ with gr.Blocks(title="上传 B 站") as upload_bilibili_interface:
         with gr.Row():
             upload_submit_btn = gr.Button("开始上传", variant="primary")
             upload_stop_btn = gr.Button("停止", variant="stop")
-            upload_clear_btn = gr.ClearButton([upload_output], value="清空")
+            gr.ClearButton([upload_output], value="清空")
 
     _upload_event = upload_submit_btn.click(
         fn=_streamify(upload_all_videos_under_folder),

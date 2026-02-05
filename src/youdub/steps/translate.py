@@ -1390,7 +1390,7 @@ def translate_all_transcript_under_folder(folder: str, target_language: str, set
     count = 0
     skipped = 0
     no_transcript = 0
-    for root, dirs, files in os.walk(folder):
+    for root, _dirs, files in os.walk(folder):
         check_cancelled()
         if 'transcript.json' not in files:
             # 只统计有 download.info.json 的文件夹（说明是视频目录）

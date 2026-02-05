@@ -79,7 +79,7 @@ class VideoPipeline:
         qwen_asr_num_threads: int = 1,
         qwen_asr_vad_segment_threshold: int = 60,
     ) -> bool:
-        for retry in range(max_retries):
+        for attempt in range(max_retries):
             check_cancelled()
             try:
                 check_cancelled()
@@ -187,7 +187,7 @@ class VideoPipeline:
                         upload_video_async(folder)
                 return True
             except Exception as exc:  # pylint: disable=broad-except
-                logger.exception(f"处理失败: {info.get('title')} ({exc})")
+                logger.exception(f"处理失败({attempt + 1}/{max_retries}): {info.get('title')} ({exc})")
         return False
 
     def run(

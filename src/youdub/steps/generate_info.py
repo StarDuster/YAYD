@@ -68,7 +68,7 @@ def generate_all_info_under_folder(root_folder):
     check_cancelled()
     start = time.time()
     count = 0
-    for root, dirs, files in os.walk(root_folder):
+    for root, _dirs, files in os.walk(root_folder):
         check_cancelled()
         if 'download.info.json' in files:
             generate_info(root)
