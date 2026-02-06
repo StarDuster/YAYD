@@ -260,3 +260,99 @@ def prepare_speaker_ref_audio(
         wav = wav * (0.95 / peak)
 
     return wav.astype(np.float32)
+
+
+def fade_edges(
+    wav: np.ndarray,
+    *,
+    fade_in_ms: float = 3.0,
+    fade_out_ms: float = 3.0,
+    sample_rate: int = 24000,
+) -> np.ndarray:
+    """Apply short linear fade-in / fade-out to prevent clicks at audio boundaries.
+
+    Args:
+        wav: Input waveform (float)
+        fade_in_ms: Fade-in duration in milliseconds (0 to skip, default 3.0)
+        fade_out_ms: Fade-out duration in milliseconds (0 to skip, default 3.0)
+        sample_rate: Audio sample rate
+
+    Returns:
+        Waveform with fades applied (float32)
+    """
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.size <= 1:
+        return wav
+
+    n_in = int(max(0.0, float(fade_in_ms)) * float(sample_rate) / 1000.0)
+    n_out = int(max(0.0, float(fade_out_ms)) * float(sample_rate) / 1000.0)
+
+    if n_in <= 0 and n_out <= 0:
+        return wav
+
+    total = n_in + n_out
+    if total > wav.size:
+        half = max(1, wav.size // 2)
+        n_in = min(n_in, half)
+        n_out = min(n_out, max(1, wav.size - n_in))
+
+    out = wav.copy()
+    if n_in > 0:
+        out[:n_in] *= np.linspace(0.0, 1.0, n_in, dtype=np.float32)
+    if n_out > 0:
+        out[-n_out:] *= np.linspace(1.0, 0.0, n_out, dtype=np.float32)
+
+    return out
+
+
+def anti_pop_tts_segment(
+    wav: np.ndarray,
+    *,
+    sample_rate: int = 24000,
+    clip_threshold: float = 0.88,
+    smooth_max_diff: float = 0.4,
+    smooth_alpha: float = 0.3,
+    fade_in_ms: float = 2.0,
+    fade_out_ms: float = 2.0,
+) -> np.ndarray:
+    """Apply anti-pop processing to a TTS audio segment.
+
+    Reduces plosive/click artifacts in TTS-generated speech by:
+    1. Soft clipping harsh peaks
+    2. Smoothing rapid transients
+    3. Applying short fade-in/fade-out
+
+    Designed for individual TTS segments (typically a few seconds each).
+
+    Args:
+        wav: Input waveform (float, mono)
+        sample_rate: Audio sample rate
+        clip_threshold: Soft clip threshold (default 0.88)
+        smooth_max_diff: Max sample-to-sample diff for transient smoothing (default 0.4)
+        smooth_alpha: Smoothing factor when transient detected (default 0.3)
+        fade_in_ms: Fade-in duration in ms (default 2.0)
+        fade_out_ms: Fade-out duration in ms (default 2.0)
+
+    Returns:
+        Processed waveform (float32)
+    """
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size <= 1:
+        return wav
+
+    # 1. Soft clip to reduce harsh peaks
+    wav = soft_clip(wav, threshold=float(clip_threshold), knee=0.1)
+
+    # 2. Smooth rapid transients (the key step — changes waveform *shape*,
+    #    so the effect survives subsequent peak normalization)
+    wav = smooth_transients(wav, max_diff=float(smooth_max_diff), alpha=float(smooth_alpha))
+
+    # 3. Fade edges to prevent boundary clicks
+    wav = fade_edges(
+        wav,
+        fade_in_ms=float(fade_in_ms),
+        fade_out_ms=float(fade_out_ms),
+        sample_rate=int(sample_rate),
+    )
+
+    return wav.astype(np.float32)

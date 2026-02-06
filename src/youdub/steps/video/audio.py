@@ -14,7 +14,7 @@ from loguru import logger
 
 from ...interrupts import check_cancelled
 from ...speech_rate import apply_scaling_ratio
-from ...utils import save_wav, save_wav_norm, valid_file
+from ...utils import anti_pop_tts_segment, fade_edges, save_wav, save_wav_norm, soft_clip, valid_file
 
 from .fs import _is_stale
 
@@ -37,7 +37,8 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v12: normalize EN syllable counting for numbers/initialisms (affects alignment ratios).
 # v13: use VAD-based voiced duration + global bias for alignment (avoid overall pacing drift).
 # v14: blend speech-rate ratio with time-budget ratio (stabilize per-segment pacing).
-_AUDIO_COMBINED_MIX_VERSION = 14
+# v15: apply anti-pop processing (soft_clip + smooth_transients + fade) to TTS segments.
+_AUDIO_COMBINED_MIX_VERSION = 15
 
 
 def _read_audio_combined_meta(folder: str) -> dict[str, Any] | None:
@@ -447,6 +448,12 @@ def _ensure_audio_combined(
             if target_samples <= 0:
                 continue
 
+            # Anti-pop: reduce plosive/click artifacts in TTS output.
+            # smooth_transients changes the waveform *shape* (not just amplitude),
+            # so the effect survives the subsequent peak normalization in save_wav_norm.
+            if tts_audio.size > 0:
+                tts_audio = anti_pop_tts_segment(tts_audio, sample_rate=sample_rate)
+
             if tts_audio.shape[0] < target_samples:
                 tts_audio = np.pad(tts_audio, (0, target_samples - int(tts_audio.shape[0])), mode="constant")
             else:
@@ -471,7 +478,9 @@ def _ensure_audio_combined(
 
             try:
                 audio, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
-                audio_segments.append(audio.astype(np.float32, copy=False))
+                # Lightweight anti-pop: soft clip to reduce harsh peaks
+                audio = soft_clip(audio.astype(np.float32, copy=False), threshold=0.88, knee=0.1)
+                audio_segments.append(audio)
             except Exception as e:
                 logger.warning(f"加载TTS音频失败 {wav_path}: {e}")
                 continue
@@ -480,6 +489,10 @@ def _ensure_audio_combined(
             raise ValueError("没有有效的TTS音频片段")
 
         audio_tts = np.concatenate(audio_segments).astype(np.float32, copy=False)
+
+    # Gentle fade-in at the very start to prevent abrupt onset after silence trimming.
+    if len(audio_tts) > 0:
+        audio_tts = fade_edges(audio_tts, fade_in_ms=5.0, fade_out_ms=0.0, sample_rate=sample_rate)
 
     # 混音校准：
     # - audio_vocals.wav / audio_instruments.wav 是 Demucs 分离产物（历史上会被各自归一化到峰值）
