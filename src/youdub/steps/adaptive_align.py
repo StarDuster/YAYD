@@ -357,15 +357,15 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
         if target_duration > 0 and target_duration < orig_seg_duration and float(tail_pad_max) > 0:
             shortfall = float(orig_seg_duration - target_duration)
             # Use punctuation to gauge semantic connection to the next segment.
-            # Sentence-ending marks signal a natural break → full padding OK.
-            # Clause-level / no punctuation → tightly connected → short padding.
-            zh_tail = str(seg.get("translation") or "").strip()
-            zh_tail = zh_tail[-1] if zh_tail else ""
-            punct_factor = 1.0 if zh_tail in {"。", "！", "？", ".", "!", "?"} else 0.3
-            # Also cap padding by segment length so short sentences won't get
-            # an unnaturally long silence gap even if they end with "。".
-            length_cap = float(orig_seg_duration) * 0.15
-            effective_pad_max = float(min(float(tail_pad_max) * float(punct_factor), float(length_cap)))
+            # Sentence-ending marks (。！？) signal a natural break → allow full padding.
+            # Clause-level / no punctuation → tightly connected → cap at 30%.
+            # Note: shortfall itself is the hard ceiling — we can never pad more than
+            # the gap between TTS duration and original segment duration.
+            zh_tail = str(seg.get("translation") or "").strip()[-1:] or ""
+            if zh_tail in {"。", "！", "？", ".", "!", "?"}:
+                effective_pad_max = float(tail_pad_max)
+            else:
+                effective_pad_max = float(tail_pad_max) * 0.3
             pad_sec = float(min(shortfall, effective_pad_max))
             if pad_sec > 0.01:
                 pad_samples = int(round(pad_sec * float(sample_rate)))
