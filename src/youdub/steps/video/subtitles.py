@@ -706,7 +706,12 @@ def generate_bilingual_ass(
     for seg in translation:
         check_cancelled()
         zh_raw = str(seg.get("translation") or "").strip()
-        en_raw = _bilingual_source_text(str(seg.get("text") or ""))
+        # NOTE:
+        # `_bilingual_source_text()` may insert hard newlines for long sentences. Those hard breaks
+        # can actually INCREASE the final rendered line count after `wrap_text()` (because wrapping
+        # becomes per-paragraph). For the on-screen subtitle layout we prefer a compact result, so
+        # we disable hard-break injection here and let `wrap_text()` do a single pass of wrapping.
+        en_raw = _bilingual_source_text(str(seg.get("text") or ""), max_words=0, max_chars=0)
         if not zh_raw and not en_raw:
             continue
 
@@ -762,7 +767,7 @@ def generate_srt(
             end = format_timestamp(line["end"])
             tr_text = str(line.get("translation", "") or "").strip()
             src_text = (
-                _bilingual_source_text(str(line.get("text", "") or ""))
+                _bilingual_source_text(str(line.get("text", "") or ""), max_words=0, max_chars=0)
                 if bilingual_subtitle
                 else str(line.get("text", "") or "").strip()
             )
