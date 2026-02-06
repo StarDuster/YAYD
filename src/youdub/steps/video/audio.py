@@ -14,7 +14,7 @@ from loguru import logger
 
 from ...interrupts import check_cancelled
 from ...speech_rate import apply_scaling_ratio
-from ...utils import anti_pop_tts_segment, fade_edges, save_wav, save_wav_norm, soft_clip, valid_file
+from ...utils import anti_pop_tts_segment, fade_edges, save_wav, save_wav_norm, smooth_transients, soft_clip, valid_file
 
 from .fs import _is_stale
 
@@ -38,7 +38,9 @@ _AUDIO_COMBINED_META_NAME = ".audio_combined.json"
 # v13: use VAD-based voiced duration + global bias for alignment (avoid overall pacing drift).
 # v14: blend speech-rate ratio with time-budget ratio (stabilize per-segment pacing).
 # v15: apply anti-pop processing (soft_clip + smooth_transients + fade) to TTS segments.
-_AUDIO_COMBINED_MIX_VERSION = 15
+# v16: strengthen anti-pop — cap alpha in smooth_transients to guarantee max_diff;
+#      lower per-segment threshold to 0.3; apply smooth_transients to final combined audio.
+_AUDIO_COMBINED_MIX_VERSION = 16
 
 
 def _read_audio_combined_meta(folder: str) -> dict[str, Any] | None:
@@ -793,6 +795,10 @@ def _ensure_audio_combined(
             # 混合：TTS + 伴奏（1:1 混合，与 origin/master 保持一致）
             audio_combined = (audio_tts + instruments).astype(np.float32, copy=False)
 
+            # Anti-pop on combined audio: smooth_transients changes the waveform *shape*
+            # so the effect survives the subsequent peak normalization.
+            audio_combined = smooth_transients(audio_combined, max_diff=0.35, alpha=0.3)
+
             # 归一化到峰值，确保音量正常且不削波
             save_wav_norm(audio_combined, audio_combined_path, sample_rate=sample_rate)
             _write_audio_combined_meta(
@@ -803,7 +809,8 @@ def _ensure_audio_combined(
             logger.info(f"已生成 audio_combined.wav: {audio_combined_path}")
         except Exception as e:
             logger.warning(f"混合背景音乐失败，仅使用TTS音频: {e}")
-            save_wav_norm(audio_tts, audio_combined_path, sample_rate=sample_rate)
+            audio_tts_safe = smooth_transients(audio_tts, max_diff=0.35, alpha=0.3)
+            save_wav_norm(audio_tts_safe, audio_combined_path, sample_rate=sample_rate)
             _write_audio_combined_meta(
                 folder,
                 adaptive_segment_stretch=adaptive_segment_stretch,
@@ -811,7 +818,8 @@ def _ensure_audio_combined(
             )
     else:
         # 没有背景音乐，直接使用TTS音频（归一化以确保音量正常）
-        save_wav_norm(audio_tts, audio_combined_path, sample_rate=sample_rate)
+        audio_tts_safe = smooth_transients(audio_tts, max_diff=0.35, alpha=0.3)
+        save_wav_norm(audio_tts_safe, audio_combined_path, sample_rate=sample_rate)
         _write_audio_combined_meta(
             folder,
             adaptive_segment_stretch=adaptive_segment_stretch,
