@@ -467,6 +467,28 @@ def upload_video(folder: str) -> bool:
     return success
 
 
+def _get_video_upload_date(folder: str) -> str:
+    """提取原视频上传日期用于排序。
+
+    优先从 download.info.json 读取 upload_date，回退到目录名前缀（YYYYMMDD 格式）。
+    """
+    info_path = os.path.join(folder, "download.info.json")
+    if os.path.exists(info_path):
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            upload_date = str(data.get("upload_date", "") or "")
+            if upload_date:
+                return upload_date
+        except Exception:
+            pass
+    # 回退：从目录名提取（格式为 "YYYYMMDD title"）
+    basename = os.path.basename(folder)
+    if len(basename) >= 8 and basename[:8].isdigit():
+        return basename[:8]
+    return ""
+
+
 def upload_all_videos_under_folder(folder: str) -> str:
     err = _biliapi_availability_error()
     if err:
@@ -493,25 +515,34 @@ def upload_all_videos_under_folder(folder: str) -> str:
             "请先运行 `node scripts/biliapi/login.mjs` 登录生成 cookies.json，再设置 BILI_COOKIE_PATH（或直接放在默认位置）。"
         )
 
-    count = 0
-    need_wait = False  # 只有真正执行了上传才需要等待
+    # 先收集所有视频目录，再按原视频上传日期排序
+    video_folders: list[str] = []
     for root, _, files in os.walk(folder):
         check_cancelled()
         if "video.mp4" in files:
-            # 已上传的直接跳过：不计数，也不需要等待间隔
-            if _folder_uploaded(root):
-                logger.info(f"跳过（已上传）: {root}")
-                continue
+            video_folders.append(root)
 
-            if need_wait and upload_interval > 0:
-                logger.info(f"等待 {upload_interval} 秒后上传下一个视频...")
-                sleep_with_cancel(upload_interval)
+    video_folders.sort(key=_get_video_upload_date)
+    logger.info(f"共发现 {len(video_folders)} 个视频目录，按原视频上传日期排序上传")
 
-            success, actually_uploaded = _upload_video_with_biliapi(root, proxy, upload_cdn, cookie_path)
-            if success:
-                count += 1
-            # 只有真正执行了上传才需要等待间隔
-            need_wait = actually_uploaded
+    count = 0
+    need_wait = False  # 只有真正执行了上传才需要等待
+    for root in video_folders:
+        check_cancelled()
+        # 已上传的直接跳过：不计数，也不需要等待间隔
+        if _folder_uploaded(root):
+            logger.info(f"跳过（已上传）: {root}")
+            continue
+
+        if need_wait and upload_interval > 0:
+            logger.info(f"等待 {upload_interval} 秒后上传下一个视频...")
+            sleep_with_cancel(upload_interval)
+
+        success, actually_uploaded = _upload_video_with_biliapi(root, proxy, upload_cdn, cookie_path)
+        if success:
+            count += 1
+        # 只有真正执行了上传才需要等待间隔
+        need_wait = actually_uploaded
     return f"上传完成: {folder}（成功 {count} 个）"
 
 
