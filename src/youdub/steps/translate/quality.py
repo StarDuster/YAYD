@@ -9,7 +9,7 @@ class _TranslationValidationError(ValueError):
 
 def translation_postprocess(result: str) -> str:
     result = re.sub(r"\（[^）]*\）", "", result)
-    result = re.sub(r"\s*\([A-Za-z][^)]*\)", "", result)
+    result = re.sub(r"(?<=[\u4e00-\u9fff])\s*\([A-Za-z][^)]*\)", "", result)
     result = result.replace("...", "，")
     result = re.sub(r"(?<=\d),(?=\d)", "", result)
     result = result.replace("²", "的平方").replace("————", "：").replace("——", "：").replace("°", "度")
