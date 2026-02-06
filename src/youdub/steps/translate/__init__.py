@@ -563,6 +563,7 @@ def _translate_single_with_guide(
         "- 尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：目标中文字数 ≈ 英文单词数 × 1.6（为了匹配配音时长，避免过短）\n"
         "- 标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化\n"
+        "- 不要在括号里附带原文（例如不要写"理论 (Theory)"，应直接写"理论"）\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
         "- 不要换行\n"
@@ -661,6 +662,7 @@ def _translate_chunk_with_guide(
         "- 尽可能保留专业术语原文不翻译（如 AI、API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）\n"
         "- 长度控制：译文不要明显短于原文（可参考：中文字符数/英文词数尽量 ≥ 1.6，常见 1.6~2.3），但不要硬凑字数。\n"
         "- 标点符号：根据原文语气使用标点（疑问用？、强调用！、停顿用……），不要过度口语化\n"
+        "- 不要在括号里附带原文（例如不要写"理论 (Theory)"，应直接写"理论"）\n"
         "- 不要包含“翻译”二字\n"
         "- 不要加引号\n"
         "- 不要换行\n"
@@ -824,7 +826,7 @@ def _translate_content(
     full_translation: list[str] = []
 
     fixed_message = [
-        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.\n全局术语表（JSON）：{terminology_json}\n翻译要求：下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：译文不要明显短于原文（可参考：中文字符数/英文词数尽量 ≥ 1.6，常见 1.6~2.3），但不要硬凑字数。标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化。请严格参考全局术语表：glossary 中出现的术语优先按对应译法，dont_translate 中的 token 必须原样保留。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译完整，不要漏译或省略。注意信达雅。只输出译文，不要包含“翻译”二字。'},
+        {'role': 'system', 'content': f'You are a expert in the field of this video.\n{info}\nTranslate the sentence into {target_language}.\n全局术语表（JSON）：{terminology_json}\n翻译要求：下面我让你来充当翻译家，你的目标是把任何语言翻译成中文，请翻译时不要带翻译腔，而是要翻译得自然、流畅和地道，使用优美和高雅的表达方式。尽可能保留专业术语原文不翻译（如 API、GPU、CPU、RGB、FFT、MFCC、CNN、RNN、LSTM 等）。长度控制：译文不要明显短于原文（可参考：中文字符数/英文词数尽量 ≥ 1.6，常见 1.6~2.3），但不要硬凑字数。标点符号：根据原文语气合理使用标点（疑问用？、强调用！、停顿用……），保持专业，不要过度口语化。请严格参考全局术语表：glossary 中出现的术语优先按对应译法，dont_translate 中的 token 必须原样保留。请将人工智能的“agent”翻译为“智能体”，强化学习中是`Q-Learning`而不是`Queue Learning`。数学公式写成plain text，不要使用latex。确保翻译完整，不要漏译或省略。不要在括号里附带原文。注意信达雅。只输出译文，不要包含“翻译”二字。'},
         {'role': 'user', 'content': 'Translate:"Knowledge is power."'},
         {'role': 'assistant', 'content': '知识就是力量。'},
         {'role': 'user', 'content': 'Translate:"To be or not to be, that is the question."'},
