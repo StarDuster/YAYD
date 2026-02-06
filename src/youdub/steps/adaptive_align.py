@@ -356,7 +356,10 @@ def prepare_adaptive_alignment(folder: str, sample_rate: int = 24000) -> None:
         orig_seg_duration = float(max(0.0, orig_end - orig_start))
         if target_duration > 0 and target_duration < orig_seg_duration and float(tail_pad_max) > 0:
             shortfall = float(orig_seg_duration - target_duration)
-            pad_sec = float(min(shortfall, float(tail_pad_max)))
+            # Scale max padding by segment length: short segments get less silence
+            # to avoid unnaturally long gaps between tightly connected sentences.
+            effective_pad_max = float(min(orig_seg_duration * 0.15, float(tail_pad_max)))
+            pad_sec = float(min(shortfall, effective_pad_max))
             if pad_sec > 0.01:
                 pad_samples = int(round(pad_sec * float(sample_rate)))
                 target_samples += pad_samples
